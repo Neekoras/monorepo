@@ -13,8 +13,6 @@ use Swoole\Coroutine;
 use Swoole\Coroutine\WaitGroup;
 use Utopia\Client;
 use Utopia\Client\Adapter\Curl\Client as CurlAdapter;
-use Utopia\Pools\Adapter\Swoole as SwoolePoolAdapter;
-use Utopia\Pools\Pool as ConnectionPool;
 use Utopia\Psr7\Request\Factory as RequestFactory;
 use Utopia\Telemetry\Adapter as Telemetry;
 use Utopia\Telemetry\Adapter\None as NoTelemetry;
@@ -23,14 +21,9 @@ use Utopia\Telemetry\Counter;
 abstract class Adapter
 {
     /**
-     * Upper bound on the connection pool size used by requestMulti().
+     * Upper bound on the requests requestMulti() keeps in flight at once.
      */
     private const int MAX_CONCURRENT_REQUESTS = 25;
-
-    /**
-     * Name of the connection pool used by requestMulti().
-     */
-    private const string CONNECTION_POOL_NAME = 'messaging';
 
     /**
      * Counter tracking sent messages, labelled by result, type and provider.
@@ -40,8 +33,8 @@ abstract class Adapter
     /**
      * @param  Telemetry|null  $telemetry Telemetry adapter to record metrics with; defaults to a no-op adapter.
      * @param  (Closure(): ClientInterface)|null  $clientFactory Factory producing the PSR-18 clients
-     *         used for HTTP requests — called once per request() and once per pooled requestMulti()
-     *         connection, so it must return a new (or safely shareable) client on each call. Defaults
+     *         used for HTTP requests — called once per request() and once per concurrent requestMulti()
+     *         worker, so it must return a new (or safely shareable) client on each call. Defaults
      *         to utopia-php/client's cURL adapter configured for HTTP/2 with the request()/requestMulti()
      *         timeouts applied. A custom factory owns its own timeout configuration, and its clients
      *         must be able to negotiate HTTP/2 for push adapters — APNs rejects HTTP/1.1 connections,
@@ -270,37 +263,58 @@ abstract class Adapter
         $results = [];
 
         $run = function () use ($requests, $timeout, $connectTimeout, &$results): void {
-            $pool = new ConnectionPool(
-                adapter: new SwoolePoolAdapter(),
-                name: self::CONNECTION_POOL_NAME,
-                size: max(1, min(\count($requests), self::MAX_CONCURRENT_REQUESTS)),
-                init: $this->clientFactory ?? $this->defaultClient($timeout, $connectTimeout)->withConnectionReuse(...),
-                // A slot per request, so acquisition never queues; the request
-                // timeouts belong to the client, not to getting hold of one.
-                timeout: 0.0,
-            );
+            $factory = $this->clientFactory
+                ?? fn(): ClientInterface => $this->defaultClient($timeout, $connectTimeout)->withConnectionReuse();
+
+            $indexes = array_keys($requests);
+            $total = \count($indexes);
+            $cursor = 0;
 
             $group = new WaitGroup();
 
-            foreach ($requests as $index => $request) {
+            // Fixed set of workers draining a shared cursor, rather than one
+            // coroutine per request: it bounds concurrency the same way a pool
+            // did, but the clients are plain locals that die with this call.
+            // Owning one long-lived pooled client per batch leaked its cURL
+            // handle — and the pool's channel, lock and idle connections —
+            // outside PHP's heap on every send.
+            $workers = max(1, min($total, self::MAX_CONCURRENT_REQUESTS));
+
+            for ($worker = 0; $worker < $workers; $worker++) {
                 $group->add();
 
-                Coroutine::create(function () use ($pool, $request, $index, &$results, $group): void {
+                Coroutine::create(function () use ($factory, $requests, $indexes, $total, &$cursor, &$results, $group): void {
+                    // One reuse-enabled client per worker, so the requests it
+                    // picks up share a connection instead of re-handshaking.
+                    $client = null;
+
                     try {
-                        $results[$index] = $pool->use(fn(ClientInterface $client): array => $this->buildResult($client->sendRequest($request), (string) $request->getUri()));
-                    } catch (\Throwable $error) {
-                        // Throwable rather than the PSR client exception: pool
-                        // acquisition and factory failures must also land in
-                        // this slot's result — an uncaught throwable in a
-                        // coroutine is fatal and would drop the slot entirely.
-                        $results[$index] = [
-                            'url' => (string) $request->getUri(),
-                            'statusCode' => 0,
-                            'response' => null,
-                            'headers' => [],
-                            'error' => $error->getMessage(),
-                            'errorCode' => (int) $error->getCode(),
-                        ];
+                        // Coroutines interleave only at I/O, so claiming a slot
+                        // needs no lock: nothing can run between read and write.
+                        while (($slot = $cursor++) < $total) {
+                            $index = $indexes[$slot];
+                            $request = $requests[$index];
+
+                            try {
+                                $client ??= $factory();
+
+                                $results[$index] = $this->buildResult($client->sendRequest($request), (string) $request->getUri());
+                            } catch (\Throwable $error) {
+                                // Throwable rather than the PSR client
+                                // exception: client factory failures must also
+                                // land in this slot's result — an uncaught
+                                // throwable in a coroutine is fatal and would
+                                // drop the slot entirely.
+                                $results[$index] = [
+                                    'url' => (string) $request->getUri(),
+                                    'statusCode' => 0,
+                                    'response' => null,
+                                    'headers' => [],
+                                    'error' => $error->getMessage(),
+                                    'errorCode' => (int) $error->getCode(),
+                                ];
+                            }
+                        }
                     } finally {
                         $group->done();
                     }
