@@ -54,13 +54,12 @@ final class BirdTest extends TestCase
         $this->assertSame('https://eu1.platform.bird.com/v1/sms/messages', $request['url']);
         $this->assertContains('Authorization: Bearer bk_eu1_Ab3xKq9mP2wR5tY8uI1oL4nJ', $request['headers']);
         $this->assertContains('Content-Type: application/json', $request['headers']);
-        $this->assertSame([
-            'to' => '+31612345678',
-            'from' => 'Appwrite',
-            'text' => 'Your code is 123456',
-            'category' => 'authentication',
-            'metadata' => ['messageId' => 'msg_1'],
-        ], $request['body']);
+        $this->assertSame('+31612345678', $request['body']['to']);
+        $this->assertSame('Appwrite', $request['body']['from']);
+        $this->assertSame('Your code is 123456', $request['body']['text']);
+        $this->assertSame('authentication', $request['body']['category']);
+        $this->assertSame(['messageId' => 'msg_1'], $request['body']['metadata']);
+        $this->assertCount(5, $request['body']);
 
         $this->assertSame(1, $response['deliveredTo']);
         $this->assertSame('+31612345678', $response['results'][0]['recipient']);
