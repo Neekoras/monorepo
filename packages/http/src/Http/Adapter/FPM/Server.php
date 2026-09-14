@@ -4,16 +4,20 @@ namespace Utopia\Http\Adapter\FPM;
 
 use Utopia\DI\Container;
 use Utopia\Http\Adapter;
+use Utopia\Http\TrustedHeaders;
 
 class Server extends Adapter
 {
     private ?Container $context = null;
 
-    public function __construct(private Container $resources) {}
+    public function __construct(
+        private Container $resources,
+        private TrustedHeaders $trusted = new TrustedHeaders(),
+    ) {}
 
     public function onRequest(callable $callback): void
     {
-        $request = new Request();
+        $request = new Request($this->trusted);
         $response = new Response();
 
         $this->context = new Container($this->resources);

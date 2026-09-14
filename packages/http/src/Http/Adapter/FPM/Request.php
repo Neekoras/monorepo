@@ -3,6 +3,7 @@
 namespace Utopia\Http\Adapter\FPM;
 
 use Utopia\Http\Request as UtopiaRequest;
+use Utopia\Http\TrustedHeaders;
 
 class Request extends UtopiaRequest
 {
@@ -12,6 +13,11 @@ class Request extends UtopiaRequest
      * @var string
      */
     protected $rawPayload = '';
+
+    public function __construct(TrustedHeaders $trusted = new TrustedHeaders())
+    {
+        $this->trusted = $trusted;
+    }
 
     /**
      * Get raw payload
@@ -58,7 +64,7 @@ class Request extends UtopiaRequest
     {
         $remoteAddr = $this->getServer('REMOTE_ADDR') ?? '0.0.0.0';
 
-        foreach ($this->trustedIpHeaders as $header) {
+        foreach ($this->trusted->ip as $header) {
             $headerValue = $this->getHeaderLine($header);
 
             if (empty($headerValue)) {

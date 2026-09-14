@@ -64,14 +64,10 @@ abstract class Request
     protected ?array $cookies = null;
 
     /**
-     * @var array<int, string>
+     * Which forwarded headers this server believes. Set at construction by the
+     * adapter, so a request cannot be talked into trusting a new hop later.
      */
-    protected array $trustedIpHeaders = [];
-
-    /**
-     * @var array<int, string>
-     */
-    protected array $trustedProtoHeaders = ['x-forwarded-proto'];
+    protected TrustedHeaders $trusted;
 
     /**
      * Get Param
@@ -143,45 +139,11 @@ abstract class Request
     abstract public function setServer(string $key, string $value): static;
 
     /**
-     * Set Trusted IP Headers
-     *
-     * Set which headers to trust for determining client IP address.
-     * Headers are checked in order; the first one found with a valid IP is used.
-     *
-     * @param  array<int, string>  $headers
-     */
-    public function setTrustedIpHeaders(array $headers): static
-    {
-        $normalized = array_map(strtolower(...), $headers);
-        $trimmed = array_map(trim(...), $normalized);
-        $this->trustedIpHeaders = array_filter($trimmed);
-
-        return $this;
-    }
-
-    /**
-     * Set Trusted Proto Headers
-     *
-     * Set which headers to trust for determining the client's scheme.
-     * Headers are checked in order; the first one naming a known scheme is used.
-     *
-     * @param  array<int, string>  $headers
-     */
-    public function setTrustedProtoHeaders(array $headers): static
-    {
-        $normalized = array_map(strtolower(...), $headers);
-        $trimmed = array_map(trim(...), $normalized);
-        $this->trustedProtoHeaders = array_values(array_filter($trimmed));
-
-        return $this;
-    }
-
-    /**
      * Read the scheme from the first trusted header that carries a known one.
      */
     protected function trustedProtocol(): ?string
     {
-        foreach ($this->trustedProtoHeaders as $header) {
+        foreach ($this->trusted->proto as $header) {
             $value = strtolower(trim($this->getHeaderLine($header)));
 
             if (\in_array($value, self::SCHEMES, true)) {
