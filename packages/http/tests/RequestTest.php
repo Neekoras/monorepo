@@ -182,6 +182,48 @@ final class RequestTest extends TestCase
         $this->assertSame('https', $this->request->getProtocol());
     }
 
+    public function testCanStopTrustingTheForwardedProtocol(): void
+    {
+        $_SERVER['HTTP_X_FORWARDED_PROTO'] = 'https';
+        $_SERVER['REQUEST_SCHEME'] = 'http';
+
+        $this->request->setTrustedProtoHeaders(['x-cdn-proto']);
+
+        $this->assertSame('http', $this->request->getProtocol());
+    }
+
+    public function testCanTrustAProtocolHeaderOfAnyName(): void
+    {
+        $_SERVER['HTTP_X_CDN_PROTO'] = 'https';
+        $_SERVER['REQUEST_SCHEME'] = 'http';
+
+        $this->request->setTrustedProtoHeaders(['x-cdn-proto']);
+
+        $this->assertSame('https', $this->request->getProtocol());
+    }
+
+    public function testReadsTrustedProtocolHeadersInOrder(): void
+    {
+        $_SERVER['HTTP_X_CDN_PROTO'] = 'https';
+        $_SERVER['HTTP_X_FORWARDED_PROTO'] = 'http';
+        $_SERVER['REQUEST_SCHEME'] = 'http';
+
+        $this->request->setTrustedProtoHeaders(['x-cdn-proto', 'x-forwarded-proto']);
+
+        $this->assertSame('https', $this->request->getProtocol());
+    }
+
+    public function testSkipsATrustedProtocolHeaderThatNamesNoKnownScheme(): void
+    {
+        $_SERVER['HTTP_X_CDN_PROTO'] = 'gopher';
+        $_SERVER['HTTP_X_FORWARDED_PROTO'] = 'https';
+        $_SERVER['REQUEST_SCHEME'] = 'http';
+
+        $this->request->setTrustedProtoHeaders(['x-cdn-proto', 'x-forwarded-proto']);
+
+        $this->assertSame('https', $this->request->getProtocol());
+    }
+
     public function testCanGetMethod(): void
     {
         $this->assertSame('UNKNOWN', $this->request->getMethod());

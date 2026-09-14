@@ -26,6 +26,13 @@ abstract class Request
     public const string METHOD_CONNECT = 'CONNECT';
 
     /**
+     * Schemes a trusted proto header may name.
+     *
+     * @var array<int, string>
+     */
+    public const array SCHEMES = ['http', 'https', 'ws', 'wss'];
+
+    /**
      * Container for php://input parsed stream as an associative array
      *
      * @var array<string, mixed>|null
@@ -60,6 +67,11 @@ abstract class Request
      * @var array<int, string>
      */
     protected array $trustedIpHeaders = [];
+
+    /**
+     * @var array<int, string>
+     */
+    protected array $trustedProtoHeaders = ['x-forwarded-proto'];
 
     /**
      * Get Param
@@ -145,6 +157,39 @@ abstract class Request
         $this->trustedIpHeaders = array_filter($trimmed);
 
         return $this;
+    }
+
+    /**
+     * Set Trusted Proto Headers
+     *
+     * Set which headers to trust for determining the client's scheme.
+     * Headers are checked in order; the first one naming a known scheme is used.
+     *
+     * @param  array<int, string>  $headers
+     */
+    public function setTrustedProtoHeaders(array $headers): static
+    {
+        $normalized = array_map(strtolower(...), $headers);
+        $trimmed = array_map(trim(...), $normalized);
+        $this->trustedProtoHeaders = array_values(array_filter($trimmed));
+
+        return $this;
+    }
+
+    /**
+     * Read the scheme from the first trusted header that carries a known one.
+     */
+    protected function trustedProtocol(): ?string
+    {
+        foreach ($this->trustedProtoHeaders as $header) {
+            $value = strtolower(trim($this->getHeaderLine($header)));
+
+            if (\in_array($value, self::SCHEMES, true)) {
+                return $value;
+            }
+        }
+
+        return null;
     }
 
     /**

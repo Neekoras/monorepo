@@ -92,7 +92,16 @@ class Request extends UtopiaRequest
      */
     public function getProtocol(): string
     {
-        $protocol = $this->getHeaderLine('x-forwarded-proto', $this->getServer('server_protocol') ?? 'https');
+        $trusted = $this->trustedProtocol();
+
+        if ($trusted !== null) {
+            return $trusted;
+        }
+
+        // Nothing in front of this server stated the scheme, so fall back to
+        // the request line. `server_protocol` is the HTTP version rather than a
+        // scheme, so it can only say that TLS was not terminated here.
+        $protocol = $this->getServer('server_protocol') ?? 'https';
 
         if ($protocol === 'HTTP/1.1') {
             return 'http';

@@ -87,7 +87,9 @@ class Request extends UtopiaRequest
      */
     public function getProtocol(): string
     {
-        return $this->getServer('HTTP_X_FORWARDED_PROTO', $this->getServer('REQUEST_SCHEME')) ?? 'https';
+        return $this->trustedProtocol()
+            ?? $this->getServer('REQUEST_SCHEME')
+            ?? 'https';
     }
 
     /**
