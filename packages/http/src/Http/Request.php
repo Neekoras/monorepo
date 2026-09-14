@@ -144,10 +144,17 @@ abstract class Request
     protected function trustedProtocol(): ?string
     {
         foreach ($this->trusted->proto as $header) {
-            $value = strtolower(trim($this->getHeaderLine($header)));
+            $value = $this->getHeaderLine($header);
 
-            if (\in_array($value, self::SCHEMES, true)) {
-                return $value;
+            if ($value === '') {
+                continue;
+            }
+
+            // Each hop appends, so the leftmost value is the client's own.
+            $scheme = strtolower(trim(explode(',', $value)[0]));
+
+            if (\in_array($scheme, self::SCHEMES, true)) {
+                return $scheme;
             }
         }
 

@@ -29,15 +29,15 @@ final readonly class TrustedHeaders
      */
     public function __construct(array $ip = [], array $proto = ['x-forwarded-proto'])
     {
-        $this->ip = self::normalize($ip);
-        $this->proto = self::normalize($proto);
+        $this->ip = $this->normalize($ip);
+        $this->proto = $this->normalize($proto);
     }
 
     /**
      * @param  array<int, string>  $headers
      * @return array<int, string>
      */
-    private static function normalize(array $headers): array
+    private function normalize(array $headers): array
     {
         $lowered = array_map(strtolower(...), $headers);
         $trimmed = array_map(trim(...), $lowered);

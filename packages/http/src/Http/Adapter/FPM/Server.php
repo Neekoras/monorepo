@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Utopia\Http\Adapter\FPM;
 
 use Utopia\DI\Container;

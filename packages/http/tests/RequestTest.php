@@ -225,6 +225,14 @@ final class RequestTest extends TestCase
         $this->assertSame('https', $this->request->getProtocol());
     }
 
+    public function testTakesTheClientSchemeFromAChainOfProxies(): void
+    {
+        $_SERVER['HTTP_X_FORWARDED_PROTO'] = 'https, http';
+        $_SERVER['REQUEST_SCHEME'] = 'http';
+
+        $this->assertSame('https', $this->request->getProtocol());
+    }
+
     public function testFallsBackToTheSocketAddressUntilAHeaderIsTrusted(): void
     {
         $_SERVER['REMOTE_ADDR'] = '10.0.0.1';
