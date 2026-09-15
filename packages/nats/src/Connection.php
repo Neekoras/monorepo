@@ -210,12 +210,11 @@ final class Connection
         try {
             return $this->requestOnce($subject, $data, $timeout, $headers);
         } catch (ProtocolException $error) {
-            // A closing -ERR read while waiting for the reply means the server
-            // had already dropped the socket when the PUB was written: it queued
-            // the error, then closed, and never read the request. handleError()
-            // has reconnected by the time this is caught, so nothing was
-            // accepted and one replay on the rebuilt connection is safe.
-            if (!self::reconnectsAfter($error->getMessage()) || $this->status !== self::STATUS_CONNECTED) {
+            // Only a stale connection: the server closed it for missed PINGs
+            // before this PUB was written, so nothing was accepted, and
+            // handleError() has already reconnected. Other closing errors may
+            // arrive after the server processed the request, so they surface.
+            if (!str_contains(strtolower($error->getMessage()), 'stale connection') || $this->status !== self::STATUS_CONNECTED) {
                 throw $error;
             }
 
