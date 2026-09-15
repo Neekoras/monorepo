@@ -246,7 +246,7 @@ final class Connection
 
             try {
                 $this->processMessage($remaining);
-            } catch (ProtocolException $error) {
+            } catch (\Throwable $error) {
                 unset($this->pendingRequests[$token]);
                 throw $error;
             }
