@@ -121,7 +121,7 @@ $server->job('v1-region-manager')->action(function (array $payload) use ($region
 });
 ```
 
-The broker dead-letters it on the first failure instead of scheduling the next attempt: on NATS it is TERM'd and copied to the dead stream, on Redis it goes to the dead list rather than the failed list the `retry()` sweep reads. Either way the payload is still there to inspect, and `retry()` re-drives it once the underlying fault is fixed. A handler that cannot reach the throw site — an exception type owned by a library, or a classification made elsewhere — calls `$message->terminal()` instead and rethrows what it had. The failure is reported to the error hooks either way.
+The broker dead-letters it on the first failure instead of scheduling the next attempt: on NATS the delivery is terminated and the payload copied to the dead stream, on Redis it goes to the dead list rather than the failed list the `retry()` sweep reads. Either way the payload is still there to inspect, and `retry()` re-drives it once the underlying fault is fixed. A handler that cannot reach the throw site — an exception type owned by a library, or a classification made elsewhere — calls `$message->terminal()` instead and throws the exception it already had. The failure is reported to the error hooks either way.
 
 Keep it to failures that are permanent for this payload. A database that is down is what the redelivery budget is for; dead-lettering it converts an outage into lost work.
 
