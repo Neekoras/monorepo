@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Utopia\Tests\Unit;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use Utopia\Cache\Adapter\None;
 use Utopia\Cache\Cache;
 use Utopia\VCS\Adapter\Git\GitHub;
@@ -185,5 +186,31 @@ final class GitHubTest extends Base
         $payload = explode('.', $jwt)[1];
         $claims = json_decode(base64_decode(strtr($payload, '-_', '+/')), true);
         $this->assertSame('Iv1.0123456789abcdef', $claims['iss']);
+    }
+    #[DataProvider('rootDirectories')]
+    public function testGenerateCloneCommandSelectsTheRootDirectory(string $rootDirectory, string $pattern): void
+    {
+        $command = $this->vcsAdapter->generateCloneCommand('owner', 'repo', 'main', GitHub::CLONE_TYPE_BRANCH, '/tmp/clone', $rootDirectory);
+
+        $this->assertStringContainsString(escapeshellarg($pattern), $command);
+    }
+
+    /**
+     * Git matches a sparse-checkout pattern gitignore-style, so a './' prefix
+     * looks for a directory literally named '.' and checks out nothing.
+     */
+    public static function rootDirectories(): \Iterator
+    {
+        yield 'repository root' => ['', '*'];
+        yield 'dot' => ['.', '*'];
+        yield 'dot slash' => ['./', '*'];
+        yield 'slash' => ['/', '*'];
+        yield 'bare' => ['docs', 'docs'];
+        yield 'trailing slash' => ['docs/', 'docs'];
+        yield 'dot slash prefix' => ['./docs', 'docs'];
+        yield 'dot slash prefix and trailing slash' => ['./docs/', 'docs'];
+        yield 'nested' => ['./astro/starter', 'astro/starter'];
+        // A directory named '0' is a real path, not a root sentinel.
+        yield 'zero' => ['0', '0'];
     }
 }

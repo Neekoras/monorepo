@@ -4,29 +4,12 @@ declare(strict_types=1);
 
 namespace Utopia\Tests\Unit;
 
-use Utopia\VCS\Adapter\Git\Gitea;
-
 /**
  * Forgejo and Gogs are Gitea forks and deliver Gitea-shaped payloads, so all
  * three read the same fixtures.
  */
 abstract class GiteaBase extends Base
 {
-    /**
-     * Gitea reads its endpoint back when it builds URLs, and the property has
-     * no default, so the adapter is unusable until one is set.
-     */
-    abstract protected function createAdapter(): Gitea;
-
-    protected function setUp(): void
-    {
-        parent::setUp();
-
-        $adapter = $this->createAdapter();
-        $adapter->setEndpoint('https://gitea.example');
-        $this->vcsAdapter = $adapter;
-    }
-
     protected function signWebhookPayload(string $payload, string $secret): string
     {
         return hash_hmac('sha256', $payload, $secret);
