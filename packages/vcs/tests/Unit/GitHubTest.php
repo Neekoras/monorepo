@@ -159,6 +159,42 @@ final class GitHubTest extends Base
         $this->assertSame(5678, $claims['iss']);
     }
 
+    #[DataProvider('encodedPemProvider')]
+    public function testInitializeVariablesSignsJwtWithEncodedPem(callable $encode): void
+    {
+        $keyPair = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
+        $this->assertNotFalse($keyPair);
+        openssl_pkey_export($keyPair, $pem);
+        $publicKey = openssl_pkey_get_details($keyPair)['key'];
+
+        $adapter = new class (new Cache(new None())) extends GitHub {
+            /** @var array<string, mixed> */
+            public array $captured = [];
+
+            protected function call(string $method, string $path = '', array $headers = [], array $params = [], bool $decode = true, bool $followRedirects = true): array
+            {
+                $this->captured = ['headers' => $headers];
+
+                return [
+                    'body' => ['token' => 'installation-token'],
+                    'headers' => ['status-code' => 201],
+                ];
+            }
+        };
+
+        $adapter->initializeVariables('1234', $encode($pem), '5678');
+
+        $jwt = substr((string) $adapter->captured['headers']['Authorization'], \strlen('Bearer '));
+        [$header, $payload, $signature] = explode('.', $jwt);
+        $verified = openssl_verify(
+            $header . '.' . $payload,
+            base64_decode(strtr($signature, '-_', '+/')),
+            $publicKey,
+            OPENSSL_ALGO_SHA256,
+        );
+        $this->assertSame(1, $verified);
+    }
+
     public function testInitializeVariablesKeepsClientIdIssuerAsString(): void
     {
         $keyPair = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
@@ -187,6 +223,61 @@ final class GitHubTest extends Base
         $claims = json_decode(base64_decode(strtr($payload, '-_', '+/')), true);
         $this->assertSame('Iv1.0123456789abcdef', $claims['iss']);
     }
+
+    public function testSearchRepositoriesPrivateProfile(): void
+    {
+        $adapter = new class (new Cache(new None())) extends GitHub {
+            protected string $jwtToken = 'app-token';
+            protected string $installationId = '1234';
+
+            protected function call(string $method, string $path = '', array $headers = [], array $params = [], bool $decode = true, bool $followRedirects = true): array
+            {
+                return match ($path) {
+                    '/app/installations/1234' => ['body' => ['repository_selection' => 'all', 'account' => ['login' => 'Private-Owner']]],
+                    // GitHub refuses to search owners whose profile is private
+                    '/search/repositories' => ['headers' => ['status-code' => 422]],
+                    '/installation/repositories' => ['body' => ['repositories' => [['id' => 1, 'name' => 'private-repository']], 'total_count' => 1]],
+                    default => ['headers' => ['status-code' => 404]],
+                };
+            }
+        };
+
+        $result = $adapter->searchRepositories('private-owner', 1, 10);
+
+        $this->assertSame(['items' => [['id' => 1, 'name' => 'private-repository']], 'total' => 1], $result);
+    }
+
+    public function testSearchRepositoriesUnknownOwner(): void
+    {
+        $adapter = new class (new Cache(new None())) extends GitHub {
+            protected string $jwtToken = 'app-token';
+            protected string $installationId = '1234';
+
+            protected function call(string $method, string $path = '', array $headers = [], array $params = [], bool $decode = true, bool $followRedirects = true): array
+            {
+                return match ($path) {
+                    '/app/installations/1234' => ['body' => ['repository_selection' => 'all', 'account' => ['login' => 'installation-owner']]],
+                    '/search/repositories' => ['headers' => ['status-code' => 422]],
+                    default => ['headers' => ['status-code' => 404]],
+                };
+            }
+        };
+
+        $result = $adapter->searchRepositories('unknown-owner', 1, 10);
+
+        $this->assertSame(['items' => [], 'total' => 0], $result);
+    }
+
+    /**
+     * @return \Iterator<string, array{callable(string): string}>
+     */
+    public static function encodedPemProvider(): \Iterator
+    {
+        yield 'base64' => [base64_encode(...)];
+        yield 'wrapped base64' => [fn(string $pem): string => chunk_split(base64_encode($pem), 76, "\n")];
+        yield 'escaped newlines' => [fn(string $pem): string => str_replace("\n", '\n', $pem)];
+    }
+
     #[DataProvider('rootDirectories')]
     public function testGenerateCloneCommandSelectsTheRootDirectory(string $rootDirectory, string $pattern): void
     {

@@ -96,6 +96,23 @@ $broker->publish(new Queue('my-queue'), ['type' => 'test_number', 'value' => 123
 
 Each queue is a WorkQueue-retention stream (a message is removed once acknowledged) with a companion dead stream. `commit()` acknowledges a message, `reject()` schedules redelivery until `maxDeliver` and then dead-letters, `retry()` re-drives the dead stream onto the queue, and `getQueueSize()` reports pending (consumer `num_pending`) or failed (dead stream) counts. `reap()` is a no-op — redelivery after `ackWait` reclaims jobs stranded by a dead worker. Requires [`utopia-php/nats`](https://github.com/utopia-php/nats).
 
+### Shaping a queue
+
+Beyond redelivery, the constructor carries what a queue holds and how much of it is in flight. `maxMsgSize`, `maxMsgs`, `maxBytes` and `discard` bound the work stream — `discard: DiscardPolicy::New` turns a full stream into backpressure, where the publish fails rather than the oldest message being dropped, and it needs one of the two limits to apply to. `maxMsgSize` also applies to the dead stream, so a message the queue accepted can always be dead-lettered. `maxAckPending`, `maxWaiting` and `inactiveThreshold` shape the worker consumers; `maxAckPending` is the one to set, because JetStream's default of 1000 hands out far more than a worker can hold and the surplus spends its `ackWait` window waiting to be picked up. `maxAge` states the message TTL directly instead of deriving it from the queue's `jobTtl`, which each side builds separately.
+
+### Provisioning
+
+By default a broker creates a queue's streams and consumers when it first touches them, and brings an existing queue in line with its own settings. That is what a queue's producer and consumer want, and what any other process should not do: a maintenance task built with different knobs rewrites the fleet's configuration just by using the queue.
+
+```php
+use Utopia\Queue\Broker\Provisioning;
+
+$maintenance = new Nats($source, provisioning: Provisioning::Require);
+$maintenance->retry(new Queue('my-queue'));   // moves messages, changes no configuration
+```
+
+`Provisioning::Require` uses what is already provisioned and refuses when it is absent. The boundary is stream configuration plus the two worker consumers; the consumer `retry()` reads the dead stream through is still created, because it carries none of the settings a running fleet depends on.
+
 ### Concurrency
 
 `Broker\Nats` is wired the way `Broker\Redis` is: a connection dedicated to the blocking receive, plus a second, lock-guarded connection carrying the commands. One NATS connection is one socket behind one shared read pump, and driving it from two coroutines does not degrade — Swoole ends the worker on the first overlap:
@@ -125,6 +142,20 @@ Rates are host-bound and only meaningful against each other. The shape is the po
 The commands connection is opened lazily on the first acknowledgment, so a publisher-only broker never pays for a socket it will not use — and a broker built from a live connection rather than a Closure factory serves both roles from that one socket, sharing one lock.
 
 Still pass a Closure factory rather than a live connection when the worker forks or reconnects per worker, and do not hand the same connection to anything outside the broker.
+
+#### Which axis to scale
+
+`job('…', N)` adds handler coroutines inside one process; replicas add processes. They are not interchangeable, and which one helps is decided by the handler, not by the broker. Measured with `tests/bench/run.sh` (400 messages, median of three, same host):
+
+| handler | 1 process x 1 coroutine | 1 x 4 (coroutines) | 4 x 1 (processes) |
+|---|---|---|---|
+| waits 25ms (`io`) | 35 msg/s | **143** (4.0x) | 140 (4.0x) |
+| hashes (`cpu`) | 72 msg/s | 72 (**1.0x**) | **266** (3.7x) |
+| both (`mixed`) | 46 msg/s | 98 (2.1x) | 190 (4.1x) |
+
+A handler that waits is absorbed by coroutines, because the wait yields. A handler that computes is not: PHP runs one coroutine at a time, so raising the cap buys nothing and only processes help. Most jobs are somewhere between, and scale partially on both.
+
+`Broker\Redis` and `Broker\Nats` are within noise of each other in every cell above, which is the point worth remembering: at any realistic handler cost the broker is not the constraint, so pick the axis that matches the work rather than the transport.
 
 `Consumer\Exclusive` stays for consumers built outside this package that drive one socket without serialising it. `Server::start()` refuses a job registered above one coroutine on a consumer carrying that marker, because it would crash exactly as above; scale one of those with replicas rather than coroutines.
 
