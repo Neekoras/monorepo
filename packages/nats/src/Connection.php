@@ -207,6 +207,24 @@ final class Connection
 
     public function request(string $subject, string $data = '', ?float $timeout = null, ?Headers $headers = null): Message
     {
+        try {
+            return $this->requestOnce($subject, $data, $timeout, $headers);
+        } catch (ProtocolException $error) {
+            // A closing -ERR read while waiting for the reply means the server
+            // had already dropped the socket when the PUB was written: it queued
+            // the error, then closed, and never read the request. handleError()
+            // has reconnected by the time this is caught, so nothing was
+            // accepted and one replay on the rebuilt connection is safe.
+            if (!self::reconnectsAfter($error->getMessage()) || $this->status !== self::STATUS_CONNECTED) {
+                throw $error;
+            }
+
+            return $this->requestOnce($subject, $data, $timeout, $headers);
+        }
+    }
+
+    private function requestOnce(string $subject, string $data, ?float $timeout, ?Headers $headers): Message
+    {
         $this->ensureConnected();
 
         $timeout ??= $this->options->requestTimeout;
@@ -227,7 +245,12 @@ final class Connection
                 throw new TimeoutException("Request timed out after {$timeout}s");
             }
 
-            $this->processMessage($remaining);
+            try {
+                $this->processMessage($remaining);
+            } catch (ProtocolException $error) {
+                unset($this->pendingRequests[$token]);
+                throw $error;
+            }
         }
 
         $msg = $this->pendingRequests[$token]['message'];
