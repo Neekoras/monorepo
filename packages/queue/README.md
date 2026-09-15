@@ -102,7 +102,7 @@ Beyond redelivery, the constructor carries what a queue holds and how much of it
 
 ### Stream names
 
-A queue's names are derived from its own, lowercased, with dots and anything outside `a-z 0-9 _ -` collapsed to `_`. Queue `v1-audits` is:
+A queue's names are derived from its own, in lower case, with dots and anything outside `a-z 0-9 _ -` collapsed to `_`. Queue `v1-audits` is:
 
 | | |
 |---|---|
@@ -112,7 +112,7 @@ A queue's names are derived from its own, lowercased, with dots and anything out
 
 The prefix is the uppercase part, the way nats-server derives `KV_my-bucket` from a bucket name. One token serves the stream name and the subject, so a stream name is the subject token with a prefix on it — `stream_name="Q_v1-deletes"` and `messaging_destination_name="v1-deletes"` join by stripping `Q_`, which is what lets stream depth be compared against the depth the producer thinks it enqueued. The dead stream takes a second prefix rather than a `_DEAD` suffix, so `QD_` and `Q_` match independently and no dashboard or alert has to exclude one before matching the other. The namespace is not part of either name: isolation is per account or cluster, so run one queue namespace per NATS account.
 
-`Nats::workStreamName()` and `Nats::deadStreamName()` return them for a queue name, so a maintenance task or a dashboard generator resolves a name instead of reimplementing the rule:
+`Nats::workStreamName()` and `Nats::deadStreamName()` return them for a queue name, so a maintenance task or a dashboard generator resolves a name instead of copying the rule:
 
 ```php
 Nats::workStreamName('v1-audits'); // Q_v1-audits
