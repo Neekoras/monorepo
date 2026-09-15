@@ -33,9 +33,13 @@ use Utopia\Queue\Queue;
  * lists and its reap()/retry() sweeps (AckWait redelivery reclaims stranded jobs).
  *
  * Stream/subject names carry the queue name but NOT its namespace (isolation is a
- * per-account/cluster concern), so run one queue namespace per NATS account. Two
- * queues that map to the same stream — a duplicate name across namespaces, or names
- * that sanitize alike — are rejected loudly by ensure() rather than silently shared.
+ * per-account/cluster concern), so run one queue namespace per NATS account. Queue
+ * `v1-audits` is stream `Q_v1-audits`, dead stream `QD_v1-audits`, subjects
+ * `q.v1-audits.{normal,priority,dead}` — one lowercase token throughout, so a stream
+ * name is its subject token with a prefix on it and either can be read off the other
+ * ({@see self::workStreamName()}, {@see self::deadStreamName()}). Two queues that map
+ * to the same stream — a duplicate name across namespaces, or names that sanitize
+ * alike — are rejected loudly by ensure() rather than silently shared.
  *
  * One NATS connection is one socket behind one shared read pump, and driving it from
  * two coroutines at once does not degrade — Swoole ends the worker on the first
@@ -71,7 +75,7 @@ class Nats implements Synchronous, Consumer
 {
     // Wire-level identifiers (stream/subject naming, durable consumers, advisories).
     private const string STREAM_PREFIX = 'Q_';
-    private const string DEAD_STREAM_SUFFIX = '_DEAD';
+    private const string DEAD_STREAM_PREFIX = 'QD_';
     private const string SUBJECT_PREFIX = 'q';
     private const string SUBJECT_NORMAL = 'normal';
     private const string SUBJECT_PRIORITY = 'priority';
@@ -89,6 +93,9 @@ class Nats implements Synchronous, Consumer
     // which queue identity owns a stream (the cross-instance collision guard).
     private const int MAX_STREAM_NAME = 255;
     private const string METADATA_IDENTITY = 'utopia_queue_identity';
+
+    // JetStream refuses a stream whose subjects another stream already carries.
+    private const int ERR_SUBJECTS_OVERLAP = 10065;
 
     // Retry budget for first-time provisioning of a replicated stream. The window
     // doubles per attempt because a fixed one re-synchronises the losers: every process
@@ -1000,7 +1007,7 @@ class Nats implements Synchronous, Consumer
             ? $this->duplicateWindow
             : min($this->duplicateWindow, $maxAge);
 
-        $this->js()->createOrUpdateStream(new StreamConfig(
+        $this->createStream($queue, new StreamConfig(
             name: $this->workStream($queue),
             subjects: [$this->workSubject($queue), $this->prioritySubject($queue)],
             description: $key,
@@ -1019,7 +1026,7 @@ class Nats implements Synchronous, Consumer
             metadata: [self::METADATA_IDENTITY => $key],
         ));
 
-        $this->js()->createOrUpdateStream(new StreamConfig(
+        $this->createStream($queue, new StreamConfig(
             name: $this->deadStream($queue),
             subjects: [$this->deadSubject($queue)],
             description: $key,
@@ -1078,6 +1085,36 @@ class Nats implements Synchronous, Consumer
         );
 
         $this->provisioned[$key] = true;
+    }
+
+    /**
+     * Create or update one of the queue's streams, naming the stream that is in the
+     * way when JetStream refuses because its subjects are already carried elsewhere.
+     *
+     * The server's own message ("subjects overlap with an existing stream") does not
+     * say which stream, and the answer is not reachable from the name it was handed:
+     * the conflict is on the subjects, so the other stream is under some other name.
+     * The one that comes up in practice is a stream this broker created under an
+     * earlier naming scheme -- the names changed, the subjects did not -- where the
+     * fix is to drain the old stream and delete it, not to rename the queue.
+     */
+    private function createStream(Queue $queue, StreamConfig $config): void
+    {
+        try {
+            $this->js()->createOrUpdateStream($config);
+        } catch (JetStreamException $e) {
+            if ($e->apiError?->errCode !== self::ERR_SUBJECTS_OVERLAP) {
+                throw $e;
+            }
+
+            throw new \RuntimeException(\sprintf(
+                'NATS stream "%s" for queue "%s" cannot be created: another stream already carries its subjects (%s). Find it with `nats stream ls --subject %s`, then drain and delete it -- a stream left behind by an earlier stream-naming scheme is the usual cause.',
+                $config->name,
+                $queue->name,
+                implode(', ', $config->subjects),
+                $this->subjectBase($queue) . '.>',
+            ), $e->getCode(), $e);
+        }
     }
 
     /**
@@ -1152,9 +1189,9 @@ class Nats implements Synchronous, Consumer
      */
     private function guardStreamName(Queue $queue, string $identity): void
     {
-        // The dead stream (work name + suffix) is the longest, so if it fits, both do.
-        // Fixed-width names never overflow, but a long queue name can -- fail clearly
-        // rather than letting JetStream reject the create with an opaque error.
+        // The dead stream carries the longer prefix, so if it fits, both do. Fixed-width
+        // names never overflow, but a long queue name can -- fail clearly rather than
+        // letting JetStream reject the create with an opaque error.
         $longest = $this->deadStream($queue);
         if (\strlen($longest) > self::MAX_STREAM_NAME) {
             throw new \RuntimeException("NATS stream name \"{$longest}\" exceeds JetStream's " . self::MAX_STREAM_NAME . '-byte limit; shorten queue "' . $queue->name . '".');
@@ -1216,18 +1253,54 @@ class Nats implements Synchronous, Consumer
         return \strlen($queue->namespace) . ':' . $queue->namespace . ':' . $queue->name;
     }
 
+    /**
+     * The work stream a queue's jobs are stored in, e.g. `Q_v1-audits`.
+     *
+     * NATS-idiomatic: a short uppercase category prefix plus the queue name, the way
+     * nats-server derives `KV_my-bucket` -- the prefix is uppercase, the name is the
+     * name. Folding the name to upper as well is what this used to do, and it cost
+     * more than it looks: `nats_stream_total_messages{stream_name="Q_V1-DELETES"}`
+     * cannot be joined to the queue's own `messaging_destination_name="v1-deletes"`,
+     * because PromQL has no case folding outside an experimental function, so there
+     * was no query comparing what a producer enqueued against what the stream holds.
+     * The token is the subject token, so the join is now a prefix strip.
+     *
+     * The namespace is not folded in -- isolation is per-account/cluster -- and
+     * ensure() guards the rare case of two names sanitizing to the same stream.
+     *
+     * Public because a name is read from outside the broker: a task deciding whether a
+     * queue is safe to retire, a dashboard, an operator at `nats stream info`. This is
+     * that answer, rather than a regex copied out of here and left to drift.
+     */
+    public static function workStreamName(string $queue): string
+    {
+        return self::STREAM_PREFIX . self::queueToken($queue);
+    }
+
+    /**
+     * The dead-letter stream for a queue, e.g. `QD_v1-audits`.
+     *
+     * A prefix rather than a `_DEAD` suffix, because a suffix shares a namespace with
+     * the name it is attached to: `Q_x_dead` reads as both "dead stream of `x`" and
+     * "work stream of queue `x_dead`", and `_` is already the separator every
+     * sanitized name is full of (`Q_database_db_fra1_self_hosted_0_0_DEAD` was live).
+     * It also forced every matcher that wanted work streams to exclude dead ones
+     * first, which is an ordering requirement dashboards and alerts kept getting
+     * wrong. Two prefixes, no ordering, no ambiguity.
+     */
+    public static function deadStreamName(string $queue): string
+    {
+        return self::DEAD_STREAM_PREFIX . self::queueToken($queue);
+    }
+
     private function workStream(Queue $queue): string
     {
-        // NATS-idiomatic: a short uppercase category prefix (mirrors JetStream's own
-        // KV_/OBJ_ streams) plus the queue name, e.g. Q_AUDITS. The namespace is not
-        // folded in -- isolation is per-account/cluster -- and ensure() guards the rare
-        // case of two names sanitizing to the same stream.
-        return self::STREAM_PREFIX . $this->streamToken($queue->name);
+        return self::workStreamName($queue->name);
     }
 
     private function deadStream(Queue $queue): string
     {
-        return $this->workStream($queue) . self::DEAD_STREAM_SUFFIX;
+        return self::deadStreamName($queue->name);
     }
 
     /**
@@ -1257,16 +1330,23 @@ class Nats implements Synchronous, Consumer
         return $this->subjectBase($queue) . '.' . self::SUBJECT_DEAD;
     }
 
-    /** Stream names are uppercase and forbid dots; anything outside A-Z 0-9 _ - maps to '_'. */
-    private function streamToken(string $name): string
-    {
-        return strtoupper((string) preg_replace('/[^A-Za-z0-9_-]/', '_', $name));
-    }
-
-    /** A single lowercase subject token; dots (token separators) and any other
-     *  character outside a-z 0-9 _ - collapse to '_'. */
-    private function subjectToken(string $name): string
+    /**
+     * A queue's wire token: one lowercase, dot-free word that names it in both a
+     * stream name and a subject.
+     *
+     * Dots (subject token separators) and anything else outside a-z 0-9 _ - collapse
+     * to '_'. One helper for both, so a stream name is its subject token with a
+     * prefix on it -- which is the whole of the join between queue telemetry and
+     * stream telemetry, and the reason two names that sanitize alike still land on
+     * one stream, where ensure()'s identity metadata refuses the second of them.
+     */
+    private static function queueToken(string $name): string
     {
         return strtolower((string) preg_replace('/[^A-Za-z0-9_-]/', '_', $name));
+    }
+
+    private function subjectToken(string $name): string
+    {
+        return self::queueToken($name);
     }
 }

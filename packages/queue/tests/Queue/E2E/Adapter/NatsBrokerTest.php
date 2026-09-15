@@ -7,7 +7,9 @@ namespace Tests\E2E\Adapter;
 use PHPUnit\Framework\TestCase;
 use Utopia\NATS\Connection;
 use Utopia\NATS\JetStream\DiscardPolicy;
+use Utopia\NATS\JetStream\RetentionPolicy;
 use Utopia\NATS\JetStream\StorageType;
+use Utopia\NATS\JetStream\StreamConfig;
 use Utopia\Queue\Adapter\Swoole;
 use Utopia\Queue\Broker\Nats;
 use Utopia\Queue\Broker\Provisioning;
@@ -207,23 +209,71 @@ final class NatsBrokerTest extends TestCase
 
     public function testUsesIdiomaticStreamAndSubjectNames(): void
     {
-        // Q_<UPPER-NAME> stream (mirrors NATS's own KV_/OBJ_) + q.<lower-name>.<class>
-        // subjects; the namespace is not folded in.
+        // Q_<name> work stream and QD_<name> dead stream (the prefix is the uppercase
+        // part, the way nats-server derives KV_<bucket>), q.<name>.<class> subjects,
+        // and one lowercase token throughout so a stream name is its subject token
+        // with a prefix on it. The namespace is not folded in.
         $name = 'audits-' . substr(md5(uniqid('', true)), 0, 6);
         $this->broker->publish(new Queue($name), ['ok' => 1]);
 
         $js = Connection::connect(getenv('NATS_URL') ?: 'nats://127.0.0.1:14225')->jetStream();
-        $info = $js->getStreamInfo('Q_' . strtoupper($name));
-        $this->assertSame('Q_' . strtoupper($name), $info->config->name);
-        $this->assertContains('q.' . strtolower($name) . '.normal', $info->config->subjects);
-        $this->assertContains('q.' . strtolower($name) . '.priority', $info->config->subjects);
+
+        $work = $js->getStreamInfo('Q_' . $name);
+        $this->assertSame('Q_' . $name, $work->config->name);
+        $this->assertContains('q.' . $name . '.normal', $work->config->subjects);
+        $this->assertContains('q.' . $name . '.priority', $work->config->subjects);
+
+        $dead = $js->getStreamInfo('QD_' . $name);
+        $this->assertSame('QD_' . $name, $dead->config->name);
+        $this->assertContains('q.' . $name . '.dead', $dead->config->subjects);
+
+        // The same names, resolvable without a live server or a copied regex.
+        $this->assertSame('Q_' . $name, Nats::workStreamName($name));
+        $this->assertSame('QD_' . $name, Nats::deadStreamName($name));
+    }
+
+    public function testStreamNamesAreDerivedTheSameWayAsSubjects(): void
+    {
+        // A queue name that needs sanitising: the dot is a subject separator, and an
+        // upper-case letter is what used to make the stream name unjoinable to the
+        // queue's own telemetry. Both collapse the same way in both places.
+        $this->assertSame('Q_v1-database_shard', Nats::workStreamName('V1-Database.Shard'));
+        $this->assertSame('QD_v1-database_shard', Nats::deadStreamName('V1-Database.Shard'));
+    }
+
+    public function testAStreamAlreadyCarryingTheSubjectsFailsLoud(): void
+    {
+        // JetStream refuses a stream whose subjects another stream already carries, and
+        // says so without naming the other stream -- which is not reachable from the one
+        // it was handed, because the conflict is on the subjects. The case that produces
+        // this in practice is a stream left behind by an earlier naming scheme: same
+        // subjects, different name, so the create is refused rather than adopted.
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $name = 'o_' . substr(md5(uniqid('', true)), 0, 8);
+        $js = Connection::connect($url)->jetStream();
+        $js->createOrUpdateStream(new StreamConfig(
+            name: 'LEGACY_' . strtoupper($name),
+            subjects: ["q.{$name}.normal", "q.{$name}.priority"],
+            retention: RetentionPolicy::WorkQueue,
+        ));
+
+        try {
+            $this->broker->publish(new Queue($name), ['ok' => 1]);
+            $this->fail('expected the overlapping subjects to be refused');
+        } catch (\RuntimeException $e) {
+            $this->assertStringContainsString('Q_' . $name, $e->getMessage());
+            $this->assertStringContainsString('already carries its subjects', $e->getMessage());
+            $this->assertStringContainsString("q.{$name}.>", $e->getMessage(), 'the message must say how to find the stream in the way');
+        } finally {
+            $js->deleteStream('LEGACY_' . strtoupper($name));
+        }
     }
 
     public function testCollidingQueueNamesFailLoud(): void
     {
         // Dropping the namespace means two names that sanitise to the same stream would
         // silently share it; the guard turns that into a loud error instead. "c.<s>" and
-        // "c_<s>" both map to stream Q_C_<S>.
+        // "c_<s>" both map to stream Q_c_<s>.
         $suffix = substr(md5(uniqid('', true)), 0, 6);
         $this->broker->publish(new Queue("c.{$suffix}"), ['ok' => 1]);
 
@@ -241,7 +291,7 @@ final class NatsBrokerTest extends TestCase
         $a = new Nats(Connection::connect($url));
         $b = new Nats(Connection::connect($url));
 
-        $a->publish(new Queue("x.{$suffix}"), ['ok' => 1]); // stamps identity on Q_X_<S>
+        $a->publish(new Queue("x.{$suffix}"), ['ok' => 1]); // stamps identity on Q_x_<s>
         try {
             $b->publish(new Queue("x_{$suffix}"), ['ok' => 1]); // same stream, different identity, other instance
             $this->fail('expected a cross-instance collision to throw');
@@ -977,7 +1027,7 @@ final class NatsBrokerTest extends TestCase
         $broker->publish($queue, ['task' => 'sized']);
 
         $js = Connection::connect($url)->jetStream();
-        $work = $js->getStreamInfo('Q_' . strtoupper($queue->name))->config;
+        $work = $js->getStreamInfo(Nats::workStreamName($queue->name))->config;
         $this->assertSame(1_000, $work->maxMsgs);
         $this->assertSame(1_048_576, $work->maxBytes);
         $this->assertSame(262_144, $work->maxMsgSize);
@@ -985,7 +1035,7 @@ final class NatsBrokerTest extends TestCase
 
         // maxMsgSize is mirrored so an accepted message can always be dead-lettered;
         // the capacity limits are the work stream's backpressure and stay there.
-        $dead = $js->getStreamInfo('Q_' . strtoupper($queue->name) . '_DEAD')->config;
+        $dead = $js->getStreamInfo(Nats::deadStreamName($queue->name))->config;
         $this->assertSame(262_144, $dead->maxMsgSize);
         $this->assertSame(-1, $dead->maxMsgs);
         $this->assertSame(-1, $dead->maxBytes);
@@ -1007,7 +1057,7 @@ final class NatsBrokerTest extends TestCase
         $broker->publish($queue, ['task' => 'inflight']);
 
         $js = Connection::connect($url)->jetStream();
-        $stream = 'Q_' . strtoupper($queue->name);
+        $stream = Nats::workStreamName($queue->name);
         foreach (['worker', 'worker_priority'] as $durable) {
             $config = $js->getConsumer($stream, $durable)->info(true)->config;
             $this->assertSame(8, $config->maxAckPending, "{$durable} must carry maxAckPending");
@@ -1029,7 +1079,7 @@ final class NatsBrokerTest extends TestCase
         $broker->publish($queue, ['task' => 'ttl']);
 
         $config = Connection::connect($url)->jetStream()
-            ->getStreamInfo('Q_' . strtoupper($queue->name))->config;
+            ->getStreamInfo(Nats::workStreamName($queue->name))->config;
         $this->assertEqualsWithDelta(60.0, $config->maxAge, PHP_FLOAT_EPSILON);
 
         $broker->close();
@@ -1068,10 +1118,10 @@ final class NatsBrokerTest extends TestCase
         $this->assertSame(1, $owner->getQueueSize($queue, true), 'message should be dead-lettered');
 
         $js = Connection::connect($url)->jetStream();
-        $stream = 'Q_' . strtoupper($queue->name);
+        $stream = Nats::workStreamName($queue->name);
         $snapshot = static fn(): array => [
             'work' => $js->getStreamInfo($stream)->config->toArray(),
-            'dead' => $js->getStreamInfo($stream . '_DEAD')->config->toArray(),
+            'dead' => $js->getStreamInfo(Nats::deadStreamName($queue->name))->config->toArray(),
             'normal' => $js->getConsumer($stream, 'worker')->info(true)->config->toArray(),
             'priority' => $js->getConsumer($stream, 'worker_priority')->info(true)->config->toArray(),
         ];

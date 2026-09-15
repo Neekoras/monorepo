@@ -100,6 +100,27 @@ Each queue is a WorkQueue-retention stream (a message is removed once acknowledg
 
 Beyond redelivery, the constructor carries what a queue holds and how much of it is in flight. `maxMsgSize`, `maxMsgs`, `maxBytes` and `discard` bound the work stream — `discard: DiscardPolicy::New` turns a full stream into backpressure, where the publish fails rather than the oldest message being dropped, and it needs one of the two limits to apply to. `maxMsgSize` also applies to the dead stream, so a message the queue accepted can always be dead-lettered. `maxAckPending`, `maxWaiting` and `inactiveThreshold` shape the worker consumers; `maxAckPending` is the one to set, because JetStream's default of 1000 hands out far more than a worker can hold and the surplus spends its `ackWait` window waiting to be picked up. `maxAge` states the message TTL directly instead of deriving it from the queue's `jobTtl`, which each side builds separately.
 
+### Stream names
+
+A queue's names are derived from its own, lowercased, with dots and anything outside `a-z 0-9 _ -` collapsed to `_`. Queue `v1-audits` is:
+
+| | |
+|---|---|
+| work stream | `Q_v1-audits` |
+| dead stream | `QD_v1-audits` |
+| subjects | `q.v1-audits.normal`, `q.v1-audits.priority`, `q.v1-audits.dead` |
+
+The prefix is the uppercase part, the way nats-server derives `KV_my-bucket` from a bucket name. One token serves the stream name and the subject, so a stream name is the subject token with a prefix on it — `stream_name="Q_v1-deletes"` and `messaging_destination_name="v1-deletes"` join by stripping `Q_`, which is what lets stream depth be compared against the depth the producer thinks it enqueued. The dead stream takes a second prefix rather than a `_DEAD` suffix, so `QD_` and `Q_` match independently and no dashboard or alert has to exclude one before matching the other. The namespace is not part of either name: isolation is per account or cluster, so run one queue namespace per NATS account.
+
+`Nats::workStreamName()` and `Nats::deadStreamName()` return them for a queue name, so a maintenance task or a dashboard generator resolves a name instead of reimplementing the rule:
+
+```php
+Nats::workStreamName('v1-audits'); // Q_v1-audits
+Nats::deadStreamName('v1-audits'); // QD_v1-audits
+```
+
+The delivery profile is deliberately not in the name — `ackWait`, `backoff` and replica count are configuration, and changing one stays a config edit rather than a rename.
+
 ### Provisioning
 
 By default a broker creates a queue's streams and consumers when it first touches them, and brings an existing queue in line with its own settings. That is what a queue's producer and consumer want, and what any other process should not do: a maintenance task built with different knobs rewrites the fleet's configuration just by using the queue.
