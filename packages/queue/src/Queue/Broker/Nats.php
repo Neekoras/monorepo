@@ -1256,10 +1256,13 @@ class Nats implements Synchronous, Consumer
     /**
      * The work stream a queue's jobs are stored in, e.g. `Q_v1-audits`.
      *
-     * NATS-idiomatic: a short uppercase category prefix plus the queue name, the way
-     * nats-server derives `KV_my-bucket` -- the prefix is uppercase, the name is the
-     * name. Folding the name to upper as well is what this used to do, and it cost
-     * more than it looks: `nats_stream_total_messages{stream_name="Q_V1-DELETES"}`
+     * NATS-idiomatic: a short uppercase category prefix plus the queue's token, the way
+     * nats-server derives `KV_my-bucket` -- the prefix carries the case, the bucket name
+     * is passed through (verified against 2.11: bucket `my-Bucket` yields stream
+     * `KV_my-Bucket`). The token here is lower-cased rather than passed through, because
+     * it is the same token the subjects use and a stream that disagrees with its own
+     * subjects about case is the defect being removed. Folding the whole name to upper
+     * is what this used to do, and it cost more than it looks: `nats_stream_total_messages{stream_name="Q_V1-DELETES"}`
      * cannot be joined to the queue's own `messaging_destination_name="v1-deletes"`,
      * because PromQL has no case folding outside an experimental function, so there
      * was no query comparing what a producer enqueued against what the stream holds.
