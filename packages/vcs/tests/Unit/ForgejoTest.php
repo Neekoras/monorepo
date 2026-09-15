@@ -16,7 +16,7 @@ final class ForgejoTest extends GiteaBase
     protected function createAdapter(): Forgejo
     {
         $adapter = new Forgejo(new Cache(new None()));
-        $adapter->setEndpoint('http://gitea:3000');
+        $adapter->setEndpoint('https://forgejo.example');
 
         return $adapter;
     }
