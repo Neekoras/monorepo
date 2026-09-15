@@ -15,9 +15,6 @@ final class GiteaTest extends GiteaBase
 
     protected function createAdapter(): Gitea
     {
-        $adapter = new Gitea(new Cache(new None()));
-        $adapter->setEndpoint('https://gitea.example');
-
-        return $adapter;
+        return new Gitea(new Cache(new None()));
     }
 }
