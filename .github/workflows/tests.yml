@@ -127,5 +127,6 @@ jobs:
           TESTS_BITBUCKET_WORKSPACE: ${{ secrets.TESTS_BITBUCKET_WORKSPACE }}
           TESTS_WHATSAPP_ACCESS_TOKEN: ${{ secrets.TESTS_WHATSAPP_ACCESS_TOKEN }}
           TESTS_WHATSAPP_PHONE_NUMBER_ID: ${{ secrets.TESTS_WHATSAPP_PHONE_NUMBER_ID }}
+          TESTS_WHATSAPP_BUSINESS_ACCOUNT_ID: ${{ secrets.TESTS_WHATSAPP_BUSINESS_ACCOUNT_ID }}
           TESTS_WHATSAPP_RECIPIENT: ${{ secrets.TESTS_WHATSAPP_RECIPIENT }}
         run: bin/monorepo test ${{ matrix.package }} ${{ matrix.linked && '--linked' || '' }}
