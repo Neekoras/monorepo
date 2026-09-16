@@ -38,7 +38,8 @@ final class Client
 
     private int $lastReply = 0;
 
-    private int $transactions = 0;
+    /** Messages accepted over this connection. */
+    public private(set) int $transactions = 0;
 
     private Capabilities $capabilities;
 
@@ -184,14 +185,6 @@ final class Client
         }
 
         return (hrtime(true) - $this->lastReply) / 1_000_000_000;
-    }
-
-    /**
-     * Messages accepted over this connection.
-     */
-    public function transactions(): int
-    {
-        return $this->transactions;
     }
 
     /**

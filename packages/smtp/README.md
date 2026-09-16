@@ -206,7 +206,7 @@ if ($client->idle() > 100 && ! $client->ping()) {
     // The session was dead and has been dropped; send() will reconnect.
 }
 
-if ($client->transactions() >= 100) {
+if ($client->transactions >= 100) {
     $client->close(); // Rotate a long-lived session the way a relay expects.
 }
 ```
