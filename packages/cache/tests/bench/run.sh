@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Benchmark the cache codecs, alone and through the Redis adapters.
+# Benchmark the cache codecs, alone and through the Redis adapter.
 #
 # Needs Redis. Brings up the package's own compose service when Docker is
 # available and it is not already reachable, and skips rather than fails when it
@@ -40,8 +40,7 @@ fi
 [ -n "$COMPOSE_STARTED" ] && trap "docker compose -p '$PROJECT' down -v --remove-orphans > /dev/null 2>&1 || true" EXIT
 
 # Pivot the driver's one-row-per-cell output so each line holds an adapter and
-# payload with both codecs side by side: adapters compare down the table,
-# codecs across it.
+# payload with both codecs side by side.
 rows=$(php tests/bench/codec.php | awk '
     {
         key = $1 " " $3
@@ -63,11 +62,11 @@ table="| adapter | payload | bytes json / igbinary | save ops/s json / igbinary 
 |---|---|---|---|---|---|
 ${rows}"
 
-section="### cache — json vs igbinary, alone and through the Redis adapters (${CORES} cores, ${ITERATIONS} ops, median of ${REPEAT})
+section="### cache — json vs igbinary, alone and through Redis (${CORES} cores, ${ITERATIONS} ops, median of ${REPEAT})
 
 ${table}
 
-_Adapter \`none\` is the codec by itself: save is encode, load is decode. \`small\` is one document, \`large\` a page of 50. Compare adapters down a column and codecs within a cell._"
+_Adapter \`none\` is the codec by itself: save is encode, load is decode. \`small\` is one document, \`large\` a page of 50. Codecs compare within a cell._"
 
 echo
 echo "$table"

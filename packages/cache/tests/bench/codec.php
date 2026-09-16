@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Codec benchmark: what each codec costs, alone and once an adapter carries it.
+ * Codec benchmark: what each codec costs, alone and once Redis carries it.
  *
  * The first rows time the codec by itself, so the encode/decode cost is visible
  * without a network round trip in front of it. The rest drive Cache::save() and
@@ -19,11 +19,8 @@
 
 declare(strict_types=1);
 
-use function Swoole\Coroutine\run;
-
 use Utopia\Cache\Adapter;
 use Utopia\Cache\Adapter\Redis as RedisAdapter;
-use Utopia\Cache\Adapter\Redis\Multiplexing;
 use Utopia\Cache\Cache;
 use Utopia\Cache\Codec;
 use Utopia\Cache\Codec\Igbinary;
@@ -140,17 +137,5 @@ if (extension_loaded('redis')) {
         $redis->connect($host, $port);
 
         return new RedisAdapter($redis, $codec);
-    });
-}
-
-if (extension_loaded('swoole')) {
-    run(static function () use ($benchAdapter, $host, $port): void {
-        $adapters = [];
-        $benchAdapter('redis-multiplexing', static function (Codec $codec) use (&$adapters, $host, $port): Adapter {
-            return $adapters[] = new Multiplexing($host, $port, codec: $codec);
-        });
-        foreach ($adapters as $adapter) {
-            $adapter->disconnect();
-        }
     });
 }
