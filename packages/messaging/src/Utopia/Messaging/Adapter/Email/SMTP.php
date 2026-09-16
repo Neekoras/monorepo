@@ -63,7 +63,7 @@ class SMTP extends EmailAdapter
         private readonly int $timeout = 30,
         private readonly bool $keepAlive = false,
         private readonly int $timelimit = 30,
-        private readonly int $pingThreshold = 100,
+        private readonly int $pingThreshold = 30,
         private readonly int $restartThreshold = 100,
         private readonly int $connections = 10,
     ) {
