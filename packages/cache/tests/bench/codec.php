@@ -90,12 +90,12 @@ $row = static function (string $adapter, string $codec, string $payload, int $by
     printf("%s %s %s %d %.0f %.0f\n", $adapter, $codec, $payload, $bytes, $save, $load);
 };
 
-// Codec alone: the pure encode/decode cost with nothing in front of it.
+// No adapter: the pure encode/decode cost with nothing in front of it.
 foreach ($payloads as $payloadName => $payload) {
     foreach ($codecs as $codecName => $codec) {
         $encoded = $codec->encode($payload);
         $row(
-            'codec',
+            'none',
             $codecName,
             $payloadName,
             strlen($encoded),

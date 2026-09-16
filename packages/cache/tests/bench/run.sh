@@ -51,7 +51,7 @@ section="### cache — codec cost alone and through the Redis adapters (${CORES}
 
 ${table}
 
-_\`codec\` rows time encode (save column) and decode (load column) with no adapter in front. \`small\` is one document, \`large\` a page of 50._"
+_Rows with adapter \`none\` time encode (save column) and decode (load column) with no adapter in front. \`small\` is one document, \`large\` a page of 50._"
 
 echo
 echo "$table"
