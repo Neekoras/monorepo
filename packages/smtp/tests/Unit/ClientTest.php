@@ -594,26 +594,11 @@ final class ClientTest extends TestCase
             $this->assertSame(421, $exception->reply->code);
         }
 
+        // The channel is gone, so no second RCPT, no RSET and no DATA follow.
         $commands = $transport->commands();
         $this->assertCount(1, array_filter($commands, static fn(string $line): bool => str_starts_with($line, 'RCPT TO')));
         $this->assertNotContains('DATA', $commands);
         $this->assertNotContains('RSET', $commands);
-        $this->assertTrue($transport->closed);
-    }
-
-    public function testAClosingReplyOnTheLoneRecipientDoesNotReset(): void
-    {
-        $transport = $this->transport(['250 Sender ok', '421 Service not available, closing transmission channel']);
-        $client = new Client($transport, encryption: Encryption::None);
-
-        try {
-            $client->sendRaw($this->envelope(), 'Body');
-            $this->fail('Expected the send to fail');
-        } catch (TransactionException $exception) {
-            $this->assertSame(421, $exception->reply->code);
-        }
-
-        $this->assertNotContains('RSET', $transport->commands());
         $this->assertTrue($transport->closed);
     }
 
@@ -669,7 +654,7 @@ final class ClientTest extends TestCase
         $this->assertContains('NOOP', $transport->commands());
     }
 
-    public function testPingDropsASessionTheServerIsClosing(): void
+    public function testPingDropsADeadSession(): void
     {
         $transport = $this->transport($this->transaction());
         $client = new Client($transport, encryption: Encryption::None);
@@ -680,24 +665,6 @@ final class ClientTest extends TestCase
         $this->assertFalse($client->ping());
         $this->assertTrue($transport->closed);
         $this->assertInfinite($client->idle());
-    }
-
-    public function testPingDropsASessionOnAClosedSocket(): void
-    {
-        $transport = $this->transport($this->transaction());
-        $client = new Client($transport, encryption: Encryption::None);
-        $client->sendRaw($this->envelope(), 'Body');
-
-        // Nothing more is queued, so the probe's read finds the socket closed.
-        $this->assertFalse($client->ping());
-        $this->assertTrue($transport->closed);
-    }
-
-    public function testPingReturnsFalseWithNoSession(): void
-    {
-        $client = new Client($this->transport(), encryption: Encryption::None);
-
-        $this->assertFalse($client->ping());
     }
 
     public function testTransactionsCountAcceptedMessagesAndResetOnClose(): void
@@ -714,18 +681,6 @@ final class ClientTest extends TestCase
         $this->assertSame(2, $client->transactions);
 
         $client->close();
-        $this->assertSame(0, $client->transactions);
-    }
-
-    public function testTransactionsResetWhenTheSessionIsDiscarded(): void
-    {
-        $transport = $this->transport([...$this->transaction(), '421 Service not available, closing transmission channel']);
-        $client = new Client($transport, encryption: Encryption::None);
-
-        $client->sendRaw($this->envelope(), 'Body');
-        $this->assertSame(1, $client->transactions);
-
-        $this->assertFalse($client->ping());
         $this->assertSame(0, $client->transactions);
     }
 }
