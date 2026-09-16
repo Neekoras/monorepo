@@ -32,7 +32,16 @@ final class Client
     /** A mechanism that keeps challenging is failing, whatever it says. */
     private const int MAX_CHALLENGES = 10;
 
+    /** RFC 5321 section 4.2.3: service not available, closing transmission channel. */
+    private const int CLOSING = 421;
+
     private bool $ready = false;
+
+    /** When the server last answered, on the monotonic clock, in nanoseconds. */
+    private int $lastReply = 0;
+
+    /** Messages the server has accepted over this connection. */
+    private int $transactions = 0;
 
     private Capabilities $capabilities;
 
@@ -106,7 +115,11 @@ final class Client
         // A refusal here is clean -- the server read the dot and is back in
         // command state -- so only a transaction failure keeps the connection.
         // exchange() decides that; a dead or desynchronised stream does not.
-        return new Result($this->messageId($this->exchange([250])), $accepted, $rejected);
+        $result = new Result($this->messageId($this->exchange([250])), $accepted, $rejected);
+
+        ++$this->transactions;
+
+        return $result;
     }
 
     public function capabilities(): Capabilities
@@ -164,6 +177,54 @@ final class Client
         $this->command('NOOP', [250]);
     }
 
+    /**
+     * Seconds since the server last answered, or INF when there is no session.
+     *
+     * A server drops a session that sits idle, and the socket says nothing
+     * about it until the next command fails. This is what a holder measures
+     * to decide whether to ping() before trusting the session with a message.
+     */
+    public function idle(): float
+    {
+        if (! $this->ready) {
+            return INF;
+        }
+
+        return (hrtime(true) - $this->lastReply) / 1_000_000_000;
+    }
+
+    /**
+     * Messages accepted over the connection so far; a holder that rotates
+     * sessions after so many reads this. Dropping the connection resets it.
+     */
+    public function transactions(): int
+    {
+        return $this->transactions;
+    }
+
+    /**
+     * Whether the session still answers. One that does not is dropped, so the
+     * next send dials afresh instead of losing a message to MAIL FROM.
+     */
+    public function ping(): bool
+    {
+        if (! $this->ready) {
+            return false;
+        }
+
+        try {
+            $this->noop();
+
+            return true;
+        } catch (SmtpException) {
+            // A dead stream and a 421 are already discarded on the way here;
+            // any other refusal of NOOP is a session not worth keeping either.
+            $this->discard();
+
+            return false;
+        }
+    }
+
     public function reset(): void
     {
         $this->command('RSET', [250]);
@@ -192,6 +253,7 @@ final class Client
         $this->ready = false;
         $this->buffer = '';
         $this->capabilities = Capabilities::none();
+        $this->transactions = 0;
     }
 
     private function start(): void
@@ -390,9 +452,16 @@ final class Client
     private function expect(array $expect): Reply
     {
         $reply = $this->reply();
+        $this->lastReply = hrtime(true);
 
         if (\in_array($reply->code, $expect, true)) {
             return $reply;
+        }
+
+        // The server said it is hanging up, so the session is gone whatever
+        // the socket reports, and the next start() dials again.
+        if ($reply->code === self::CLOSING) {
+            $this->discard();
         }
 
         $wanted = implode(' or ', array_map(\strval(...), $expect));
