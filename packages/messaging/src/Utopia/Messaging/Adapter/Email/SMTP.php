@@ -6,6 +6,10 @@ use Swoole\Coroutine;
 use Utopia\Messaging\Adapter\Email as EmailAdapter;
 use Utopia\Messaging\Messages\Email as EmailMessage;
 use Utopia\Messaging\Response;
+use Utopia\Pools\Adapter\Stack;
+use Utopia\Pools\Adapter\Swoole as SwoolePoolAdapter;
+use Utopia\Pools\Connection;
+use Utopia\Pools\Pool;
 use Utopia\SMTP\Auth\Login;
 use Utopia\SMTP\Auth\Plain;
 use Utopia\SMTP\Client;
@@ -20,7 +24,18 @@ class SMTP extends EmailAdapter
 {
     protected const NAME = 'SMTP';
 
-    private ?Client $client = null;
+    /**
+     * @var Pool<Client>|null
+     */
+    private ?Pool $pool = null;
+
+    /**
+     * Every session the pool has dialled, so disconnect() can say goodbye to
+     * the idle ones the pool does not hand back.
+     *
+     * @var list<Client>
+     */
+    private array $clients = [];
 
     /**
      * @param string $host SMTP hosts. Either a single hostname or multiple semicolon-delimited hostnames. A port may follow a hostname after a colon (e.g. "smtp1.example.com:25;smtp2.example.com"), and an address literal is bracketed to keep its own colons apart from it (e.g. "[::1]:587"). An encryption prefix may lead each entry (e.g. "tls://smtp1.example.com:587;ssl://smtp2.example.com:465"). Hosts are tried in order.
@@ -35,6 +50,7 @@ class SMTP extends EmailAdapter
      * @param int $timelimit SMTP command timelimit in seconds.
      * @param int $pingThreshold Seconds a kept session may sit idle before it is probed ahead of the next message.
      * @param int $restartThreshold Messages a kept session carries before it is replaced. 0 disables.
+     * @param int $connections Sessions kept open at most when keepAlive is on. Each send owns one, and a send past this many waits up to $timeout for one to come back.
      */
     public function __construct(
         private readonly string $host,
@@ -49,6 +65,7 @@ class SMTP extends EmailAdapter
         private readonly int $timelimit = 30,
         private readonly int $pingThreshold = 100,
         private readonly int $restartThreshold = 100,
+        private readonly int $connections = 10,
     ) {
         parent::__construct();
         if (!\in_array($this->smtpSecure, ['', 'ssl', 'tls'])) {
@@ -75,14 +92,17 @@ class SMTP extends EmailAdapter
         $recipients = $this->recipients($message);
 
         try {
-            $client = $this->client();
-        } catch (SmtpException $exception) {
+            $connection = $this->keepAlive ? $this->connection() : null;
+            $client = $connection instanceof Connection ? $connection->resource : $this->dial();
+        } catch (\Exception $exception) {
             foreach ($recipients as $email) {
                 $response->addResult($email, $exception->getMessage());
             }
 
             return $response->toArray();
         }
+
+        $keep = $connection instanceof Connection;
 
         try {
             $result = $client->send($this->build($message));
@@ -108,9 +128,13 @@ class SMTP extends EmailAdapter
                 $response->addResult($email, $exception->getMessage());
             }
 
-            $this->disconnect();
+            $keep = false;
         } finally {
-            if (!$this->keepAlive) {
+            if ($keep) {
+                $connection->reclaim();
+            } elseif ($connection instanceof Connection) {
+                $this->drop($connection);
+            } else {
                 $client->close();
             }
         }
@@ -123,26 +147,71 @@ class SMTP extends EmailAdapter
      */
     public function disconnect(): void
     {
-        $this->held()?->close();
-        $this->hold(null);
+        foreach ($this->clients as $client) {
+            $client->close();
+        }
+
+        $this->clients = [];
+        $this->pool = null;
+    }
+
+    /**
+     * A pooled session this send owns until it is reclaimed or dropped.
+     *
+     * @return Connection<Client>
+     */
+    private function connection(): Connection
+    {
+        $connection = $this->pool()->pop();
+
+        if ($this->reusable($connection->resource)) {
+            return $connection;
+        }
+
+        $this->drop($connection);
+
+        return $this->pool()->pop();
+    }
+
+    /**
+     * @param  Connection<Client>  $connection
+     */
+    private function drop(Connection $connection): void
+    {
+        $client = $connection->resource;
+
+        // Untrack before the QUIT: close() yields, and a concurrent drop that
+        // ran in the gap would otherwise filter a stale copy and lose the other
+        // coroutine's removal. Every mutation of shared state happens first.
+        $this->clients = array_values(array_filter($this->clients, fn(Client $tracked): bool => $tracked !== $client));
+        $connection->destroy();
+        $client->close();
+    }
+
+    /**
+     * @return Pool<Client>
+     */
+    private function pool(): Pool
+    {
+        return $this->pool ??= new Pool(
+            adapter: $this->coroutine() ? new SwoolePoolAdapter() : new Stack(),
+            name: 'smtp',
+            size: $this->connections,
+            init: function (): Client {
+                $client = $this->dial();
+                $this->clients[] = $client;
+
+                return $client;
+            },
+            timeout: (float) $this->timeout,
+        );
     }
 
     /**
      * The first host that answers, tried in the order they were given.
      */
-    private function client(): Client
+    private function dial(): Client
     {
-        $held = $this->held();
-
-        if ($held instanceof Client) {
-            if ($this->reusable($held)) {
-                return $held;
-            }
-
-            $held->close();
-            $this->hold(null);
-        }
-
         $timeouts = new Timeouts(
             connect: (float) $this->timeout,
             read: (float) $this->timelimit,
@@ -170,10 +239,6 @@ class SMTP extends EmailAdapter
                 continue;
             }
 
-            if ($this->keepAlive) {
-                $this->hold($client);
-            }
-
             return $client;
         }
 
@@ -193,28 +258,6 @@ class SMTP extends EmailAdapter
         }
 
         return $client->ping();
-    }
-
-    private function held(): ?Client
-    {
-        if ($this->coroutine()) {
-            $client = Coroutine::getContext()[self::class] ?? null;
-
-            return $client instanceof Client ? $client : null;
-        }
-
-        return $this->client;
-    }
-
-    private function hold(?Client $client): void
-    {
-        if ($this->coroutine()) {
-            Coroutine::getContext()[self::class] = $client;
-
-            return;
-        }
-
-        $this->client = $client;
     }
 
     private function coroutine(): bool
