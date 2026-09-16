@@ -83,6 +83,12 @@ final class Client
                 $this->command("RCPT TO:<{$recipient}>", [250, 251, 252]);
                 $accepted[] = $recipient;
             } catch (TransactionException $exception) {
+                // A 421 closes the channel, so the transport is already gone.
+                // Stop rather than issue the next command on a dead stream.
+                if (! $this->ready) {
+                    throw $exception;
+                }
+
                 // Partial refusal is normal and the message still reaches the rest.
                 $rejected[$recipient] = $exception->reply;
                 $refusal ??= $exception->reply;
@@ -90,7 +96,9 @@ final class Client
         }
 
         if ($refusal instanceof \Utopia\SMTP\Reply && $accepted === []) {
-            $this->reset();
+            if ($this->ready) {
+                $this->reset();
+            }
 
             throw new TransactionException($refusal, 'Every recipient was refused');
         }
