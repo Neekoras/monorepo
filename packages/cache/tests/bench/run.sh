@@ -39,19 +39,35 @@ fi
 # shellcheck disable=SC2064
 [ -n "$COMPOSE_STARTED" ] && trap "docker compose -p '$PROJECT' down -v --remove-orphans > /dev/null 2>&1 || true" EXIT
 
-rows=$(php tests/bench/codec.php | awk '{
-    printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6
-}')
+# Pivot the driver's one-row-per-cell output so each line holds an adapter and
+# payload with both codecs side by side: adapters compare down the table,
+# codecs across it.
+rows=$(php tests/bench/codec.php | awk '
+    {
+        key = $1 " " $3
+        if (!(key in seen)) { seen[key] = 1; order[++n] = key }
+        bytes[key, $2] = $4; save[key, $2] = $5; load[key, $2] = $6
+    }
+    END {
+        for (i = 1; i <= n; i++) {
+            key = order[i]; split(key, k, " ")
+            printf "| %s | %s | %s / %s | %s / %s | %s / %s | %.2fx |\n", k[1], k[2],
+                bytes[key, "json"], bytes[key, "igbinary"],
+                save[key, "json"], save[key, "igbinary"],
+                load[key, "json"], load[key, "igbinary"],
+                load[key, "igbinary"] / load[key, "json"]
+        }
+    }')
 
-table="| adapter | codec | payload | bytes | save ops/s | load ops/s |
+table="| adapter | payload | bytes json / igbinary | save ops/s json / igbinary | load ops/s json / igbinary | igbinary load speedup |
 |---|---|---|---|---|---|
 ${rows}"
 
-section="### cache — codec cost alone and through the Redis adapters (${CORES} cores, ${ITERATIONS} ops, median of ${REPEAT})
+section="### cache — json vs igbinary, alone and through the Redis adapters (${CORES} cores, ${ITERATIONS} ops, median of ${REPEAT})
 
 ${table}
 
-_Rows with adapter \`none\` time encode (save column) and decode (load column) with no adapter in front. \`small\` is one document, \`large\` a page of 50._"
+_Adapter \`none\` is the codec by itself: save is encode, load is decode. \`small\` is one document, \`large\` a page of 50. Compare adapters down a column and codecs within a cell._"
 
 echo
 echo "$table"
