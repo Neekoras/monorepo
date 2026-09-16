@@ -44,7 +44,8 @@
     },
     "scripts": {
         "test": "phpunit --testsuite unit",
-        "test:e2e": "phpunit --testsuite e2e"
+        "test:e2e": "phpunit --testsuite e2e",
+        "bench": "bash tests/bench/run.sh"
     },
     "minimum-stability": "stable",
     "prefer-stable": true,

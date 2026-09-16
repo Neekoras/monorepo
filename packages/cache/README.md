@@ -97,3 +97,11 @@ docker compose down -v
 ## Copyright and license
 
 The MIT License (MIT) [http://www.opensource.org/licenses/mit-license.php](http://www.opensource.org/licenses/mit-license.php)
+
+## Benchmarks
+
+The codec benchmark times each codec alone and through the Redis adapters. It needs the `igbinary` extension and starts Redis from the package's compose file when nothing is listening on the offset port:
+
+```bash
+composer bench
+```
