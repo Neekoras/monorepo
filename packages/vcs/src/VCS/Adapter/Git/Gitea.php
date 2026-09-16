@@ -20,7 +20,7 @@ class Gitea extends Git
 
     protected ?string $refreshToken = null;
 
-    protected string $giteaUrl;
+    protected string $giteaUrl = 'http://gitea:3000';
 
     /**
      * Global Headers
