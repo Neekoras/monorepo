@@ -86,7 +86,6 @@ graph TD
     platform --> servers
     pools --> telemetry
     queue --> di
-    queue --> lock
     queue --> servers
     queue --> pools
     queue --> telemetry
