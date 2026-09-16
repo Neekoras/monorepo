@@ -5,7 +5,6 @@ namespace Utopia\CircuitBreaker;
 use Utopia\Telemetry\Adapter as Telemetry;
 use Utopia\Telemetry\Counter;
 use Utopia\Telemetry\Gauge;
-use Utopia\Telemetry\UpDownCounter;
 
 class CircuitBreaker
 {
@@ -28,6 +27,7 @@ class CircuitBreaker
      * timeout to survive a crashed holder, and would still be a guess.
      */
     private int $halfOpenInFlight = 0;
+    private int $activeCalls = 0;
 
     /**
      * The rolling window, kept in this process and not mirrored to the cache
@@ -51,10 +51,6 @@ class CircuitBreaker
     private ?Counter $callbackFailures = null;
     private ?Counter $fallbacks = null;
     private ?Counter $transitions = null;
-    private ?UpDownCounter $activeCalls = null;
-    private ?Gauge $stateGauge = null;
-    private ?Gauge $failuresGauge = null;
-    private ?Gauge $successesGauge = null;
     private ?Gauge $eventTimestamp = null;
 
     /**
@@ -124,10 +120,21 @@ class CircuitBreaker
     public function setTelemetry(Telemetry $telemetry): void
     {
         $this->calls = $telemetry->createCounter($this->metricName('breaker.calls'), '{call}');
-        $this->activeCalls = $telemetry->createUpDownCounter($this->metricName('breaker.active_calls'), '{call}');
-        $this->stateGauge = $telemetry->createGauge($this->metricName('breaker.state'));
-        $this->failuresGauge = $telemetry->createGauge($this->metricName('breaker.failures'), '{failure}');
-        $this->successesGauge = $telemetry->createGauge($this->metricName('breaker.successes'), '{success}');
+
+        // State, counts and calls in flight are read when the adapter collects, not written on
+        // every call: a breaker in front of the cache is called tens of times per request, and
+        // recording four gauges each time cost more CPU than the cache read it guarded.
+        $telemetry->createObservableGauge($this->metricName('breaker.active_calls'), '{call}')
+            ->observe(fn(callable $observe) => $observe($this->activeCalls, $this->telemetryAttributes()));
+        $telemetry->createObservableGauge($this->metricName('breaker.state'))
+            ->observe(fn(callable $observe) => $observe($this->stateValue(), $this->telemetryAttributes()));
+        $telemetry->createObservableGauge($this->metricName('breaker.failures'), '{failure}')
+            ->observe(fn(callable $observe) => $observe(
+                $this->state === CircuitState::HALF_OPEN ? $this->failures : $this->windowFailureCount(),
+                $this->telemetryAttributes(),
+            ));
+        $telemetry->createObservableGauge($this->metricName('breaker.successes'), '{success}')
+            ->observe(fn(callable $observe) => $observe($this->successes, $this->telemetryAttributes()));
 
         $this->callbackFailures = $telemetry->createCounter($this->metricName('breaker.callback_failures'), '{failure}');
         $this->fallbacks = $telemetry->createCounter($this->metricName('breaker.fallbacks'), '{fallback}');
@@ -140,14 +147,14 @@ class CircuitBreaker
         $initialState = $this->state;
         $outcome = 'unknown';
         $exceptionType = null;
-        $activeAttributes = null;
+        $entered = false;
         $probing = false;
 
         try {
             $this->updateState();
             $initialState = $this->state;
-            $activeAttributes = $this->telemetryAttributes(['circuit_breaker.state' => $initialState->value]);
-            $this->activeCalls?->add(1, $activeAttributes);
+            $this->activeCalls++;
+            $entered = true;
 
             if ($this->state === CircuitState::OPEN) {
                 $outcome = 'short_circuit';
@@ -226,9 +233,8 @@ class CircuitBreaker
                     'circuit_breaker.outcome' => $outcome,
                 ]);
             }
-            $this->recordState();
-            if ($activeAttributes !== null) {
-                $this->activeCalls?->add(-1, $activeAttributes);
+            if ($entered) {
+                $this->activeCalls--;
             }
         }
     }
@@ -546,17 +552,6 @@ class CircuitBreaker
         ] + $attributes));
     }
 
-    private function recordState(): void
-    {
-        $attributes = $this->telemetryAttributes();
-        $this->stateGauge?->record($this->stateValue(), $attributes);
-        $this->failuresGauge?->record(
-            $this->state === CircuitState::HALF_OPEN ? $this->failures : $this->windowFailureCount(),
-            $attributes,
-        );
-        $this->successesGauge?->record($this->successes, $attributes);
-    }
-
     private function stateValue(): int
     {
         return match ($this->state) {
@@ -609,12 +604,11 @@ class CircuitBreaker
 
     /**
      * Force the breaker into the open state. Idempotent: re-tripping refreshes
-     * openedAt and re-emits gauges, but does not record a transition.
+     * openedAt but does not record a transition.
      */
     public function trip(): void
     {
         $this->syncFromCache();
         $this->transitionToOpen();
-        $this->recordState();
     }
 }
