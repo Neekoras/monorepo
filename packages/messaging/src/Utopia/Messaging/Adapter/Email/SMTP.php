@@ -32,7 +32,7 @@ class SMTP extends EmailAdapter
      * @param int $timeout SMTP timeout in seconds.
      * @param bool $keepAlive Whether to reuse the SMTP connection across process() calls.
      * @param int $timelimit SMTP command timelimit in seconds.
-     * @param int $pingThreshold Seconds a kept session may sit idle before it is probed ahead of the next message.
+     * @param int $pingThreshold Seconds a kept session may sit idle before it is probed ahead of the next message. Keep it under the server's idle timeout: a session the server closed inside the threshold fails its send without a retry. 0 probes before every reuse.
      * @param int $restartThreshold Messages a kept session carries before it is replaced. 0 disables.
      */
     public function __construct(
