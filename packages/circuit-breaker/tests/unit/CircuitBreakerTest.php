@@ -474,15 +474,75 @@ final class CircuitBreakerTest extends TestCase
     }
 
     /**
+     * A discarded breaker must not be kept alive by its observation, and must
+     * stop reporting; a breaker bound twice to the same adapter, or moved to
+     * another one, must report exactly once, on the adapter it is bound to.
+     */
+    public function testObservationsFollowTheBreakerLifecycle(): void
+    {
+        $first = new TestTelemetry();
+        $second = new TestTelemetry();
+        $kept = new CircuitBreaker(key: 'kept', telemetry: $first);
+
+        $discarded = new CircuitBreaker(key: 'discarded', telemetry: $first);
+        $reference = \WeakReference::create($discarded);
+        unset($discarded);
+        gc_collect_cycles();
+
+        $this->assertNotInstanceOf(\Utopia\CircuitBreaker\CircuitBreaker::class, $reference->get());
+        $this->assertSame(['kept' => 0], $this->observeSeries($first)['breaker.state']);
+        $this->assertCount(1, $first->observableGauges['breaker.state']->callbacks);
+
+        $kept->setTelemetry($first);
+        $this->assertSame(['kept' => 0], $this->observeSeries($first)['breaker.state']);
+        $this->assertCount(1, $first->observableGauges['breaker.state']->callbacks);
+
+        $kept->setTelemetry($second);
+        $this->assertSame([], $this->observeSeries($first)['breaker.state']);
+        $this->assertSame(['kept' => 0], $this->observeSeries($second)['breaker.state']);
+    }
+
+    /**
+     * The verdict is shared through the cache adapter. A breaker that receives
+     * no calls must still report a circuit another process tripped, and must
+     * not move an open circuit to half-open merely because it was collected.
+     */
+    public function testIdleBreakerObservesTheSharedState(): void
+    {
+        $cache = $this->createArrayAdapter();
+        $telemetry = new TestTelemetry();
+        $idle = new CircuitBreaker(timeout: 30, cache: $cache, key: 'users-api', telemetry: $telemetry);
+        $active = new CircuitBreaker(timeout: 30, cache: $cache, key: 'users-api');
+
+        $this->assertSame(0, $this->observe($telemetry)['breaker.state']);
+
+        $active->trip();
+
+        $this->assertSame(1, $this->observe($telemetry)['breaker.state']);
+        $this->assertSame(1, $this->observe($telemetry)['breaker.state']);
+        $this->assertTrue($idle->isOpen());
+    }
+
+    /**
      * @return array<string, float|int> gauge name => last observed value
      */
     private function observe(TestTelemetry $telemetry): array
     {
+        return array_map(static fn(array $series): float|int => end($series), array_filter($this->observeSeries($telemetry)));
+    }
+
+    /**
+     * @return array<string, array<string, float|int>> gauge name => breaker name => observed value
+     */
+    private function observeSeries(TestTelemetry $telemetry): array
+    {
         $observed = [];
         foreach ($telemetry->observableGauges as $name => $gauge) {
+            $observed[$name] = [];
             foreach ($gauge->callbacks as $callback) {
-                $callback(function (float|int $value) use (&$observed, $name): void {
-                    $observed[$name] = $value;
+                $callback(function (float|int $value, iterable $attributes = []) use (&$observed, $name): void {
+                    $attributes = iterator_to_array($attributes);
+                    $observed[$name][$attributes['circuit_breaker.name']] = $value;
                 });
             }
         }

@@ -29,6 +29,20 @@ class CircuitBreaker
     private int $halfOpenInFlight = 0;
     private int $activeCalls = 0;
 
+    private ?Telemetry $telemetry = null;
+
+    /**
+     * The breakers each telemetry adapter observes, by metric prefix. One
+     * observation callback per adapter and prefix is registered the first time
+     * a breaker binds to that adapter, and it walks the live breakers in this
+     * map at collection. The keys are weak, so a discarded breaker drops out of
+     * collection and is not kept alive by the callback, and a breaker that
+     * rebinds moves rather than registering a second time.
+     *
+     * @var \WeakMap<Telemetry, array<string, \WeakMap<CircuitBreaker, true>>>|null
+     */
+    private static ?\WeakMap $observed = null;
+
     /**
      * The rolling window, kept in this process and not mirrored to the cache
      * adapter.
@@ -124,17 +138,23 @@ class CircuitBreaker
         // State, counts and calls in flight are read when the adapter collects, not written on
         // every call: a breaker in front of the cache is called tens of times per request, and
         // recording four gauges each time cost more CPU than the cache read it guarded.
-        $telemetry->createObservableGauge($this->metricName('breaker.active_calls'), '{call}')
-            ->observe(fn(callable $observe) => $observe($this->activeCalls, $this->telemetryAttributes()));
-        $telemetry->createObservableGauge($this->metricName('breaker.state'))
-            ->observe(fn(callable $observe) => $observe($this->stateValue(), $this->telemetryAttributes()));
-        $telemetry->createObservableGauge($this->metricName('breaker.failures'), '{failure}')
-            ->observe(fn(callable $observe) => $observe(
-                $this->state === CircuitState::HALF_OPEN ? $this->failures : $this->windowFailureCount(),
-                $this->telemetryAttributes(),
-            ));
-        $telemetry->createObservableGauge($this->metricName('breaker.successes'), '{success}')
-            ->observe(fn(callable $observe) => $observe($this->successes, $this->telemetryAttributes()));
+        if ($this->telemetry instanceof \Utopia\Telemetry\Adapter && $this->telemetry !== $telemetry) {
+            $registry = self::$observed[$this->telemetry] ?? [];
+            if (isset($registry[$this->metricPrefix])) {
+                unset($registry[$this->metricPrefix][$this]);
+            }
+        }
+        $this->telemetry = $telemetry;
+        self::$observed ??= new \WeakMap();
+        $registry = self::$observed[$telemetry] ?? [];
+        if (! isset($registry[$this->metricPrefix])) {
+            /** @var \WeakMap<CircuitBreaker, true> $breakers */
+            $breakers = new \WeakMap();
+            $registry[$this->metricPrefix] = $breakers;
+            self::$observed[$telemetry] = $registry;
+            $this->observe($telemetry, $this->metricPrefix, $breakers);
+        }
+        $registry[$this->metricPrefix][$this] = true;
 
         $this->callbackFailures = $telemetry->createCounter($this->metricName('breaker.callback_failures'), '{failure}');
         $this->fallbacks = $telemetry->createCounter($this->metricName('breaker.fallbacks'), '{fallback}');
@@ -514,6 +534,46 @@ class CircuitBreaker
         $prefix = trim($this->metricPrefix, '.');
 
         return $prefix === '' ? $name : $prefix . '.' . $name;
+    }
+
+    /**
+     * Register the gauges that every breaker bound to $telemetry with $prefix
+     * reports through, reading each live breaker when the adapter collects.
+     * The shared verdict (state, failures and successes while half-open) is
+     * refreshed from the cache adapter first, so an idle breaker reports a
+     * circuit tripped or recovered by another process; the open timeout is not
+     * applied here, because collecting telemetry must not move the circuit.
+     *
+     * @param \WeakMap<CircuitBreaker, true> $breakers
+     */
+    private function observe(Telemetry $telemetry, string $prefix, \WeakMap $breakers): void
+    {
+        $prefix = trim($prefix, '.');
+        $gauge = static function (string $name, ?string $unit, \Closure $value) use ($telemetry, $prefix, $breakers): void {
+            $telemetry->createObservableGauge($prefix === '' ? $name : $prefix . '.' . $name, $unit)
+                ->observe(static function (callable $observe) use ($breakers, $value): void {
+                    foreach ($breakers as $breaker => $_) {
+                        $observe($value($breaker), $breaker->telemetryAttributes());
+                    }
+                });
+        };
+
+        $gauge('breaker.active_calls', '{call}', static fn(self $breaker): int => $breaker->activeCalls);
+        $gauge('breaker.state', null, static function (self $breaker): int {
+            $breaker->syncFromCache();
+
+            return $breaker->stateValue();
+        });
+        $gauge('breaker.failures', '{failure}', static function (self $breaker): int {
+            $breaker->syncFromCache();
+
+            return $breaker->state === CircuitState::HALF_OPEN ? $breaker->failures : $breaker->windowFailureCount();
+        });
+        $gauge('breaker.successes', '{success}', static function (self $breaker): int {
+            $breaker->syncFromCache();
+
+            return $breaker->successes;
+        });
     }
 
     /**
