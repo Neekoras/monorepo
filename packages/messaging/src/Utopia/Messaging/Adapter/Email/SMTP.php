@@ -162,15 +162,18 @@ class SMTP extends EmailAdapter
      */
     private function connection(): Connection
     {
-        $connection = $this->pool()->pop();
+        // Every idle session may have been closed during the same quiet stretch,
+        // so keep dropping dead ones until a live session comes back. Once the
+        // idle set is spent, pop() dials a fresh one, which is always reusable.
+        while (true) {
+            $connection = $this->pool()->pop();
 
-        if ($this->reusable($connection->resource)) {
-            return $connection;
+            if ($this->reusable($connection->resource)) {
+                return $connection;
+            }
+
+            $this->drop($connection);
         }
-
-        $this->drop($connection);
-
-        return $this->pool()->pop();
     }
 
     /**
