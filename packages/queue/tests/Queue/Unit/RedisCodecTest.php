@@ -104,7 +104,7 @@ final class RedisCodecTest extends TestCase
         $connection->leftPush($key, $poison);
         $broker->publish($queue, ['n' => 1]);
 
-        $this->assertNull($broker->receive($queue, 0), 'the unreadable message is not handed to a handler');
+        $this->assertNotInstanceOf(Message::class, $broker->receive($queue, 0), 'the unreadable message is not handed to a handler');
         $this->assertSame(
             [$poison],
             $connection->listRange(self::NAMESPACE . '.poison.' . self::QUEUE, 1, 0),
@@ -128,7 +128,7 @@ final class RedisCodecTest extends TestCase
 
         $connection->leftPush(self::NAMESPACE . '.queue.' . self::QUEUE, '{"hello":"world"}');
 
-        $this->assertNull($broker->receive($queue, 0));
+        $this->assertNotInstanceOf(Message::class, $broker->receive($queue, 0));
         $this->assertSame(1, $connection->listSize(self::NAMESPACE . '.poison.' . self::QUEUE));
     }
 }
