@@ -199,6 +199,8 @@ What it costs the server is exact, and has no clock in it. Counted from Redis's 
 
 The fetch side falls by 3.8x; the total only by 1.7x, because `commit()` is four commands and this does not touch it. **On Redis the acknowledgment is now the larger half of the cost**, and no batch size changes that.
 
+A batch of one is the previous single `receive()`, not an approximation of it: both send 9.00 commands per message, and the only difference is an `INCRBY key 1` where the older code sent `INCR key` — the same round trip. So the rows below are a before and after, and the three command-identical configurations (the previous code, this code's `receive()`, and this code at `batch: 1`) land within each other's run-to-run spread.
+
 Whether that becomes throughput depends entirely on whether those commands were the constraint. Ratio of batch-16 to batch-1, 16 coroutines, 10,000 messages, two passes in opposite order:
 
 | the handler | `Broker\Redis` | `Broker\Nats` |
