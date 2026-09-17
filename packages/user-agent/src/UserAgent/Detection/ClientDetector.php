@@ -25,7 +25,8 @@ final class ClientDetector
             ?? self::firefox($userAgent)
             ?? self::safari($userAgent)
             ?? self::internetExplorer($userAgent)
-            ?? self::library($userAgent);
+            ?? self::library($userAgent)
+            ?? self::mobileApp($userAgent);
 
         return $client ?? new Client();
     }
@@ -303,6 +304,22 @@ final class ClientDetector
         }
 
         return null;
+    }
+
+    private static function mobileApp(string $userAgent): ?Client
+    {
+        // Native Flutter iOS clients send a bundle identifier and version,
+        // followed by the device's machine identifier and iOS version.
+        $pattern = '/^([A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+)'
+            . '\/([0-9]+(?:\.[0-9]+)*) '
+            . '(?:i(?:Phone|Pad|Pod)[0-9]+,[0-9]+|arm64|x86_64|i386) '
+            . 'iOS\/[0-9]+(?:\.[0-9]+)*$/D';
+
+        if (preg_match($pattern, $userAgent, $matches) !== 1) {
+            return null;
+        }
+
+        return new Client('mobile app', null, $matches[1], self::displayVersion($matches[2]));
     }
 
     private static function tokenVersion(string $userAgent, string $token): ?string
