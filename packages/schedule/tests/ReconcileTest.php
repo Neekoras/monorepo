@@ -253,10 +253,8 @@ final class ReconcileTest extends TestCase
     {
         $clock = new TestClock(new \DateTimeImmutable('2026-08-18 03:00:30.000000'));
         $telemetry = new TestTelemetry();
-        $errors = new class {
-            /** @var list<string> */
-            public array $messages = [];
-        };
+        /** @var list<string> $errors */
+        $errors = [];
         $scheduler = new Scheduler(
             source: new SnapshotSource(
                 snapshot: fn(): array => [new Row('a', 'v1'), new Row('bad', 'v1'), new Row('c', 'v1')],
@@ -271,8 +269,8 @@ final class ReconcileTest extends TestCase
             store: new MemoryStore(),
             clock: $clock,
             telemetry: $telemetry,
-            onError: function (\Throwable $error) use ($errors): void {
-                $errors->messages[] = $error->getMessage();
+            onError: function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error->getMessage();
             },
         );
 
@@ -284,7 +282,7 @@ final class ReconcileTest extends TestCase
         $ids = array_map(fn(Occurrence $occurrence): string => $occurrence->id, $scheduler->tick());
 
         $this->assertSame(['a', 'c'], $ids);
-        $this->assertSame(['poison row'], $errors->messages);
+        $this->assertSame(['poison row'], $errors);
 
         /** @var list<float|int> $counted */
         $counted = get_object_vars($telemetry->counters['schedule.error.total'])['values'];
