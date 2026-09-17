@@ -2,6 +2,8 @@
 
 namespace Utopia\Queue\Broker;
 
+use Utopia\Queue\Codec;
+use Utopia\Queue\Codec\Json;
 use Utopia\Queue\Connection;
 use Utopia\Queue\Consumer;
 use Utopia\Queue\Message;
@@ -31,6 +33,10 @@ class Redis implements Synchronous, Consumer
         private readonly Connection $receive,
         // Acks and publishing; wrap in Locking when shared by coroutines.
         private readonly Connection $commands,
+        // How an envelope is written and read; Json is what every release so
+        // far has put on the list. See Codec\Compat before changing it on a
+        // queue that already holds messages.
+        private readonly Codec $codec = new Json(),
     ) {}
 
     public function setReconnectCallback(?callable $callback): self
@@ -54,7 +60,7 @@ class Redis implements Synchronous, Consumer
         }
 
         try {
-            $nextMessage = $this->receive->rightPopArray("{$queue->namespace}.queue.{$queue->name}", $timeout);
+            $raw = $this->receive->rightPop("{$queue->namespace}.queue.{$queue->name}", $timeout);
             if ($this->reconnectAttempt > 0) {
                 $this->triggerReconnectSuccessCallback($queue, $this->reconnectAttempt);
             }
@@ -82,17 +88,31 @@ class Redis implements Synchronous, Consumer
             return null;
         }
 
-        if (!$nextMessage) {
+        if ($raw === false || $raw === '') {
             return null;
         }
 
-        $nextMessage['timestamp'] = (int) $nextMessage['timestamp'];
+        try {
+            $envelope = $this->codec->decode($raw);
+        } catch (\Throwable) {
+            $envelope = null;
+        }
 
-        $message = new Message($nextMessage);
+        if (!\is_array($envelope) || !isset($envelope['pid'], $envelope['queue'], $envelope['timestamp'])) {
+            $this->park($queue, $raw);
+
+            return null;
+        }
+
+        $envelope['timestamp'] = (int) $envelope['timestamp'];
+
+        $message = new Message($envelope);
         $pid = $message->getPid();
 
-        // Claim: store the job, mark it processing, bump received stats.
-        $this->receive->setArray("{$queue->namespace}.jobs.{$queue->name}.{$pid}", $nextMessage, $queue->jobTtl);
+        // Claim: store the job as it arrived, mark it processing, bump received
+        // stats. The bytes go back unchanged rather than re-encoded, which is
+        // the decode this path used to pay twice.
+        $this->receive->set("{$queue->namespace}.jobs.{$queue->name}.{$pid}", $raw, $queue->jobTtl);
         $this->receive->leftPush("{$queue->namespace}.processing.{$queue->name}", $pid);
         $this->receive->increment("{$queue->namespace}.stats.{$queue->name}.total");
         $this->receive->increment("{$queue->namespace}.stats.{$queue->name}.processing");
@@ -131,6 +151,21 @@ class Redis implements Synchronous, Consumer
         return $this->closed;
     }
 
+    /**
+     * Set aside bytes no codec on this worker can read.
+     *
+     * The pop already took them off the queue, so the choice is where they go,
+     * not whether they leave: dropping them loses the work silently, and
+     * putting them back wedges the queue behind a message every worker chokes
+     * on. The failed and dead lists hold pids, and a message nothing can decode
+     * has no pid to hold -- so the raw bytes go on a list of their own, for a
+     * human to read.
+     */
+    private function park(Queue $queue, string $raw): void
+    {
+        $this->receive->leftPush("{$queue->namespace}.poison.{$queue->name}", $raw);
+    }
+
     private function triggerReconnectCallback(Queue $queue, \Throwable $error, int $attempt, int $sleepMs): void
     {
         if (!\is_callable($this->reconnectCallback)) {
@@ -158,11 +193,11 @@ class Redis implements Synchronous, Consumer
     public function publish(Queue $queue, array $payload, bool $priority = false): bool
     {
         $key = "{$queue->namespace}.queue.{$queue->name}";
-        $envelope = $this->envelope($queue, $payload);
+        $envelope = $this->codec->encode($this->envelope($queue, $payload));
 
         return $priority
-            ? $this->commands->rightPushArray($key, $envelope)
-            : $this->commands->leftPushArray($key, $envelope);
+            ? $this->commands->rightPush($key, $envelope)
+            : $this->commands->leftPush($key, $envelope);
     }
 
     public function enqueueMany(Queue $queue, array $payloads, bool $priority = false): bool
@@ -173,7 +208,7 @@ class Redis implements Synchronous, Consumer
 
         $encoded = [];
         foreach ($payloads as $payload) {
-            $encoded[] = (string) json_encode($this->envelope($queue, $payload));
+            $encoded[] = $this->codec->encode($this->envelope($queue, $payload));
         }
 
         $key = "{$queue->namespace}.queue.{$queue->name}";
@@ -321,17 +356,21 @@ class Redis implements Synchronous, Consumer
             'payload' => $job->getPayload(),
             'attempts' => $job->getAttempts() + 1,
         ];
-        $this->commands->leftPushArray("{$queue->namespace}.queue.{$queue->name}", $payload);
+        $this->commands->leftPush("{$queue->namespace}.queue.{$queue->name}", $this->codec->encode($payload));
     }
 
     private function getJob(Queue $queue, string $pid): Message|false
     {
         $value = $this->commands->get("{$queue->namespace}.jobs.{$queue->name}.{$pid}");
 
-        // get() yields a decoded array or raw JSON depending on the driver;
-        // missing/expired jobs come back null or false.
+        // Missing or expired jobs come back null or false; anything else is a
+        // stored envelope, which only the codec can read.
         if (\is_string($value)) {
-            $value = json_decode($value, true);
+            try {
+                $value = $this->codec->decode($value);
+            } catch (\Throwable) {
+                return false;
+            }
         }
 
         return \is_array($value) ? new Message($value) : false;

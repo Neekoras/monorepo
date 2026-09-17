@@ -17,6 +17,8 @@ use Utopia\NATS\JetStream\JetStreamMessage;
 use Utopia\NATS\JetStream\RetentionPolicy;
 use Utopia\NATS\JetStream\StorageType;
 use Utopia\NATS\JetStream\StreamConfig;
+use Utopia\Queue\Codec;
+use Utopia\Queue\Codec\Json;
 use Utopia\Queue\Consumer;
 use Utopia\Queue\Message;
 use Utopia\Queue\Publisher\Synchronous;
@@ -253,6 +255,9 @@ class Nats implements Synchronous, Consumer
         private readonly ?int $maxWaiting = null,
         private readonly ?float $inactiveThreshold = null,
         private readonly Provisioning $provisioning = Provisioning::Ensure,
+        // How an envelope is written and read; see Codec\Compat before changing
+        // it on a stream that already holds messages.
+        private readonly Codec $codec = new Json(),
     ) {
         $this->lock = new Mutex();
 
@@ -426,7 +431,7 @@ class Nats implements Synchronous, Consumer
 
             $messages[] = [
                 'subject' => $subject,
-                'data' => (string) json_encode($envelope),
+                'data' => $this->codec->encode($envelope),
                 'msgId' => $id,
             ];
         }
@@ -470,7 +475,7 @@ class Nats implements Synchronous, Consumer
 
         $ack = $this->js()->publish(
             $subject,
-            (string) json_encode($envelope),
+            $this->codec->encode($envelope),
             msgId: $id,
         );
 
@@ -617,14 +622,49 @@ class Nats implements Synchronous, Consumer
             return null;
         }
 
+        try {
+            $data = $this->codec->decode($jsMessage->getData());
+        } catch (\Throwable) {
+            $data = null;
+        }
+
+        if (!\is_array($data) || !isset($data['pid'], $data['queue'], $data['timestamp'])) {
+            $this->park($queue, $jsMessage);
+
+            return null;
+        }
+
         /** @var array{pid: string, queue: string, timestamp: int, payload: array<mixed>} $data */
-        $data = json_decode($jsMessage->getData(), true);
         $this->inFlight[$data['pid']] = $jsMessage;
 
         return new Message($data)
             // JetStream counts deliveries from 1; expose it as the Redis-style attempt count.
             ->setAttempts(max(0, $jsMessage->metadata()->numDelivered - 1))
             ->setSequence($jsMessage->metadata()->streamSequence);
+    }
+
+    /**
+     * Set aside a message no codec on this worker can read.
+     *
+     * Straight to the dead stream and terminated, rather than NAK'd: every
+     * redelivery would fail the same way, and unacknowledged it would hold a
+     * maxAckPending slot for a full ackWait each time round. The bytes are
+     * republished as they arrived, so whatever can read them still can.
+     *
+     * On the receive connection, because pull() is already holding its lock and
+     * the two locks are never nested. Terminated only after the republish
+     * returns: a failure there leaves the message unacknowledged, which costs a
+     * redelivery and ends on the dead stream anyway, where dropping the ack
+     * first would lose it outright.
+     */
+    private function park(Queue $queue, JetStreamMessage $jsMessage): void
+    {
+        try {
+            $this->js()->publish($this->deadSubject($queue), $jsMessage->getData());
+            $jsMessage->term('payload could not be decoded');
+        } catch (\Throwable $error) {
+            $this->report($error);
+        }
     }
 
     /**

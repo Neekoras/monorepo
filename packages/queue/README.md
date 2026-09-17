@@ -169,6 +169,28 @@ if ($coroutines > 1 && $consumer instanceof Consumer\Exclusive) {
 
 Clamping on the marker rather than on a transport name or a version also means the cap starts applying by itself once the consumer stops carrying it.
 
+## Message encoding
+
+Both brokers write a message through a `Codec`, and default to `Codec\Json` — the format every release so far has put on the wire.
+
+```php
+use Utopia\Queue\Broker\Redis as Broker;
+use Utopia\Queue\Codec\Compat;
+use Utopia\Queue\Codec\Igbinary;
+
+$broker = new Broker(
+    receive: $receive,
+    commands: $commands,
+    codec: new Compat(new Igbinary()),
+);
+```
+
+`Codec\Igbinary` stores envelopes as binary through the `igbinary` extension: smaller on the wire, and several times faster to read. A queue pays the decode once per message per delivery, so a redelivered message pays it again.
+
+Changing the codec of a queue that already holds messages needs `Codec\Compat`. It reads either format and writes the one you give it, because the messages on the list, the jobs in flight, and the dead letters nobody has drained yet were all written by yesterday's release. Deploy it writing JSON first, then give it the `Igbinary` writer, and leave it reading both afterwards — a dead-letter list has no deadline.
+
+Bytes that no codec can read are parked rather than dropped or retried: the Redis broker moves them to `<namespace>.poison.<queue>`, and the NATS broker publishes them to the queue's dead subject and terminates the delivery. The pop has already taken them off the queue by the time anything can tell, so the only question is where they go — and a message every worker chokes on must not sit at the head of the queue.
+
 ## Background publishing
 
 `Broker\Background` wraps a synchronous publisher with a bounded in-process buffer. `enqueue()` hands work to reader coroutines, applying back pressure when the buffer is full; `publish()` bypasses the buffer and remains synchronous. Call `shutdown()` to drain accepted messages before the process exits.
