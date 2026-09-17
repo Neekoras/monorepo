@@ -253,10 +253,8 @@ final class ReconcileTest extends TestCase
     {
         $clock = new TestClock(new \DateTimeImmutable('2026-08-18 03:00:30.000000'));
         $telemetry = new TestTelemetry();
-        $errors = new class {
-            /** @var list<string> */
-            public array $messages = [];
-        };
+        /** @var list<string> $errors */
+        $errors = [];
         $scheduler = new Scheduler(
             source: new SnapshotSource(
                 snapshot: fn(): array => [new Row('a', 'v1'), new Row('bad', 'v1'), new Row('c', 'v1')],
@@ -271,8 +269,8 @@ final class ReconcileTest extends TestCase
             store: new MemoryStore(),
             clock: $clock,
             telemetry: $telemetry,
-            onError: function (\Throwable $error) use ($errors): void {
-                $errors->messages[] = $error->getMessage();
+            onError: function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error->getMessage();
             },
         );
 
@@ -284,11 +282,90 @@ final class ReconcileTest extends TestCase
         $ids = array_map(fn(Occurrence $occurrence): string => $occurrence->id, $scheduler->tick());
 
         $this->assertSame(['a', 'c'], $ids);
-        $this->assertSame(['poison row'], $errors->messages);
+        $this->assertSame(['poison row'], $errors);
 
         /** @var list<float|int> $counted */
         $counted = get_object_vars($telemetry->counters['schedule.error.total'])['values'];
         $this->assertSame([1], $counted);
+    }
+
+    public function testARowThatFailsToMakeIsReportedOncePerVersion(): void
+    {
+        // Reconcile runs on a timer, so a row the source keeps listing and
+        // this scheduler keeps refusing must not report on every pass.
+        $clock = new TestClock(new \DateTimeImmutable('2026-08-18 03:00:30.000000'));
+        /** @var list<string> $errors */
+        $errors = [];
+        $attempts = 0;
+        $scheduler = new Scheduler(
+            source: new SnapshotSource(
+                snapshot: fn(): array => [new Row('bad', 'v1')],
+                make: function (Row $row) use (&$attempts): Entry {
+                    ++$attempts;
+
+                    throw new \InvalidArgumentException('poison row');
+                },
+            ),
+            store: new MemoryStore(),
+            clock: $clock,
+            telemetry: new TestTelemetry(),
+            onError: function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error->getMessage();
+            },
+        );
+
+        $scheduler->reconcile();
+        $scheduler->reconcile();
+        $scheduler->reconcile();
+
+        $this->assertSame(['poison row'], $errors);
+        $this->assertSame(1, $attempts);
+    }
+
+    public function testAnEditedRowIsTriedAgainAfterItFailedToMake(): void
+    {
+        // The refusal is pinned to the version that earned it, so fixing
+        // the row is picked up by the next sync rather than waiting for a
+        // restart.
+        $clock = new TestClock(new \DateTimeImmutable('2026-08-18 03:00:30.000000'));
+        /** @var list<string> $errors */
+        $errors = [];
+        $version = 'v1';
+        $scheduler = new Scheduler(
+            source: new SnapshotSource(
+                snapshot: function () use (&$version): array {
+                    return [new Row('bad', $version)];
+                },
+                make: function (Row $row): Entry {
+                    if ($row->version === 'v1') {
+                        throw new \InvalidArgumentException('poison row');
+                    }
+
+                    return new Entry(new Interval(60), $row->id);
+                },
+            ),
+            store: new MemoryStore(),
+            clock: $clock,
+            telemetry: new TestTelemetry(),
+            onError: function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error->getMessage();
+            },
+        );
+
+        $scheduler->reconcile();
+        $scheduler->reconcile();
+        $this->assertSame(['poison row'], $errors);
+
+        $version = 'v2';
+        $scheduler->reconcile();
+        $scheduler->tick();
+        $scheduler->commit();
+        $clock->advance(60.0);
+
+        $ids = array_map(fn(Occurrence $occurrence): string => $occurrence->id, $scheduler->tick());
+
+        $this->assertSame(['bad'], $ids);
+        $this->assertSame(['poison row'], $errors);
     }
 
     public function testOneShotDueSoonerThanTheSyncLagFiresLate(): void

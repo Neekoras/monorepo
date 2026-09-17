@@ -82,6 +82,18 @@ final class Scheduler
      */
     private array $tombstones = [];
 
+    /**
+     * Rows whose {@see Source::make()} threw, id => version. A source of
+     * truth can hold a row nothing here accepts -- a schedule written
+     * before the parser tightened, say -- and reconcile runs on a timer,
+     * so without this the row is reported again on every pass for as long
+     * as it sits there. One report per version still surfaces it, and an
+     * edit that moves the version is retried.
+     *
+     * @var array<string, string>
+     */
+    private array $rejected = [];
+
     private ?\DateTimeImmutable $pendingCoveredUntil = null;
 
     /**
@@ -262,7 +274,7 @@ final class Scheduler
 
         foreach ($rows as $id => $row) {
             if (!$row->active) {
-                unset($this->entries[$id], $this->tombstones[$id]);
+                unset($this->entries[$id], $this->tombstones[$id], $this->rejected[$id]);
                 continue;
             }
 
@@ -276,12 +288,18 @@ final class Scheduler
                 continue;
             }
 
+            if (($this->rejected[$id] ?? null) === $row->version) {
+                continue; // make() already refused this exact version
+            }
+
             try {
                 $entry = $this->source->make($row);
             } catch (\Throwable $error) {
+                $this->rejected[$id] = $row->version;
                 $this->report($error, 'make');
                 continue;
             }
+            unset($this->rejected[$id]);
 
             $this->entries[$id] = [
                 'trigger' => $entry->trigger,
@@ -300,6 +318,11 @@ final class Scheduler
             foreach (array_keys($this->tombstones) as $id) {
                 if (!isset($rows[$id])) {
                     unset($this->tombstones[$id]);
+                }
+            }
+            foreach (array_keys($this->rejected) as $id) {
+                if (!isset($rows[$id])) {
+                    unset($this->rejected[$id]);
                 }
             }
         }
