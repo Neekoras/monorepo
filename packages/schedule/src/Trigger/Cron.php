@@ -413,9 +413,6 @@ final readonly class Cron implements Trigger
                 [$lowText, $highText] = explode('-', $range, 2);
                 $low = $this->value($lowText, $names);
                 $high = $this->value($highText, $names);
-                if ($low > $high) {
-                    throw new \InvalidArgumentException("Invalid cron range \"{$part}\"");
-                }
             } else {
                 if ($step > 1) {
                     // Steps apply to * or to a range, as in vixie cron.
@@ -425,12 +422,18 @@ final readonly class Cron implements Trigger
                 $high = $low;
             }
 
-            if ($low < $min || $high > $max) {
+            if ($low < $min || $low > $max || $high < $min || $high > $max) {
                 throw new \InvalidArgumentException("Cron value \"{$part}\" is out of range {$min}-{$max}");
             }
 
-            for ($value = $low; $value <= $high; $value += $step) {
-                $set[$value] = true;
+            // A range whose end sits below its start wraps around the field,
+            // so "22-3" in hours reads as 22,23,0,1,2,3 and "FRI-MON" in days
+            // of week as FRI,SAT,SUN,MON. The step walks that same path.
+            $period = $max - $min + 1;
+            $span = $high >= $low ? $high - $low : $high - $low + $period;
+
+            for ($offset = 0; $offset <= $span; $offset += $step) {
+                $set[$min + (($low - $min + $offset) % $period)] = true;
             }
         }
 

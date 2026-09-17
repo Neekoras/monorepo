@@ -135,6 +135,65 @@ final class ScheduleTest extends TestCase
         );
     }
 
+    public function testCronHourRangeWrapsAroundMidnight(): void
+    {
+        // "22-3" reads as 22,23,0,1,2,3 -- a night window, not an empty set.
+        $cron = new Cron('0 22-3 * * *');
+
+        $this->assertSame(
+            ['00:00:00', '01:00:00', '02:00:00', '03:00:00', '22:00:00', '23:00:00'],
+            $this->format($cron->occurrencesBetween(
+                new \DateTimeImmutable('2026-08-17 00:00:00.000000'),
+                new \DateTimeImmutable('2026-08-18 00:00:00.000000'),
+            )),
+        );
+    }
+
+    public function testCronWrappingRangeStepsAroundTheWrap(): void
+    {
+        // The step walks forward from 22 across midnight: 22, 0, 2.
+        $cron = new Cron('0 22-3/2 * * *');
+
+        $this->assertSame(
+            ['00:00:00', '02:00:00', '22:00:00'],
+            $this->format($cron->occurrencesBetween(
+                new \DateTimeImmutable('2026-08-17 00:00:00.000000'),
+                new \DateTimeImmutable('2026-08-18 00:00:00.000000'),
+            )),
+        );
+    }
+
+    public function testCronDayOfWeekRangeWrapsAroundSunday(): void
+    {
+        // 2026-08-17 is a Monday, so the week runs Mon 17 .. Sun 23.
+        $cron = new Cron('0 0 * * FRI-MON');
+
+        $occurrences = $cron->occurrencesBetween(
+            new \DateTimeImmutable('2026-08-17 00:00:01.000000'),
+            new \DateTimeImmutable('2026-08-25 00:00:00.000000'),
+        );
+
+        $this->assertSame(
+            ['2026-08-21', '2026-08-22', '2026-08-23', '2026-08-24'], // Fri, Sat, Sun, Mon
+            array_map(fn(\DateTimeImmutable $occurrence): string => $occurrence->format('Y-m-d'), $occurrences),
+        );
+    }
+
+    public function testCronMonthRangeWrapsAroundTheYear(): void
+    {
+        $cron = new Cron('0 0 1 NOV-FEB *');
+
+        $occurrences = $cron->occurrencesBetween(
+            new \DateTimeImmutable('2026-10-01 00:00:01.000000'),
+            new \DateTimeImmutable('2027-04-01 00:00:00.000000'),
+        );
+
+        $this->assertSame(
+            ['2026-11-01', '2026-12-01', '2027-01-01', '2027-02-01'],
+            array_map(fn(\DateTimeImmutable $occurrence): string => $occurrence->format('Y-m-d'), $occurrences),
+        );
+    }
+
     public function testCronMonthAndDayNames(): void
     {
         // 2026-08-17 is a Monday.
@@ -274,8 +333,8 @@ final class ScheduleTest extends TestCase
         // zero step
         yield ['5/10 * * * *'];
         // steps need * or a range
-        yield ['5-1 * * * *'];
-        // reversed range
+        yield ['55-61 * * * *'];
+        // range endpoint out of the field
         yield ['* * L-31 * *'];
         // day-of-month offset past any month
         yield ['* * 32W * *'];
