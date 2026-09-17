@@ -145,7 +145,7 @@ final class RedisBrokerRecoveryTest extends TestCase
         $claimed = $this->broker->receive($this->queue, 0);
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $claimed->setAttempts(3);
-        $this->connection->setArray('tests.jobs.recovery.' . $claimed->getPid(), $claimed->asArray());
+        $this->connection->set('tests.jobs.recovery.' . $claimed->getPid(), new Json()->encode($claimed->asArray()));
         $this->broker->reject($this->queue, $claimed);
         $this->backdate($claimed->getPid());
 
