@@ -189,19 +189,31 @@ On `Broker\Redis` this turns a claim of `4N` commands into `N + 3`: the job payl
 
 `Broker\Nats` fetches the batch in one pull request. Consumers that cannot batch are not required to: `Consumer\Batched` is optional, and the adapter falls back to `receive()` for anything without it.
 
-Measured with `tests/bench/run.sh` on the `null` workload — no handler at all, 16 coroutines, 600 messages, median of three:
+What it costs the server is exact, and has no clock in it. Counted from Redis's own `commandstats`, per message acknowledged:
 
-| batch | `Broker\Redis` | `Broker\Nats` |
+| batch | fetch and claim | acknowledge | total |
+|---|---|---|---|
+| 1 | 5.00 | 4.00 | **9.00** |
+| 4 | 2.25 | 4.00 | **6.25** |
+| 16 | 1.31 | 4.00 | **5.31** |
+
+The fetch side falls by 3.8x; the total only by 1.7x, because `commit()` is four commands and this does not touch it. **On Redis the acknowledgment is now the larger half of the cost**, and no batch size changes that.
+
+Whether that becomes throughput depends entirely on whether those commands were the constraint. Ratio of batch-16 to batch-1, 16 coroutines, 10,000 messages, two passes in opposite order:
+
+| the handler | `Broker\Redis` | `Broker\Nats` |
 |---|---|---|
-| 1 | 3,870 msg/s | 5,100 msg/s |
-| 4 | 5,218 (1.35x) | 11,347 (2.2x) |
-| 16 | 5,196 (1.34x) | 11,552 (2.3x) |
+| does nothing | 1.30-1.36x | 2.03-2.31x |
+| computes for 0.14ms | 1.18-1.23x | 1.45-1.51x |
+| computes for 1ms | 1.04-1.08x | 1.08-1.10x |
+| waits 1ms | 1.23-1.25x | 1.62-1.63x |
+| waits 2ms | **0.92-0.96x** | **0.80-0.82x** |
 
-Run-to-run spread on these cells is around 10%, so read them as "about a third more" and "about twice".
+Read the axis as "is the receive loop the bottleneck", not "is the handler fast". A handler that computes does not yield, so PHP runs one at a time and throughput is capped by the handler no matter what the broker does — 1ms of computation leaves nothing for a batch to win. A handler that waits yields, so sixteen of them overlap and the loop has to feed all sixteen; there the broker is the constraint and batching pays.
 
-Redis gains less than NATS for a reason worth knowing before reaching for a bigger batch: `commit()` is still four commands per message and is not batched, so an acknowledged message costs about 5.3 commands where it used to cost 9. On NATS an acknowledgment is one publish on a second connection, so removing the receive round trips removes most of what was left. **The Redis acknowledgment path is now the larger half of the cost.**
+And past the point where it pays, **it costs**: at 2ms of waiting the batch is a 4-20% loss, reproduced in both passes. Sixteen messages claimed together finish together, and their sixteen acknowledgments then queue behind one lock, so a smooth pipeline turns into convoys. The `io`, `cpu` and `mixed` rows in the table above are all in this region, which is why none of them move.
 
-Batching is for a queue whose handlers are cheap. Where a handler does real work the round trip is already noise beside it — see the table above, where the `io`, `cpu` and `mixed` cells are unmoved by it — and the default of 1 is the right setting.
+So the default of 1 is not a conservative default, it is the right one for most queues. Raise it for a queue that is demonstrably broker-bound — cheap handlers, deep backlog — and measure the queue you are raising it for, because the same change makes a handler-bound queue slower.
 
 ## Message encoding
 
