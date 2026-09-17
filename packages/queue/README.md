@@ -169,6 +169,40 @@ if ($coroutines > 1 && $consumer instanceof Consumer\Exclusive) {
 
 Clamping on the marker rather than on a transport name or a version also means the cap starts applying by itself once the consumer stops carrying it.
 
+### Batched receive
+
+A `receive()` costs at least one round trip, and on a queue whose handler is cheap that round trip *is* the work. `job('…', $coroutines, batch: N)` lets one receive claim up to N messages:
+
+```php
+$server
+    ->job('v1-stats-usage', 16, batch: 16)
+    ->action(function (array $payload) { /* … */ });
+```
+
+Only the first message of a batch waits. The rest are whatever is already on the queue, taken without blocking, so a queue holding one message behaves exactly as it did before rather than waiting for company that is not coming.
+
+The batch is bounded by free handler slots, and `Server::start()` refuses a batch larger than the coroutine cap. That bound is the whole safety argument: a claimed message is out of the broker and invisible to every idle replica, so claiming more than this worker can start would be taking work away from a worker that could have run it. At `job('…', 1)` every batch is one message, which is why raising the coroutine count comes first.
+
+Each message keeps its own acknowledgment — there is no batch commit — so one poison message in a batch of sixteen is rejected on its own and the other fifteen are unaffected.
+
+On `Broker\Redis` this turns a claim of `4N` commands into `N + 3`: the job payloads still need a key each, because a TTL cannot be shared, but the processing list takes one push for the batch and each counter moves once. With the pop, a batch of eight costs 13 commands where eight single receives cost 40.
+
+`Broker\Nats` fetches the batch in one pull request. Consumers that cannot batch are not required to: `Consumer\Batched` is optional, and the adapter falls back to `receive()` for anything without it.
+
+Measured with `tests/bench/run.sh` on the `null` workload — no handler at all, 16 coroutines, 600 messages, median of three:
+
+| batch | `Broker\Redis` | `Broker\Nats` |
+|---|---|---|
+| 1 | 3,870 msg/s | 5,100 msg/s |
+| 4 | 5,218 (1.35x) | 11,347 (2.2x) |
+| 16 | 5,196 (1.34x) | 11,552 (2.3x) |
+
+Run-to-run spread on these cells is around 10%, so read them as "about a third more" and "about twice".
+
+Redis gains less than NATS for a reason worth knowing before reaching for a bigger batch: `commit()` is still four commands per message and is not batched, so an acknowledged message costs about 5.3 commands where it used to cost 9. On NATS an acknowledgment is one publish on a second connection, so removing the receive round trips removes most of what was left. **The Redis acknowledgment path is now the larger half of the cost.**
+
+Batching is for a queue whose handlers are cheap. Where a handler does real work the round trip is already noise beside it — see the table above, where the `io`, `cpu` and `mixed` cells are unmoved by it — and the default of 1 is the right setting.
+
 ## Message encoding
 
 Both brokers write a message through a `Codec`, and default to `Codec\Json` — the format every release so far has put on the wire.

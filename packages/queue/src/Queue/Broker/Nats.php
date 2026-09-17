@@ -20,6 +20,7 @@ use Utopia\NATS\JetStream\StreamConfig;
 use Utopia\Queue\Codec;
 use Utopia\Queue\Codec\Json;
 use Utopia\Queue\Consumer;
+use Utopia\Queue\Consumer\Batched;
 use Utopia\Queue\Message;
 use Utopia\Queue\Publisher\Synchronous;
 use Utopia\Queue\Queue;
@@ -69,7 +70,7 @@ use Utopia\Queue\Queue;
  * publish. Its commands connection is opened lazily on the first ack, so a publisher
  * never pays for a socket it will not use.
  */
-class Nats implements Synchronous, Consumer
+class Nats implements Synchronous, Consumer, Batched
 {
     // Wire-level identifiers (stream/subject naming, durable consumers, advisories).
     private const string STREAM_PREFIX = 'Q_';
@@ -594,8 +595,13 @@ class Nats implements Synchronous, Consumer
 
     public function receive(Queue $queue, int $timeout): ?Message
     {
+        return $this->receiveBatch($queue, $timeout, 1)[0] ?? null;
+    }
+
+    public function receiveBatch(Queue $queue, int $timeout, int $max): array
+    {
         try {
-            return $this->synchronize(fn(): ?Message => $this->pull($queue, $timeout));
+            return $this->synchronize(fn(): array => $this->pull($queue, $timeout, max(1, $max)));
         } finally {
             // Off the lock, and on the way out however pull() ended.
             $this->flushReports();
@@ -608,39 +614,59 @@ class Nats implements Synchronous, Consumer
      * Holds it across the fetch, which is what an ack from a handler coroutine waits
      * behind — see the class docblock for that bound and why it is safe.
      */
-    private function pull(Queue $queue, int $timeout): ?Message
+    private function pull(Queue $queue, int $timeout, int $max): array
     {
         $this->ensure($queue);
         $key = $this->identity($queue);
         $this->drainDeadLetters($queue, $key);
 
         // Priority first (no_wait poll), then the normal queue for up to $timeout.
-        $jsMessage = $this->fetchOne($this->consumers[$key]['priority'], 0.25, true)
-            ?? $this->fetchOne($this->consumers[$key]['normal'], (float) $timeout, false);
+        $deliveries = $this->fetch($this->consumers[$key]['priority'], $max, 0.25, true);
 
-        if (!$jsMessage instanceof JetStreamMessage) {
-            return null;
+        // Waiting is only ever allowed with nothing in hand. Holding a message
+        // while blocking for company would add the whole receive timeout to the
+        // latency of a message already claimed.
+        if ($deliveries === []) {
+            // And it asks for exactly one. fetch($max, $timeout) does not return
+            // as soon as it has something: it collects until the batch fills or
+            // the deadline passes, so asking for a batch up front would make
+            // every message on a sparse queue $timeout late.
+            $deliveries = $this->fetch($this->consumers[$key]['normal'], 1, (float) $timeout, false);
         }
 
-        try {
-            $data = $this->codec->decode($jsMessage->getData());
-        } catch (\Throwable) {
-            $data = null;
+        // Whatever else is already waiting, on a poll that cannot block.
+        if ($deliveries !== [] && \count($deliveries) < $max) {
+            $deliveries = array_merge($deliveries, $this->fetch($this->consumers[$key]['normal'], $max - \count($deliveries), 0.25, true));
         }
 
-        if (!\is_array($data) || !isset($data['pid'], $data['queue'], $data['timestamp'])) {
-            $this->park($queue, $jsMessage);
+        $messages = [];
 
-            return null;
+        foreach ($deliveries as $jsMessage) {
+            try {
+                $data = $this->codec->decode($jsMessage->getData());
+            } catch (\Throwable) {
+                $data = null;
+            }
+
+            if (!\is_array($data) || !isset($data['pid'], $data['queue'], $data['timestamp'])) {
+                // Parked rather than thrown: in a batch a throw here would leave
+                // every message behind it unregistered and unacknowledged, each
+                // burning an attempt and a maxAckPending slot for a full ackWait.
+                $this->park($queue, $jsMessage);
+
+                continue;
+            }
+
+            /** @var array{pid: string, queue: string, timestamp: int, payload: array<mixed>} $data */
+            $this->inFlight[$data['pid']] = $jsMessage;
+
+            $messages[] = new Message($data)
+                // JetStream counts deliveries from 1; expose it as the Redis-style attempt count.
+                ->setAttempts(max(0, $jsMessage->metadata()->numDelivered - 1))
+                ->setSequence($jsMessage->metadata()->streamSequence);
         }
 
-        /** @var array{pid: string, queue: string, timestamp: int, payload: array<mixed>} $data */
-        $this->inFlight[$data['pid']] = $jsMessage;
-
-        return new Message($data)
-            // JetStream counts deliveries from 1; expose it as the Redis-style attempt count.
-            ->setAttempts(max(0, $jsMessage->metadata()->numDelivered - 1))
-            ->setSequence($jsMessage->metadata()->streamSequence);
+        return $messages;
     }
 
     /**
@@ -854,7 +880,7 @@ class Nats implements Synchronous, Consumer
 
             $remaining = $limit ?? 500;
             while ($remaining > 0) {
-                $jsMessage = $this->fetchOne($consumer, 1.0, false);
+                $jsMessage = $this->fetch($consumer, 1, 1.0, false)[0] ?? null;
                 if (!$jsMessage instanceof JetStreamMessage) {
                     break;
                 }
@@ -955,14 +981,20 @@ class Nats implements Synchronous, Consumer
         }
     }
 
-    /** Fetch a single message, or null on timeout / empty. */
-    private function fetchOne(NatsConsumer $consumer, float $timeout, bool $noWait): ?JetStreamMessage
+    /**
+     * Fetch up to $batch deliveries, as a list.
+     *
+     * @return list<JetStreamMessage>
+     */
+    private function fetch(NatsConsumer $consumer, int $batch, float $timeout, bool $noWait): array
     {
-        foreach ($consumer->fetch(1, $timeout, $noWait) as $message) {
-            return $message;
+        $messages = [];
+
+        foreach ($consumer->fetch($batch, $timeout, $noWait) as $message) {
+            $messages[] = $message;
         }
 
-        return null;
+        return $messages;
     }
 
     /**

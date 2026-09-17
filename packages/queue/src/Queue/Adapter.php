@@ -3,6 +3,7 @@
 namespace Utopia\Queue;
 
 use Utopia\DI\Container;
+use Utopia\Queue\Consumer\Batched;
 
 abstract class Adapter
 {
@@ -123,7 +124,7 @@ abstract class Adapter
      * @param callable(Message): void $successCallback
      * @param callable(?Message, \Throwable): void $errorCallback Receives null when
      *        the failure was in obtaining a message rather than handling one.
-     * @param array<int, array{queue: Queue, maxCoroutines: int, consumer?: Consumer}> $queues
+     * @param array<int, array{queue: Queue, maxCoroutines: int, batch?: int, consumer?: Consumer}> $queues
      *        Queue identity and concurrency come from Server::job(); sequential
      *        adapters run specs one after another, Swoole runs independent loops.
      */
@@ -147,13 +148,14 @@ abstract class Adapter
                 $successCallback,
                 $errorCallback,
                 $spec['consumer'] ?? $this->consumer,
+                $spec['batch'] ?? 1,
             );
         }
     }
 
     /**
-     * One-queue loop. `$maxCoroutines` is accepted for adapter parity; the
-     * sequential fallback processes one message at a time (effective cap 1).
+     * One-queue loop. `$maxCoroutines` and `$batch` are accepted for adapter
+     * parity; the sequential fallback processes one message at a time.
      *
      * Binds `$this->queue` / `$this->consumer` for the duration so the hot
      * path matches pre-multi-queue (no per-message queue/consumer args).
@@ -169,8 +171,13 @@ abstract class Adapter
         callable $successCallback,
         callable $errorCallback,
         Consumer $consumer,
+        int $batch = 1,
     ): void {
-        unset($maxCoroutines);
+        // Both are accepted for adapter parity and neither applies here. A batch
+        // would be worse than useless on a loop that runs one handler at a time:
+        // the messages behind the first would sit claimed in this process,
+        // invisible to every idle sibling, for as long as the ones ahead take.
+        unset($maxCoroutines, $batch);
 
         $previousConsumer = $this->consumer;
         $this->queue = $queue;
@@ -296,6 +303,39 @@ abstract class Adapter
             sleep(static::RECEIVE_BACKOFF);
 
             return null;
+        }
+    }
+
+    /**
+     * Claim up to $max messages at once, where the consumer can.
+     *
+     * A consumer that is not {@see Batched} degrades to a single receive rather
+     * than being refused: the capability is optional, and the loop above works
+     * either way.
+     *
+     * @param callable(?Message, \Throwable): void $errorCallback
+     * @return list<Message>
+     */
+    protected function nextBatchFrom(callable $errorCallback, Queue $queue, Consumer $consumer, int $max): array
+    {
+        try {
+            if ($max > 1 && $consumer instanceof Batched) {
+                return $consumer->receiveBatch($queue, static::RECEIVE_TIMEOUT, $max);
+            }
+
+            $message = $consumer->receive($queue, static::RECEIVE_TIMEOUT);
+
+            return $message instanceof Message ? [$message] : [];
+        } catch (\Throwable $error) {
+            try {
+                $errorCallback(null, $error);
+            } catch (\Throwable $reportFailure) {
+                $this->reportUnreported($error, $reportFailure);
+            }
+
+            sleep(static::RECEIVE_BACKOFF);
+
+            return [];
         }
     }
 

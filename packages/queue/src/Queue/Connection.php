@@ -27,6 +27,18 @@ interface Connection
     public function leftPopArray(string $queue, int $timeout): array|false;
     public function rightPush(string $queue, string $payload): bool;
     public function rightPop(string $queue, int $timeout): string|false;
+
+    /**
+     * Pop up to $count payloads from the tail, in pop order, without blocking.
+     *
+     * The companion to {@see self::rightPop()} for a consumer draining a
+     * backlog: one command for the messages already waiting, rather than one
+     * round trip each. Returns fewer than asked -- including none -- when the
+     * list runs out, which is the ordinary case and not an error.
+     *
+     * @return list<string>
+     */
+    public function rightPopMany(string $queue, int $count): array;
     public function rightPopLeftPush(string $queue, string $destination, int $timeout): string|false;
     public function leftPush(string $queue, string $payload): bool;
     public function leftPop(string $queue, int $timeout): string|false;
@@ -38,6 +50,9 @@ interface Connection
     public function get(string $key): array|string|null;
     public function setArray(string $key, array $value, int $ttl = 0): bool;
     public function increment(string $key): int;
+
+    /** Add $by to a counter in one command, returning the new value. */
+    public function incrementBy(string $key, int $by): int;
     public function decrement(string $key): int;
     public function ping(): bool;
     public function close(): void;

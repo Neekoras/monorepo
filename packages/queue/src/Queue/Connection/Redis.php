@@ -94,6 +94,22 @@ class Redis implements Connection
         return $response[1];
     }
 
+    public function rightPopMany(string $queue, int $count): array
+    {
+        if ($count < 1) {
+            return [];
+        }
+
+        // Not idempotent, for the reason call() gives about pops: a replay
+        // after an ambiguous transport error would take a second helping off
+        // the list and drop the first.
+        // The extension's stub types rPop() by its single-key form; with a
+        // count it answers a list.
+        $response = $this->call(fn(\Redis $redis): mixed => $redis->rPop($queue, $count));
+
+        return \is_array($response) ? array_values(array_filter($response, \is_string(...))) : [];
+    }
+
     public function leftPopArray(string $queue, int $timeout): array|false
     {
         $response = $this->call(fn(\Redis $redis): \Redis|array|false|null => $redis->blPop($queue, $timeout));
@@ -152,6 +168,11 @@ class Redis implements Connection
     public function increment(string $key): int
     {
         return $this->call(fn(\Redis $redis): int|\Redis|false => $redis->incr($key));
+    }
+
+    public function incrementBy(string $key, int $by): int
+    {
+        return $this->call(fn(\Redis $redis): int|\Redis|false => $redis->incrBy($key, $by));
     }
 
     public function decrement(string $key): int
