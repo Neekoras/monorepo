@@ -194,6 +194,76 @@ if ($coroutines > 1 && $consumer instanceof Consumer\Exclusive) {
 
 Clamping on the marker rather than on a transport name or a version also means the cap starts applying by itself once the consumer stops carrying it.
 
+### Batched receive
+
+A `receive()` costs at least one round trip, and on a queue whose handler is cheap that round trip *is* the work. `job('…', $coroutines, batch: N)` lets one receive claim up to N messages:
+
+```php
+$server
+    ->job('v1-stats-usage', 16, batch: 16)
+    ->action(function (array $payload) { /* … */ });
+```
+
+Only the first message of a batch waits. The rest are whatever is already on the queue, taken without blocking, so a queue holding one message behaves exactly as it did before rather than waiting for company that is not coming.
+
+The batch is bounded by free handler slots, and `Server::start()` refuses a batch larger than the coroutine cap. That bound is the whole safety argument: a claimed message is out of the broker and invisible to every idle replica, so claiming more than this worker can start would be taking work away from a worker that could have run it. At `job('…', 1)` every batch is one message, which is why raising the coroutine count comes first.
+
+Each message keeps its own acknowledgment — there is no batch commit — so one poison message in a batch of sixteen is rejected on its own and the other fifteen are unaffected.
+
+On `Broker\Redis` this turns a claim of `4N` commands into `N + 3`: the job payloads still need a key each, because a TTL cannot be shared, but the processing list takes one push for the batch and each counter moves once. With the pop, a batch of eight costs 13 commands where eight single receives cost 40.
+
+`Broker\Nats` fetches the batch in one pull request. Consumers that cannot batch are not required to: `Consumer\Batched` is optional, and the adapter falls back to `receive()` for anything without it.
+
+What it costs the server is exact, and has no clock in it. Counted from Redis's own `commandstats`, per message acknowledged:
+
+| batch | fetch and claim | acknowledge | total |
+|---|---|---|---|
+| 1 | 5.00 | 4.00 | **9.00** |
+| 4 | 2.25 | 4.00 | **6.25** |
+| 16 | 1.31 | 4.00 | **5.31** |
+
+The fetch side falls by 3.8x; the total only by 1.7x, because `commit()` is four commands and this does not touch it. **On Redis the acknowledgment is now the larger half of the cost**, and no batch size changes that.
+
+A batch of one is the previous single `receive()`, not an approximation of it: both send 9.00 commands per message, and the only difference is an `INCRBY key 1` where the older code sent `INCR key` — the same round trip. So the rows below are a before and after, and the three command-identical configurations (the previous code, this code's `receive()`, and this code at `batch: 1`) land within each other's run-to-run spread.
+
+Whether that becomes throughput depends entirely on whether those commands were the constraint. Ratio of batch-16 to batch-1, 16 coroutines, 10,000 messages, two passes in opposite order:
+
+| the handler | `Broker\Redis` | `Broker\Nats` |
+|---|---|---|
+| does nothing | 1.30-1.36x | 2.03-2.31x |
+| computes for 0.14ms | 1.18-1.23x | 1.45-1.51x |
+| computes for 1ms | 1.04-1.08x | 1.08-1.10x |
+| waits 1ms | 1.23-1.25x | 1.62-1.63x |
+| waits 2ms | **0.92-0.96x** | **0.80-0.82x** |
+
+Read the axis as "is the receive loop the bottleneck", not "is the handler fast". A handler that computes does not yield, so PHP runs one at a time and throughput is capped by the handler no matter what the broker does — 1ms of computation leaves nothing for a batch to win. A handler that waits yields, so sixteen of them overlap and the loop has to feed all sixteen; there the broker is the constraint and batching pays.
+
+And past the point where it pays, **it costs**: at 2ms of waiting the batch is a 4-20% loss, reproduced in both passes. Sixteen messages claimed together finish together, and their sixteen acknowledgments then queue behind one lock, so a smooth pipeline turns into convoys. The `io`, `cpu` and `mixed` rows in the table above are all in this region, which is why none of them move.
+
+So the default of 1 is not a conservative default, it is the right one for most queues. Raise it for a queue that is demonstrably broker-bound — cheap handlers, deep backlog — and measure the queue you are raising it for, because the same change makes a handler-bound queue slower.
+
+## Message encoding
+
+Both brokers write a message through a `Codec`, and default to `Codec\Json` — the format every release so far has put on the wire.
+
+```php
+use Utopia\Queue\Broker\Redis as Broker;
+use Utopia\Queue\Codec\Compat;
+use Utopia\Queue\Codec\Igbinary;
+
+$broker = new Broker(
+    receive: $receive,
+    commands: $commands,
+    codec: new Compat(new Igbinary()),
+);
+```
+
+`Codec\Igbinary` stores envelopes as binary through the `igbinary` extension: smaller on the wire, and several times faster to read. A queue pays the decode once per message per delivery, so a redelivered message pays it again.
+
+Changing the codec of a queue that already holds messages needs `Codec\Compat`. It reads either format and writes the one you give it, because the messages on the list, the jobs in flight, and the dead letters nobody has drained yet were all written by yesterday's release. Deploy it writing JSON first, then give it the `Igbinary` writer, and leave it reading both afterwards — a dead-letter list has no deadline.
+
+Bytes that no codec can read are parked rather than dropped or retried: the Redis broker moves them to `<namespace>.poison.<queue>`, and the NATS broker publishes them to the queue's dead subject and terminates the delivery. The pop has already taken them off the queue by the time anything can tell, so the only question is where they go — and a message every worker chokes on must not sit at the head of the queue.
+
 ## Background publishing
 
 `Broker\Background` wraps a synchronous publisher with a bounded in-process buffer. `enqueue()` hands work to reader coroutines, applying back pressure when the buffer is full; `publish()` bypasses the buffer and remains synchronous. Call `shutdown()` to drain accepted messages before the process exits.

@@ -94,6 +94,25 @@ class RedisCluster implements Connection
         return $response[1];
     }
 
+    public function rightPopMany(string $queue, int $count): array
+    {
+        if ($count < 1) {
+            return [];
+        }
+
+        // Through rawCommand because the extension types rPop() by its
+        // single-key form, which answers a string; the counted form answers a
+        // list. Same command on the wire either way, and rawCommand routes by
+        // the key it is given, so it lands on the slot that owns the list.
+        $response = $this->getRedis()->rawCommand($queue, 'rpop', $queue, $count);
+
+        if (!\is_array($response)) {
+            return [];
+        }
+
+        return array_values(array_filter($response, \is_string(...)));
+    }
+
     public function leftPopArray(string $queue, int $timeout): array|false
     {
         $response = $this->getRedis()->blPop([$queue], $timeout);
@@ -152,6 +171,11 @@ class RedisCluster implements Connection
     public function increment(string $key): int
     {
         return $this->getRedis()->incr($key);
+    }
+
+    public function incrementBy(string $key, int $by): int
+    {
+        return $this->getRedis()->incrBy($key, $by);
     }
 
     public function decrement(string $key): int

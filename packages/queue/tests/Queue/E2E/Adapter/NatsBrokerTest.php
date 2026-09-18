@@ -490,6 +490,64 @@ final class NatsBrokerTest extends TestCase
      * second one — a duplicate nothing could detect, on a queue that may be
      * billing someone.
      */
+    public function testReceiveBatchClaimsSeveralMessagesInOneCall(): void
+    {
+        for ($i = 0; $i < 20; $i++) {
+            $this->broker->publish($this->queue, ['task' => "job-{$i}"]);
+        }
+
+        $batch = $this->broker->receiveBatch($this->queue, 2, 8);
+
+        $this->assertCount(8, $batch);
+        $this->assertSame(
+            array_map(static fn(int $i): string => "job-{$i}", range(0, 7)),
+            array_map(static fn(Message $message): string => $message->getPayload()['task'], $batch),
+        );
+
+        // Each one is a delivery of its own, owed its own acknowledgment.
+        foreach ($batch as $message) {
+            $this->broker->commit($this->queue, $message);
+        }
+
+        $this->assertCount(12, $this->broker->receiveBatch($this->queue, 2, 32));
+    }
+
+    /**
+     * The trap this whole path is shaped around.
+     *
+     * JetStream's fetch(N, timeout) does not answer as soon as it has
+     * something: it collects until the batch fills or the deadline passes. A
+     * receive that asked for its whole batch up front would therefore make
+     * every message on a queue that is not busy wait the full receive timeout —
+     * batching would have made a sparse queue slower, by a lot. Measured at
+     * 1.9s against this same assertion before the fix.
+     */
+    public function testALoneMessageDoesNotWaitForTheBatchToFill(): void
+    {
+        $this->broker->publish($this->queue, ['task' => 'only-one']);
+
+        $started = microtime(true);
+        $batch = $this->broker->receiveBatch($this->queue, 2, 16);
+        $elapsed = microtime(true) - $started;
+
+        $this->assertCount(1, $batch);
+        $this->assertLessThan(
+            0.5,
+            $elapsed,
+            'asking for 16 and getting 1 must not cost the receive timeout',
+        );
+    }
+
+    public function testAnEmptyQueueCostsTheTimeoutOnceRatherThanPerMessage(): void
+    {
+        $started = microtime(true);
+        $batch = $this->broker->receiveBatch($this->queue, 1, 16);
+        $elapsed = microtime(true) - $started;
+
+        $this->assertSame([], $batch);
+        $this->assertLessThan(2.0, $elapsed, 'one timeout for the call, not one per message asked for');
+    }
+
     public function testEnqueueManyStoresEveryPayloadInOrder(): void
     {
         $payloads = [];

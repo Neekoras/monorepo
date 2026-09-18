@@ -84,8 +84,8 @@ final class ServerJobsTest extends TestCase
 
         $this->assertSame(
             [
-                ['queue' => 'database_db_main', 'maxCoroutines' => 1],
-                ['queue' => 'v1-functions', 'maxCoroutines' => 8],
+                ['queue' => 'database_db_main', 'maxCoroutines' => 1, 'batch' => 1],
+                ['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1],
             ],
             $adapter->consumed,
         );
@@ -101,7 +101,7 @@ final class ServerJobsTest extends TestCase
 
         $this->assertSame(
             [
-                ['queue' => 'v1-functions', 'maxCoroutines' => 8],
+                ['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1],
             ],
             $adapter->consumed,
         );
@@ -118,8 +118,8 @@ final class ServerJobsTest extends TestCase
 
         $this->assertSame(
             [
-                ['queue' => 'database_db_main', 'maxCoroutines' => 1],
-                ['queue' => 'v1-functions', 'maxCoroutines' => 8],
+                ['queue' => 'database_db_main', 'maxCoroutines' => 1, 'batch' => 1],
+                ['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1],
             ],
             $adapter->consumed,
         );
@@ -172,7 +172,7 @@ final class ServerJobsTest extends TestCase
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 1]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 1, 'batch' => 1]], $adapter->consumed);
     }
 
     /**
@@ -197,7 +197,7 @@ final class ServerJobsTest extends TestCase
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1]], $adapter->consumed);
     }
 
     /**
@@ -265,7 +265,49 @@ final class ServerJobsTest extends TestCase
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1]], $adapter->consumed);
+    }
+
+    public function testStartCarriesTheBatchToTheConsumeLoop(): void
+    {
+        $adapter = new RecordingAdapter();
+        $server = new Server($adapter);
+        $server->job('v1-stats-usage', 16, 8);
+
+        $server->start();
+
+        $this->assertSame([['queue' => 'v1-stats-usage', 'maxCoroutines' => 16, 'batch' => 8]], $adapter->consumed);
+    }
+
+    /**
+     * A batch larger than the handler slots waiting for it would claim messages
+     * this worker cannot start -- out of the broker, and invisible to the idle
+     * replica that could have run them.
+     */
+    public function testStartRefusesABatchLargerThanTheCoroutineCap(): void
+    {
+        $adapter = new RecordingAdapter();
+        $server = new Server($adapter);
+        $server->job('v1-stats-usage', 4, 16);
+
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessageMatches('/batch cannot exceed the handler slots/');
+
+        try {
+            $server->start();
+        } finally {
+            $this->assertSame([], $adapter->consumed, 'the refusal lands before any loop starts');
+        }
+    }
+
+    public function testBatchDefaultsToOneAndIsFloored(): void
+    {
+        $server = new Server(new RecordingAdapter());
+        $server->job('a');
+        $server->job('b', 4, 0);
+
+        $this->assertSame(1, $server->batch('a'));
+        $this->assertSame(1, $server->batch('b'), 'a batch below one is a batch of one, like the coroutine cap');
     }
 }
 
@@ -388,10 +430,12 @@ final class RecordingAdapter extends Adapter
         callable $successCallback,
         callable $errorCallback,
         Consumer $consumer,
+        int $batch = 1,
     ): void {
         $this->consumed[] = [
             'queue' => $queue->name,
             'maxCoroutines' => $maxCoroutines,
+            'batch' => $batch,
         ];
     }
 }
