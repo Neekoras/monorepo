@@ -5,11 +5,12 @@ namespace Utopia\Queue\Broker;
 use Utopia\Pools\Pool as UtopiaPool;
 use Utopia\Queue\Consumer;
 use Utopia\Queue\Consumer\Batched;
+use Utopia\Queue\Consumer\Bounded;
 use Utopia\Queue\Message;
 use Utopia\Queue\Publisher\Synchronous;
 use Utopia\Queue\Queue;
 
-readonly class Pool implements Synchronous, Consumer, Batched
+readonly class Pool implements Synchronous, Consumer, Batched, Bounded
 {
     public function __construct(
         private ?UtopiaPool $publisher = null,
@@ -130,6 +131,19 @@ readonly class Pool implements Synchronous, Consumer, Batched
 
             return \is_callable($interval) ? (float) $interval() : null;
         });
+    }
+
+    /**
+     * The leased consumer's in-flight ceiling, where it has one.
+     *
+     * Probed per lease rather than declared, for the same reason extend() is: the
+     * pool may hold a broker with no ceiling of its own (Redis), and this class is
+     * the consumer for those too. Null — an unbounded broker, or no consumer pool
+     * at all — refuses nothing.
+     */
+    public function inFlightCeiling(): ?int
+    {
+        return $this->consumer?->use(static fn(Synchronous|Consumer $adapter): ?int => $adapter instanceof Bounded ? $adapter->inFlightCeiling() : null);
     }
 
     /**
