@@ -8,6 +8,7 @@ use Utopia\Lock\Mutex;
 use Utopia\NATS\Connection as NatsConnection;
 use Utopia\NATS\Exception\JetStreamException;
 use Utopia\NATS\Exception\TimeoutException;
+use Utopia\NATS\Headers;
 use Utopia\NATS\JetStream\AckPolicy;
 use Utopia\NATS\JetStream\Consumer as NatsConsumer;
 use Utopia\NATS\JetStream\ConsumerConfig;
@@ -81,6 +82,7 @@ class Nats implements Synchronous, Consumer
     private const string CONSUMER_NORMAL = 'worker';
     private const string CONSUMER_PRIORITY = 'worker_priority';
     private const string CONSUMER_RETRY = 'retry';
+    private const string CONTENT_TYPE = 'Content-Type';
     private const string ADVISORY_MAX_DELIVERIES = '$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES';
 
     // Queue group for the advisory subscription, so one worker per queue acts
@@ -432,6 +434,7 @@ class Nats implements Synchronous, Consumer
             $messages[] = [
                 'subject' => $subject,
                 'data' => $this->codec->encode($envelope),
+                'headers' => $this->contentTypeHeader(),
                 'msgId' => $id,
             ];
         }
@@ -476,6 +479,7 @@ class Nats implements Synchronous, Consumer
         $ack = $this->js()->publish(
             $subject,
             $this->codec->encode($envelope),
+            headers: $this->contentTypeHeader(),
             msgId: $id,
         );
 
@@ -487,6 +491,25 @@ class Nats implements Synchronous, Consumer
         if ($ack->duplicate) {
             ++$this->duplicates;
         }
+    }
+
+    /**
+     * Advertise which codec wrote the payload.
+     *
+     * A header rather than something in the envelope, so a consumer can read it
+     * without first decoding the bytes it describes -- including one in another
+     * language, and one reading the stream through a tool rather than this
+     * library. {@see Codec\Compat} still sniffs on the way in: messages
+     * published before this release carry no header at all, and the dead stream
+     * keeps them indefinitely.
+     *
+     * A fresh instance per message: JetStream::publish() writes Nats-Msg-Id into
+     * whatever Headers it is handed, so a shared one would carry another
+     * message's id.
+     */
+    private function contentTypeHeader(): Headers
+    {
+        return new Headers()->set(self::CONTENT_TYPE, $this->codec->contentType());
     }
 
     /**
@@ -660,7 +683,16 @@ class Nats implements Synchronous, Consumer
     private function park(Queue $queue, JetStreamMessage $jsMessage): void
     {
         try {
-            $this->js()->publish($this->deadSubject($queue), $jsMessage->getData());
+            // The message's own Content-Type, not this codec's: the bytes go over
+            // as they arrived, and what could not be read here is precisely what
+            // this worker's codec does not write.
+            $headers = new Headers();
+            $contentType = $jsMessage->getHeaders()?->get(self::CONTENT_TYPE);
+            if ($contentType !== null) {
+                $headers->set(self::CONTENT_TYPE, $contentType);
+            }
+
+            $this->js()->publish($this->deadSubject($queue), $jsMessage->getData(), headers: $headers);
             $jsMessage->term('payload could not be decoded');
         } catch (\Throwable $error) {
             $this->report($error);

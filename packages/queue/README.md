@@ -189,6 +189,8 @@ $broker = new Broker(
 
 Changing the codec of a queue that already holds messages needs `Codec\Compat`. It reads either format and writes the one you give it, because the messages on the list, the jobs in flight, and the dead letters nobody has drained yet were all written by yesterday's release. Deploy it writing JSON first, then give it the `Igbinary` writer, and leave it reading both afterwards — a dead-letter list has no deadline.
 
+On NATS every published message carries a `Content-Type` header naming the format it is in — `application/json` or `application/vnd.php.igbinary` — so a consumer can switch on the header instead of inspecting the payload. `Codec\Compat` still reads by sniffing the bytes, because messages written before this release carry no header. Redis lists have nowhere to put one, so there the sniff is the whole answer.
+
 Bytes that no codec can read are parked rather than dropped or retried: the Redis broker moves them to `<namespace>.poison.<queue>`, and the NATS broker publishes them to the queue's dead subject and terminates the delivery. The pop has already taken them off the queue by the time anything can tell, so the only question is where they go — and a message every worker chokes on must not sit at the head of the queue.
 
 ## Background publishing

@@ -45,4 +45,9 @@ final class Igbinary implements Codec
             restore_error_handler();
         }
     }
+
+    public function contentType(): string
+    {
+        return 'application/vnd.php.igbinary';
+    }
 }

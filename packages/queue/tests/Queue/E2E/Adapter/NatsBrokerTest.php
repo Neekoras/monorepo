@@ -11,6 +11,7 @@ use Utopia\NATS\JetStream\StorageType;
 use Utopia\Queue\Adapter\Swoole;
 use Utopia\Queue\Broker\Nats;
 use Utopia\Queue\Broker\Provisioning;
+use Utopia\Queue\Codec\Igbinary;
 use Utopia\Queue\Message;
 use Utopia\Queue\Queue;
 
@@ -217,6 +218,46 @@ final class NatsBrokerTest extends TestCase
         $this->assertSame('Q_' . strtoupper($name), $info->config->name);
         $this->assertContains('q.' . strtolower($name) . '.normal', $info->config->subjects);
         $this->assertContains('q.' . strtolower($name) . '.priority', $info->config->subjects);
+    }
+
+    /**
+     * A consumer switching formats reads the header, not the bytes: it says
+     * which codec wrote the payload without anyone having to sniff it, and it
+     * has to be on both publish paths, since enqueueMany() builds its own
+     * message array rather than going through publish().
+     */
+    public function testPublishedMessagesCarryTheCodecsContentType(): void
+    {
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $js = Connection::connect($url)->jetStream();
+
+        $single = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+        $this->broker->publish($single, ['task' => 'a']);
+
+        $stored = $js->getLastMessage('Q_' . strtoupper($single->name), 'q.' . strtolower($single->name) . '.normal');
+        $this->assertSame('application/json', $stored->headers?->get('Content-Type'));
+        $this->assertSame('a', json_decode($stored->data, true)['payload']['task']);
+
+        $many = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+        $this->broker->enqueueMany($many, [['task' => 'b'], ['task' => 'c']]);
+
+        $stored = $js->getLastMessage('Q_' . strtoupper($many->name), 'q.' . strtolower($many->name) . '.normal');
+        $this->assertSame('application/json', $stored->headers?->get('Content-Type'));
+        // The batch writes one Headers per message; a shared one would carry the
+        // first message's Nats-Msg-Id onto every later message and collapse them.
+        $this->assertSame(2, $this->broker->getQueueSize($many));
+
+        if (!\function_exists('igbinary_serialize')) {
+            return;
+        }
+
+        $binary = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+        $broker = new Nats(Connection::connect($url), codec: new Igbinary());
+        $broker->publish($binary, ['task' => 'd']);
+
+        $stored = $js->getLastMessage('Q_' . strtoupper($binary->name), 'q.' . strtolower($binary->name) . '.normal');
+        $this->assertSame('application/vnd.php.igbinary', $stored->headers?->get('Content-Type'));
+        $broker->close();
     }
 
     public function testCollidingQueueNamesFailLoud(): void

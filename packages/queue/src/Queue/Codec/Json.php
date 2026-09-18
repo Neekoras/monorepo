@@ -23,4 +23,9 @@ final class Json implements Codec
     {
         return json_decode($value, true, flags: JSON_THROW_ON_ERROR);
     }
+
+    public function contentType(): string
+    {
+        return 'application/json';
+    }
 }

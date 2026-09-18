@@ -23,4 +23,13 @@ interface Codec
      * @throws \Throwable
      */
     public function decode(string $value): mixed;
+
+    /**
+     * The media type of what {@see self::encode()} writes.
+     *
+     * Brokers that carry metadata beside the payload publish it, so a consumer
+     * reading the stream can tell which format a message is in without
+     * inspecting its bytes.
+     */
+    public function contentType(): string;
 }

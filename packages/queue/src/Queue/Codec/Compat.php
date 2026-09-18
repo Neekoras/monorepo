@@ -46,6 +46,16 @@ final class Compat implements Codec
     }
 
     /**
+     * What the writer produces, not what the reader accepts: the header
+     * describes the message it is attached to, and during the cutover that is
+     * whichever format this deploy is still writing.
+     */
+    public function contentType(): string
+    {
+        return $this->writer->contentType();
+    }
+
+    /**
      * Pick a reader from the leading bytes.
      *
      * Sniffing rather than a version header, because the bytes on the queue

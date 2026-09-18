@@ -111,6 +111,36 @@ final class CodecTest extends TestCase
         new Compat()->decode("\x00\x00\x00\x09anything");
     }
 
+    /**
+     * The value goes out as a NATS Content-Type header, so it is part of the
+     * wire contract and not an internal label: a consumer switches on it.
+     */
+    public function testContentTypesNameTheFormat(): void
+    {
+        $this->assertSame('application/json', new Json()->contentType());
+
+        if (!\function_exists('igbinary_serialize')) {
+            return;
+        }
+
+        $this->assertSame('application/vnd.php.igbinary', new Igbinary()->contentType());
+    }
+
+    /**
+     * Compat reads both but writes one, and the header describes the message
+     * it travels with -- so it is the writer's type, all through the cutover.
+     */
+    public function testCompatAdvertisesItsWritersContentType(): void
+    {
+        $this->assertSame('application/json', new Compat()->contentType());
+
+        if (!\function_exists('igbinary_serialize')) {
+            return;
+        }
+
+        $this->assertSame('application/vnd.php.igbinary', new Compat(new Igbinary())->contentType());
+    }
+
     public function testIgbinaryRejectsEmptyInput(): void
     {
         if (!\function_exists('igbinary_serialize')) {
