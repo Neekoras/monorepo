@@ -74,8 +74,10 @@ final class FastlyTlsTest extends TestCase
         $this->assertSame('https://api.fastly.com/tls/subscriptions/sub_123?force=true', $client->calls[1]['url']);
     }
 
-    public function testIssueCertificateReturnsRenewDateFromIncludedCertificate(): void
+    public function testIssueCertificateReturnsNoRenewDateForAnIssuedSubscription(): void
     {
+        // Fastly renews on its own. A date derived from the certificate, as this
+        // used to return, had consumers re-queue issuance daily for nothing.
         $client = new TestClient([new Response(200, body: new Stream(json_encode([
             'data' => [[
                 'id' => 'sub_123',
@@ -90,7 +92,11 @@ final class FastlyTlsTest extends TestCase
         ])))]);
 
         $provider = new FastlyTls('token', 'tls-config-id', 'certainly', $client);
-        $this->assertSame('2027-01-02 00:00:00.000', $provider->issueCertificate('cert', 'example.com', null));
+        $this->assertNull($provider->issueCertificate('cert', 'example.com', null));
+
+        // An issued subscription is reused as is: one lookup, nothing created.
+        $this->assertCount(1, $client->calls);
+        $this->assertSame('GET', $client->calls[0]['method']);
     }
 
     public function testRetriesFailedSubscription(): void

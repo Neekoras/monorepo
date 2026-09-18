@@ -30,12 +30,16 @@ class FastlyTls implements Provider
         $subscription = $this->findSubscription($domain);
 
         if ($subscription === null) {
-            $subscription = $this->createSubscription($domain);
+            $this->createSubscription($domain);
         } elseif ($this->mapStatus($subscription['resource']['attributes']['state'] ?? '') === Status::FAILED) {
-            $subscription = $this->retrySubscription($subscription['resource']['id']);
+            $this->retrySubscription($subscription['resource']['id']);
         }
 
-        return $this->extractRenewDate($subscription);
+        // Fastly renews the certificate itself for as long as the subscription
+        // exists, so there is no date for the caller to schedule a renewal on.
+        // Returning one derived from the certificate had every consumer
+        // re-queue issuance daily for a certificate that needed nothing.
+        return null;
     }
 
     public function isInstantGeneration(string $domain, ?string $domainType): bool
@@ -216,52 +220,6 @@ class FastlyTls implements Provider
         $included = $result['response']['included'] ?? [];
 
         return ['resource' => $data, 'included' => \is_array($included) ? array_values(array_filter($included, is_array(...))) : []];
-    }
-
-    /**
-     * @param array{resource:array<string, mixed>,included:array<int, array<string, mixed>>} $subscription
-     */
-    private function extractRenewDate(array $subscription): ?string
-    {
-        $resource = $subscription['resource'];
-        $state = $this->mapStatus($resource['attributes']['state'] ?? '');
-
-        if ($state !== Status::ISSUED && $state !== Status::RENEWING) {
-            return null;
-        }
-
-        $relationship = $resource['relationships']['tls_certificates']['data'] ?? [];
-        $certificateIds = [];
-        if (\is_array($relationship)) {
-            foreach ($relationship as $reference) {
-                if (\is_array($reference) && \is_string($reference['id'] ?? null)) {
-                    $certificateIds[] = $reference['id'];
-                }
-            }
-        }
-
-        $dates = [];
-        foreach ($subscription['included'] as $included) {
-            if (($included['type'] ?? null) !== 'tls_certificate') {
-                continue;
-            }
-            if (!\in_array($included['id'] ?? null, $certificateIds, true)) {
-                continue;
-            }
-            $notAfter = $included['attributes']['not_after'] ?? null;
-            if (\is_string($notAfter) && $notAfter !== '') {
-                $dates[] = $notAfter;
-            }
-        }
-
-        if ($dates === []) {
-            return null;
-        }
-
-        usort($dates, static fn(string $left, string $right): int => strtotime($right) <=> strtotime($left));
-        $date = new \DateTimeImmutable($dates[0]);
-
-        return $date->modify('-30 days')->format('Y-m-d H:i:s.v');
     }
 
     /**

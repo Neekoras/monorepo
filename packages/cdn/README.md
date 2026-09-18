@@ -171,7 +171,7 @@ $status = $certificates->getCertificateStatus('cdn.example.com', null);
 $renewRequired = $certificates->isRenewRequired('cdn.example.com', null);
 ```
 
-`issueCertificate()` returns a renew date when Fastly already has an issued or renewing certificate. For asynchronous states like `pending` or `processing`, it returns `null`.
+`issueCertificate()` always returns `null` for Fastly: Fastly renews the certificate itself for as long as the subscription exists, so there is no date for the caller to schedule a renewal on. `isRenewRequired()` reports `true` only when the subscription is missing or `failed`, which is when calling `issueCertificate()` again does something.
 
 When Fastly domain management owns the domain lifecycle, use the managed provider instead. It creates domains without a service version on the configured service and removes both the domain and TLS subscription on deletion. Classic domains are removed by cloning and activating their service version first.
 
