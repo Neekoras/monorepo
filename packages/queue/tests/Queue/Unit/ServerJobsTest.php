@@ -234,7 +234,7 @@ final class ServerJobsTest extends TestCase
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1]], $adapter->consumed);
     }
 
     /**
@@ -249,7 +249,7 @@ final class ServerJobsTest extends TestCase
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1]], $adapter->consumed);
     }
 
     /**
