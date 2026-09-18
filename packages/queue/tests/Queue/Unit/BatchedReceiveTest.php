@@ -124,8 +124,8 @@ final class BatchedReceiveTest extends TestCase
         $batch = $broker->receiveBatch($queue, 0, 8);
 
         $this->assertCount(8, $batch);
-        $this->assertSame(1, $connection->commands('rightPop'), 'one blocking pop, whatever the batch size');
-        $this->assertSame(1, $connection->commands('rightPopMany'), 'one command for the rest of the batch');
+        $this->assertSame(0, $connection->commands('rightPop'), 'the blocking pop is the batch pop');
+        $this->assertSame(1, $connection->commands('rightPopMany'), 'one BLMPOP for the wait and the whole batch');
         $this->assertSame(8, $connection->commands('set'), 'one job key each -- a TTL cannot be shared');
         $this->assertSame(1, $connection->commands('leftPushMany'), 'one command for every claim');
         $this->assertSame(2, $connection->commands('incrementBy'), 'two counters, moved once each');
@@ -133,9 +133,9 @@ final class BatchedReceiveTest extends TestCase
         $this->assertSame(0, $connection->commands('increment'));
 
         $this->assertSame(
-            13,
+            12,
             array_sum($connection->counts),
-            'N + 5 commands for a batch of 8, where one at a time costs 5N = 40',
+            'N + 4 commands for a batch of 8, where one at a time costs 5N = 40',
         );
     }
 
@@ -255,9 +255,9 @@ final class CountingConnection extends InMemoryConnection
     }
 
     #[\Override]
-    public function rightPopMany(string $queue, int $count): array
+    public function rightPopMany(string $queue, int $count, int $timeout): array
     {
-        return $this->outermost(__FUNCTION__, fn(): mixed => parent::rightPopMany($queue, $count));
+        return $this->outermost(__FUNCTION__, fn(): mixed => parent::rightPopMany($queue, $count, $timeout));
     }
 
     #[\Override]

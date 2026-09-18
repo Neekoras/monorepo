@@ -94,20 +94,26 @@ class Redis implements Connection
         return $response[1];
     }
 
-    public function rightPopMany(string $queue, int $count): array
+    public function rightPopMany(string $queue, int $count, int $timeout): array
     {
         if ($count < 1) {
             return [];
         }
 
+        // BLMPOP (Redis 7.0), so the wait and the drain are one round trip
+        // rather than a BRPOP followed by an RPOP that asks what else arrived.
         // Not idempotent, for the reason call() gives about pops: a replay
         // after an ambiguous transport error would take a second helping off
         // the list and drop the first.
-        // The extension's stub types rPop() by its single-key form; with a
-        // count it answers a list.
-        $response = $this->call(fn(\Redis $redis): mixed => $redis->rPop($queue, $count));
+        $response = $this->call(fn(\Redis $redis): mixed => $redis->blmpop((float) $timeout, [$queue], 'RIGHT', $count));
 
-        return \is_array($response) ? array_values(array_filter($response, \is_string(...))) : [];
+        // [key, [payload, ...]] when something was popped; false or null when
+        // the timeout passed with the list empty.
+        if (!\is_array($response) || !\is_array($response[1] ?? null)) {
+            return [];
+        }
+
+        return array_values(array_filter($response[1], \is_string(...)));
     }
 
     public function leftPopArray(string $queue, int $timeout): array|false

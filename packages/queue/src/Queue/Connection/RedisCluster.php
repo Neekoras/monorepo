@@ -94,23 +94,22 @@ class RedisCluster implements Connection
         return $response[1];
     }
 
-    public function rightPopMany(string $queue, int $count): array
+    public function rightPopMany(string $queue, int $count, int $timeout): array
     {
         if ($count < 1) {
             return [];
         }
 
-        // Through rawCommand because the extension types rPop() by its
-        // single-key form, which answers a string; the counted form answers a
-        // list. Same command on the wire either way, and rawCommand routes by
-        // the key it is given, so it lands on the slot that owns the list.
-        $response = $this->getRedis()->rawCommand($queue, 'rpop', $queue, $count);
+        // BLMPOP over a single key, so the cluster routes it by that key like
+        // any other list command; the numkeys > 1 form is what would need every
+        // key in one slot, and this never uses it.
+        $response = $this->getRedis()->blmpop((float) $timeout, [$queue], 'RIGHT', $count);
 
-        if (!\is_array($response)) {
+        if (!\is_array($response) || !\is_array($response[1] ?? null)) {
             return [];
         }
 
-        return array_values(array_filter($response, \is_string(...)));
+        return array_values(array_filter($response[1], \is_string(...)));
     }
 
     public function leftPopArray(string $queue, int $timeout): array|false

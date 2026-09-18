@@ -82,7 +82,7 @@ final class PushRecordingConnection implements Connection
         return false;
     }
 
-    public function rightPopMany(string $queue, int $count): array
+    public function rightPopMany(string $queue, int $count, int $timeout): array
     {
         $this->calls[] = ['rightPopMany', $queue];
 

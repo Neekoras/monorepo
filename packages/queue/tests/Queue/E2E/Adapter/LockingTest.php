@@ -123,7 +123,7 @@ final class LockingTest extends TestCase
         yield 'leftPopArray' => ['leftPopArray', ['queue', 5], ['popped' => 'left']];
         yield 'rightPush' => ['rightPush', ['queue', 'value'], true];
         yield 'rightPop' => ['rightPop', ['queue', 5], 'right-pop'];
-        yield 'rightPopMany' => ['rightPopMany', ['queue', 4], ['right-pop', 'right-pop-2']];
+        yield 'rightPopMany' => ['rightPopMany', ['queue', 4, 5], ['right-pop', 'right-pop-2']];
         yield 'rightPopLeftPush' => ['rightPopLeftPush', ['queue', 'dest', 5], 'rpoplpush'];
         yield 'leftPush' => ['leftPush', ['queue', 'value'], true];
         yield 'leftPop' => ['leftPop', ['queue', 5], 'left-pop'];
@@ -259,9 +259,9 @@ class RecordingConnection implements Connection
         return 'right-pop';
     }
 
-    public function rightPopMany(string $queue, int $count): array
+    public function rightPopMany(string $queue, int $count, int $timeout): array
     {
-        $this->record('rightPopMany', [$queue, $count]);
+        $this->record('rightPopMany', [$queue, $count, $timeout]);
 
         return ['right-pop', 'right-pop-2'];
     }
@@ -377,7 +377,7 @@ class ThrowingConnection implements Connection
         return true;
     }
 
-    public function rightPopMany(string $queue, int $count): array
+    public function rightPopMany(string $queue, int $count, int $timeout): array
     {
         return [];
     }

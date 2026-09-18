@@ -125,7 +125,7 @@ class FailingRedisConnection implements Connection
         return false;
     }
 
-    public function rightPopMany(string $queue, int $count): array
+    public function rightPopMany(string $queue, int $count, int $timeout): array
     {
         return [];
     }

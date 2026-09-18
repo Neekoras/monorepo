@@ -204,13 +204,13 @@ $server
     ->action(function (array $payload) { /* … */ });
 ```
 
-Only the first message of a batch waits. The rest are whatever is already on the queue, taken without blocking, so a queue holding one message behaves exactly as it did before rather than waiting for company that is not coming.
+Only the first message of a batch waits. On Redis the whole batch is one `BLMPOP`, which blocks for that first message exactly as `BRPOP` did and then takes whatever is already behind it, so a queue holding one message answers at once rather than waiting for company that is not coming. That command is Redis 7.0; a batch of one still uses `BRPOP`, so the floor applies to the queues that asked for a batch and not to every deployment.
 
 The batch is bounded by free handler slots, and `Server::start()` refuses a batch larger than the coroutine cap. That bound is the whole safety argument: a claimed message is out of the broker and invisible to every idle replica, so claiming more than this worker can start would be taking work away from a worker that could have run it. At `job('…', 1)` every batch is one message, which is why raising the coroutine count comes first.
 
 Each message keeps its own acknowledgment — there is no batch commit — so one poison message in a batch of sixteen is rejected on its own and the other fifteen are unaffected.
 
-On `Broker\Redis` this turns a claim of `4N` commands into `N + 3`: the job payloads still need a key each, because a TTL cannot be shared, but the processing list takes one push for the batch and each counter moves once. With the pop, a batch of eight costs 13 commands where eight single receives cost 40.
+On `Broker\Redis` this turns a claim of `4N` commands into `N + 3`: the job payloads still need a key each, because a TTL cannot be shared, but the processing list takes one push for the batch and each counter moves once. With the pop, a batch of eight costs 12 commands where eight single receives cost 40.
 
 `Broker\Nats` fetches the batch in one pull request. Consumers that cannot batch are not required to: `Consumer\Batched` is optional, and the adapter falls back to `receive()` for anything without it.
 
@@ -219,10 +219,10 @@ What it costs the server is exact, and has no clock in it. Counted from Redis's 
 | batch | fetch and claim | acknowledge | total |
 |---|---|---|---|
 | 1 | 5.00 | 4.00 | **9.00** |
-| 4 | 2.25 | 4.00 | **6.25** |
-| 16 | 1.31 | 4.00 | **5.31** |
+| 4 | 2.00 | 4.00 | **6.00** |
+| 16 | 1.25 | 4.00 | **5.25** |
 
-The fetch side falls by 3.8x; the total only by 1.7x, because `commit()` is four commands and this does not touch it. **On Redis the acknowledgment is now the larger half of the cost**, and no batch size changes that.
+The fetch side falls by 4x; the total only by 1.7x, because `commit()` is four commands and this does not touch it. **On Redis the acknowledgment is now the larger half of the cost**, and no batch size changes that.
 
 A batch of one is the previous single `receive()`, not an approximation of it: both send 9.00 commands per message, and the only difference is an `INCRBY key 1` where the older code sent `INCR key` — the same round trip. So the rows below are a before and after, and the three command-identical configurations (the previous code, this code's `receive()`, and this code at `batch: 1`) land within each other's run-to-run spread.
 

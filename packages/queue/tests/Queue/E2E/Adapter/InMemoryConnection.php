@@ -93,7 +93,7 @@ class InMemoryConnection implements Connection
         return \is_string($value) ? $value : false;
     }
 
-    public function rightPopMany(string $queue, int $count): array
+    public function rightPopMany(string $queue, int $count, int $timeout): array
     {
         $popped = [];
 

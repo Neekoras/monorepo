@@ -68,7 +68,20 @@ class Redis implements Synchronous, Consumer, Batched
         $key = "{$queue->namespace}.queue.{$queue->name}";
 
         try {
-            $raw = $this->receive->rightPop($key, $timeout);
+            // One command for the whole batch: LMPOP's blocking form waits for
+            // the first message exactly as BRPOP does, then takes whatever else
+            // is already on the list in the same round trip -- so a queue
+            // holding one message costs what it costs today and never waits for
+            // company that is not coming. A batch of one stays on BRPOP, which
+            // keeps LMPOP's Redis 7.0 floor on the consumers that asked for a
+            // batch rather than on every deployment.
+            if ($max > 1) {
+                $batch = $this->receive->rightPopMany($key, $max, $timeout);
+            } else {
+                $raw = $this->receive->rightPop($key, $timeout);
+                $batch = \is_string($raw) && $raw !== '' ? [$raw] : [];
+            }
+
             if ($this->reconnectAttempt > 0) {
                 $this->triggerReconnectSuccessCallback($queue, $this->reconnectAttempt);
             }
@@ -96,24 +109,8 @@ class Redis implements Synchronous, Consumer, Batched
             return [];
         }
 
-        if ($raw === false || $raw === '') {
+        if ($batch === []) {
             return [];
-        }
-
-        $batch = [$raw];
-
-        // Only the first pop blocks. This one takes whatever is already there
-        // and returns at once, so a queue holding one message costs exactly what
-        // it costs today rather than waiting for company that is not coming.
-        if ($max > 1) {
-            try {
-                foreach ($this->receive->rightPopMany($key, $max - 1) as $more) {
-                    $batch[] = $more;
-                }
-            } catch (\RedisException|\RedisClusterException) {
-                // The first message is already ours and must still be claimed;
-                // the rest of the batch is an optimisation that did not happen.
-            }
         }
 
         return $this->claim($queue, $batch);

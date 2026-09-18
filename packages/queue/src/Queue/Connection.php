@@ -29,16 +29,19 @@ interface Connection
     public function rightPop(string $queue, int $timeout): string|false;
 
     /**
-     * Pop up to $count payloads from the tail, in pop order, without blocking.
+     * Pop up to $count payloads from the tail, in pop order, blocking up to
+     * $timeout seconds for the first of them.
      *
-     * The companion to {@see self::rightPop()} for a consumer draining a
-     * backlog: one command for the messages already waiting, rather than one
-     * round trip each. Returns fewer than asked -- including none -- when the
-     * list runs out, which is the ordinary case and not an error.
+     * {@see self::rightPop()} for a consumer draining a backlog: one command
+     * for the message it waits on and every message already behind it, rather
+     * than a round trip each. Only the first one is waited for -- a list
+     * holding one message answers immediately with one, so this returns fewer
+     * than asked, including none when the timeout passes on an empty list.
+     * That is the ordinary case and not an error.
      *
      * @return list<string>
      */
-    public function rightPopMany(string $queue, int $count): array;
+    public function rightPopMany(string $queue, int $count, int $timeout): array;
     public function rightPopLeftPush(string $queue, string $destination, int $timeout): string|false;
     public function leftPush(string $queue, string $payload): bool;
     public function leftPop(string $queue, int $timeout): string|false;
