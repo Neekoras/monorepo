@@ -114,6 +114,64 @@ final class NatsBrokerTest extends TestCase
         $this->broker->commit($this->queue, $recovered);
     }
 
+    public function testATerminalMessageIsDeadLetteredOnTheFirstFailure(): void
+    {
+        $this->broker->publish($this->queue, ['task' => 'doomed']);
+
+        $message = $this->broker->receive($this->queue, 2);
+        $this->assertInstanceOf(Message::class, $message);
+
+        // maxDeliver is 3 here: without the verdict this reject schedules attempt
+        // two, and the message keeps its in-flight slot through every attempt.
+        $this->broker->reject($this->queue, $message->terminal());
+
+        $this->assertSame(1, $this->broker->getQueueSize($this->queue, true), 'message should be on the dead stream');
+        $this->assertSame(0, $this->broker->getQueueSize($this->queue), 'work queue should be empty');
+
+        // TERM, not NAK: nothing is redelivered on the ackWait deadline either.
+        sleep(3);
+        $this->assertNotInstanceOf(\Utopia\Queue\Message::class, $this->broker->receive($this->queue, 2));
+
+        // Still re-drivable: ending the attempt early must not lose the work.
+        $this->broker->retry($this->queue, 10);
+        $recovered = $this->broker->receive($this->queue, 2);
+        $this->assertInstanceOf(Message::class, $recovered);
+        $this->assertSame('doomed', $recovered->getPayload()['task']);
+        $this->broker->commit($this->queue, $recovered);
+    }
+
+    public function testATerminalMessageFreesItsInFlightSlotForTheNextOne(): void
+    {
+        // One slot, so the queue can only move if the rejected message gives it
+        // back. A NAK holds it until the backoff expires; a TERM returns it now.
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $broker = new Nats(
+            Connection::connect($url),
+            ackWait: 30.0,
+            maxDeliver: 5,
+            backoff: [30.0, 60.0],
+            maxAckPending: 1,
+        );
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        try {
+            $broker->publish($queue, ['task' => 'poison']);
+            $broker->publish($queue, ['task' => 'good']);
+
+            $poison = $broker->receive($queue, 2);
+            $this->assertInstanceOf(Message::class, $poison);
+            $this->assertSame('poison', $poison->getPayload()['task']);
+            $broker->reject($queue, $poison->terminal());
+
+            $good = $broker->receive($queue, 3);
+            $this->assertInstanceOf(Message::class, $good, 'the slot must come back before the backoff expires');
+            $this->assertSame('good', $good->getPayload()['task']);
+            $broker->commit($queue, $good);
+        } finally {
+            $broker->close();
+        }
+    }
+
     public function testUncommittedMessageIsRedeliveredAfterAckWait(): void
     {
         // A worker that receives but never commits (crash/OOM) must not lose the
@@ -473,6 +531,64 @@ final class NatsBrokerTest extends TestCase
      * second one — a duplicate nothing could detect, on a queue that may be
      * billing someone.
      */
+    public function testReceiveBatchClaimsSeveralMessagesInOneCall(): void
+    {
+        for ($i = 0; $i < 20; $i++) {
+            $this->broker->publish($this->queue, ['task' => "job-{$i}"]);
+        }
+
+        $batch = $this->broker->receiveBatch($this->queue, 2, 8);
+
+        $this->assertCount(8, $batch);
+        $this->assertSame(
+            array_map(static fn(int $i): string => "job-{$i}", range(0, 7)),
+            array_map(static fn(Message $message): string => $message->getPayload()['task'], $batch),
+        );
+
+        // Each one is a delivery of its own, owed its own acknowledgment.
+        foreach ($batch as $message) {
+            $this->broker->commit($this->queue, $message);
+        }
+
+        $this->assertCount(12, $this->broker->receiveBatch($this->queue, 2, 32));
+    }
+
+    /**
+     * The trap this whole path is shaped around.
+     *
+     * JetStream's fetch(N, timeout) does not answer as soon as it has
+     * something: it collects until the batch fills or the deadline passes. A
+     * receive that asked for its whole batch up front would therefore make
+     * every message on a queue that is not busy wait the full receive timeout —
+     * batching would have made a sparse queue slower, by a lot. Measured at
+     * 1.9s against this same assertion before the fix.
+     */
+    public function testALoneMessageDoesNotWaitForTheBatchToFill(): void
+    {
+        $this->broker->publish($this->queue, ['task' => 'only-one']);
+
+        $started = microtime(true);
+        $batch = $this->broker->receiveBatch($this->queue, 2, 16);
+        $elapsed = microtime(true) - $started;
+
+        $this->assertCount(1, $batch);
+        $this->assertLessThan(
+            0.5,
+            $elapsed,
+            'asking for 16 and getting 1 must not cost the receive timeout',
+        );
+    }
+
+    public function testAnEmptyQueueCostsTheTimeoutOnceRatherThanPerMessage(): void
+    {
+        $started = microtime(true);
+        $batch = $this->broker->receiveBatch($this->queue, 1, 16);
+        $elapsed = microtime(true) - $started;
+
+        $this->assertSame([], $batch);
+        $this->assertLessThan(2.0, $elapsed, 'one timeout for the call, not one per message asked for');
+    }
+
     public function testEnqueueManyStoresEveryPayloadInOrder(): void
     {
         $payloads = [];

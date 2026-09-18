@@ -82,6 +82,13 @@ final class PushRecordingConnection implements Connection
         return false;
     }
 
+    public function rightPopMany(string $queue, int $count, int $timeout): array
+    {
+        $this->calls[] = ['rightPopMany', $queue];
+
+        return [];
+    }
+
     public function rightPopLeftPush(string $queue, string $destination, int $timeout): string|false
     {
         return false;
@@ -138,6 +145,13 @@ final class PushRecordingConnection implements Connection
     public function increment(string $key): int
     {
         return 0;
+    }
+
+    public function incrementBy(string $key, int $by): int
+    {
+        $this->calls[] = ['incrementBy', $key];
+
+        return $by;
     }
 
     public function decrement(string $key): int

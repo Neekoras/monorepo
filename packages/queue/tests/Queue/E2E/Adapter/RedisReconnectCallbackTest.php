@@ -125,6 +125,11 @@ class FailingRedisConnection implements Connection
         return false;
     }
 
+    public function rightPopMany(string $queue, int $count, int $timeout): array
+    {
+        return [];
+    }
+
     public function rightPopLeftPush(string $queue, string $destination, int $timeout): string|false
     {
         return false;
@@ -178,6 +183,11 @@ class FailingRedisConnection implements Connection
     public function increment(string $key): int
     {
         return 1;
+    }
+
+    public function incrementBy(string $key, int $by): int
+    {
+        return $by;
     }
 
     public function decrement(string $key): int
