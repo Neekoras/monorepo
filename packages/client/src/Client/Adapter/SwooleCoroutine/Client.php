@@ -245,8 +245,20 @@ class Client implements Adapter
         } finally {
             if (!$this->reuseConnections) {
                 $this->forgetConnection();
+            } elseif ($sink !== null) {
+                $this->releaseSink();
             }
         }
+    }
+
+    /**
+     * A write callback cannot be taken off a Swoole client, so replace the one
+     * holding $sink with a no-op. Whatever the sink captured is released, and
+     * the next stream on this connection installs its own callback anyway.
+     */
+    private function releaseSink(): void
+    {
+        $this->streamConnection?->set(['write_func' => static function (): void {}]);
     }
 
     /**
@@ -310,6 +322,10 @@ class Client implements Adapter
 
                 $sink($chunk);
             };
+        } else {
+            // $settings passes native settings through, and a caller-supplied
+            // write_func would leave every buffered body empty.
+            $settings['write_func'] = null;
         }
 
         try {

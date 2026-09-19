@@ -178,6 +178,49 @@ final class ClientTest extends AdapterContract
         });
     }
 
+    public function testABufferedRequestIgnoresAWriteCallbackPassedInSettings(): void
+    {
+        Http::serve(function (int $port): void {
+            $calls = 0;
+            $client = $this->createAdapter(['write_func' => function () use (&$calls): void {
+                $calls++;
+            }]);
+
+            $this->runAdapter(function () use ($client, $port, &$calls): void {
+                $response = $client->sendRequest(new Request\Factory()->createRequest(Method::GET, 'http://127.0.0.1:' . $port . '/buffered'));
+                $this->assertSame(202, $response->getStatusCode());
+                $this->assertSame('GET:/buffered::', (string) $response->getBody());
+                $this->assertSame(0, $calls, 'the supplied write callback received nothing');
+            });
+        });
+    }
+
+    public function testAReusedStreamConnectionReleasesItsSinkAfterTheStream(): void
+    {
+        Http::serve(function (int $port): void {
+            $client = $this->createAdapter()->withConnectionReuse();
+            $captured = null;
+
+            $this->runAdapter(function () use ($client, $port, &$captured): void {
+                $held = new \stdClass();
+                $captured = \WeakReference::create($held);
+
+                $response = $client->stream(
+                    new Request\Factory()->createRequest(Method::GET, 'http://127.0.0.1:' . $port . '/stream'),
+                    function (string $chunk) use ($held): void {
+                        $held->last = $chunk;
+                    },
+                );
+                $this->assertSame(200, $response->getStatusCode());
+            });
+
+            gc_collect_cycles();
+
+            $this->assertInstanceOf(\WeakReference::class, $captured);
+            $this->assertNotInstanceOf(\stdClass::class, $captured->get(), 'the sink outlived the stream on the kept-alive connection');
+        });
+    }
+
     public function testItRequiresCoroutineContext(): void
     {
         $client = $this->createAdapter();
