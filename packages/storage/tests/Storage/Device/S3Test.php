@@ -655,6 +655,22 @@ final class S3Test extends TestCase
         $this->assertContains('s3:completeMultipartUpload', $this->s3->calls);
     }
 
+    public function testFinalizeOfACompletedUploadWithoutItsIdIsNotAnError(): void
+    {
+        $this->s3->objectExists = true;
+        $metadata = ['parts' => [1 => 'etag-1', 2 => 'etag-2'], 'chunks' => 2];
+
+        $this->assertTrue($this->s3->finalize('/root/file.txt', 2, $metadata), 'the object is there, so the upload was completed');
+        $this->assertNotContains('s3:completeMultipartUpload', $this->s3->calls);
+    }
+
+    public function testFinalizeOfAnUploadThatNeverExistedFails(): void
+    {
+        $metadata = ['parts' => [1 => 'etag-1', 2 => 'etag-2'], 'chunks' => 2];
+
+        $this->assertFalse($this->s3->finalize('/root/file.txt', 2, $metadata));
+    }
+
     public function testWritesCarryNoAclWhenNoneIsConfigured(): void
     {
         $client = new ScriptedClient([new Response(200)->withHeader('etag', '"abc"')]);

@@ -280,9 +280,9 @@ $etag = $device->replace('locks/refresh', new Stream($token), $etag, 'text/plain
 $chunk = $device->read('dataset.bin', $offset, $length, $etag);
 ```
 
-On S3 the check and the operation are one request (`If-None-Match`, `If-Match`), so nothing can slip in between. On the local disk the ETag is the file's MD5 hash and `replace()` checks it before writing, which leaves a window between the two; `create()` opens the file exclusively and has none.
+On S3 the check and the operation are one request (`If-None-Match`, `If-Match`), so nothing can slip in between. On the local disk the ETag is the file's MD5 hash. `create()` opens the file exclusively and has no window at all; `replace()` checks the hash before writing, so a replacement landing between the two goes unnoticed and the last writer wins. Local writes land by renaming a finished temporary file over the path, so a reader never sees two versions mixed and a write that fails part way leaves the previous one in place. A conditional read on `Local` pins the file open and hashes it, one full pass before the first byte comes back.
 
-Multipart uploads left neither finalized nor aborted keep their parts, and S3 bills for them. `listUploads()` finds them, so a cleanup job can abort what a crashed process left behind. Amazon S3 takes any prefix; MinIO only honours a whole key.
+Multipart uploads left neither finalized nor aborted keep their parts, and S3 bills for them. `listUploads()` finds them, so a cleanup job can abort what a crashed process left behind. It is an `S3` method, forwarded by the `Telemetry` decorator; other devices have no multipart uploads and refuse the call. Amazon S3 takes any prefix; MinIO only honours a whole key.
 
 ```php
 $list = $device->listUploads('remote/directory');
@@ -358,7 +358,7 @@ $device = new Telemetry($telemetryAdapter, new Local('/path/to/storage'));
 
 - `write()` returns the ETag of the file written, a string, instead of `true`. A `false` never happened: every adapter threw instead. Callers testing the result for truth keep working; callers comparing it with `true` do not.
 - `Device` has three new abstract methods, `getFileInfo()`, `create()` and `replace()`, and `read()` takes an optional ETag. Adapters outside this library must implement them.
-- `finalize()` completes a multipart upload over an existing file instead of skipping it. Finalizing twice is still not an error.
+- `finalize()` completes a multipart upload over an existing file instead of skipping it. Finalizing twice is still not an error, on either adapter and whatever the chunk count. A chunk that never arrived is reported, whatever file happens to sit at the path.
 
 ## Upgrading from 3.x
 

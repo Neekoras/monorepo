@@ -44,6 +44,89 @@ final class LocalTest extends TestCase
         return $contents;
     }
 
+    /**
+     * A stream that hands over one chunk and then fails, standing in for a
+     * full disk or a connection dropped mid-body.
+     */
+    private function failingStream(): StreamInterface
+    {
+        return new class implements StreamInterface {
+            private bool $sent = false;
+
+            public function read(int $length): string
+            {
+                if ($this->sent) {
+                    throw new \DomainException('Stream failed');
+                }
+
+                $this->sent = true;
+
+                return 'partial';
+            }
+
+            public function eof(): bool
+            {
+                return false;
+            }
+
+            public function isReadable(): bool
+            {
+                return true;
+            }
+
+            public function isSeekable(): bool
+            {
+                return false;
+            }
+
+            public function isWritable(): bool
+            {
+                return false;
+            }
+
+            public function __toString(): string
+            {
+                return '';
+            }
+
+            public function close(): void {}
+
+            public function detach()
+            {
+                return null;
+            }
+
+            public function getSize(): ?int
+            {
+                return null;
+            }
+
+            public function tell(): int
+            {
+                return 0;
+            }
+
+            public function seek(int $offset, int $whence = SEEK_SET): void {}
+
+            public function rewind(): void {}
+
+            public function write(string $string): int
+            {
+                return 0;
+            }
+
+            public function getContents(): string
+            {
+                return '';
+            }
+
+            public function getMetadata(?string $key = null): mixed
+            {
+                return null;
+            }
+        };
+    }
+
     private Local $object;
 
     protected function setUp(): void
@@ -842,6 +925,100 @@ final class LocalTest extends TestCase
         $this->assertTrue($this->object->finalize($path, 2, $metadata));
         $this->assertSame('new contents', file_get_contents($path));
         $this->assertTrue($this->object->finalize($path, 2, $metadata), 'finalizing again is not an error');
+
+        $this->object->delete($path);
+    }
+
+    public function testFinalizeWithAMissingChunkDoesNotClaimAnExistingFile(): void
+    {
+        $path = $this->object->getPath('incomplete.txt');
+        $this->object->write($path, new Stream('old contents'), 'text/plain');
+
+        $metadata = [];
+        $this->object->upload(new Stream('new '), $path, 'text/plain', 1, 3, $metadata);
+        $this->object->upload(new Stream('!'), $path, 'text/plain', 3, 3, $metadata);
+
+        try {
+            $this->object->finalize($path, 3, $metadata);
+            self::fail('Expected the missing chunk to be reported');
+        } catch (UploadException) {
+            $this->assertSame('old contents', file_get_contents($path), 'a file in the way is not this upload');
+        }
+
+        $this->object->abort($path);
+    }
+
+    public function testAStalePartDoesNotHijackAWholeFileUpload(): void
+    {
+        $path = $this->object->getPath('hijacked.txt');
+
+        $abandoned = [];
+        $this->object->upload(new Stream('abandoned chunk'), $path, 'text/plain', 1, 0, $abandoned);
+
+        $metadata = [];
+        $this->object->upload(new Stream('whole file'), $path, 'text/plain', 1, 1, $metadata);
+
+        $this->assertTrue($this->object->finalize($path, 1, $metadata));
+        $this->assertSame('whole file', file_get_contents($path), 'another upload\'s leftovers are not this file');
+
+        $this->object->abort($path);
+    }
+
+    public function testAFailedCreateGivesThePathBack(): void
+    {
+        $path = $this->object->getPath('failed-create.txt');
+
+        try {
+            $this->object->create($path, $this->failingStream(), 'text/plain');
+            self::fail('Expected the write to fail');
+        } catch (\DomainException) {
+            $this->assertFileDoesNotExist($path, 'a path claimed but never written stays free');
+        }
+
+        $this->assertSame(md5('taken'), $this->object->create($path, new Stream('taken'), 'text/plain'));
+
+        $this->object->delete($path);
+    }
+
+    public function testAFailedReplaceLeavesThePreviousVersionInPlace(): void
+    {
+        $path = $this->object->getPath('failed-replace.txt');
+        $etag = $this->object->create($path, new Stream('first'), 'text/plain');
+
+        try {
+            $this->object->replace($path, $this->failingStream(), $etag, 'text/plain');
+            self::fail('Expected the write to fail');
+        } catch (\DomainException) {
+            $this->assertSame('first', file_get_contents($path));
+            $this->assertSame($etag, $this->object->getFileInfo($path)->etag);
+        }
+
+        $this->assertSame([], glob(\dirname($path) . DIRECTORY_SEPARATOR . 'tmp_write_*') ?: [], 'the half-written file is cleaned up');
+
+        $this->object->delete($path);
+    }
+
+    public function testAReplacementDoesNotDisturbAReaderAlreadyStreaming(): void
+    {
+        $path = $this->object->getPath('atomic.txt');
+        $etag = $this->object->create($path, new Stream('first version'), 'text/plain');
+
+        $stream = $this->object->read($path, 0, null, $etag);
+        $this->object->replace($path, new Stream('second'), $etag, 'text/plain');
+
+        $this->assertSame('first version', (string) $stream, 'the reader keeps the file whose ETag it checked');
+        $this->assertSame('second', file_get_contents($path));
+
+        $this->object->delete($path);
+    }
+
+    public function testAReplacedFileKeepsReadablePermissions(): void
+    {
+        $path = $this->object->getPath('permissions.txt');
+        $etag = $this->object->create($path, new Stream('first'), 'text/plain');
+        $this->object->replace($path, new Stream('second'), $etag, 'text/plain');
+
+        $this->assertSame(0644 & ~umask(), fileperms($path) & 0777);
 
         $this->object->delete($path);
     }

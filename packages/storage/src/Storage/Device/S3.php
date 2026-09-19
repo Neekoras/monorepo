@@ -129,14 +129,12 @@ class S3 extends Device
 
     public function finalize(string $path, int $chunks = 1, array &$metadata = []): bool
     {
-        // A single chunk went up as a whole object, unless the upload was
-        // prepared without knowing the count: then it is one part to complete.
-        if ($chunks === 1 && empty($metadata['uploadId'])) {
-            return $this->exists($path);
-        }
-
+        // No multipart upload to complete: either a single chunk went up as a
+        // whole object, or an earlier call completed the upload and the ID is
+        // gone with it. The object in place is the answer to both; without one
+        // there was never an upload here, and the caller is told so.
         if (empty($metadata['uploadId'])) {
-            throw new UploadException('Missing multipart upload ID');
+            return $this->exists($path);
         }
 
         $metadata['parts'] ??= [];

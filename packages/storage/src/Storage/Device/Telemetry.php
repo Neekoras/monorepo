@@ -9,6 +9,7 @@ use Utopia\Storage\Device;
 use Utopia\Storage\DeviceType;
 use Utopia\Storage\FileInfo;
 use Utopia\Storage\FileList;
+use Utopia\Storage\UploadList;
 use Utopia\Telemetry\Adapter;
 use Utopia\Telemetry\Histogram;
 
@@ -168,6 +169,27 @@ class Telemetry extends Device
     public function listFiles(string $prefix = '', int $max = 1000, ?string $cursor = null): FileList
     {
         return $this->measure(__FUNCTION__, fn(): FileList => $this->device->listFiles($prefix, $max, $cursor));
+    }
+
+    /**
+     * List the multipart uploads in progress on the decorated device.
+     *
+     * Only `S3` has uploads to list; wrapping anything else and asking for
+     * them is a programming error rather than an empty page, which would read
+     * as "nothing is being billed".
+     *
+     * @param  int<1, max>  $max
+     *
+     * @throws \BadMethodCallException When the decorated device has no multipart uploads
+     */
+    public function listUploads(string $prefix = '', int $max = 1000, ?string $cursor = null): UploadList
+    {
+        $device = $this->device;
+        if (! $device instanceof S3) {
+            throw new \BadMethodCallException($device::class . ' does not list multipart uploads');
+        }
+
+        return $this->measure(__FUNCTION__, fn(): UploadList => $device->listUploads($prefix, $max, $cursor));
     }
 
     public function getFileInfo(string $path): FileInfo

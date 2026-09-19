@@ -11,7 +11,7 @@ use Utopia\Storage\Exception\StorageException;
 use Utopia\Storage\Exception\UploadException;
 
 /**
- * @phpstan-type UploadMetadata array{parts?: array<int, bool|string>, chunks?: int, content_type?: string, uploadId?: string}
+ * @phpstan-type UploadMetadata array{parts?: array<int, bool|string>, chunks?: int, content_type?: string, uploadId?: string, whole?: bool}
  */
 abstract class Device
 {
@@ -117,6 +117,8 @@ abstract class Device
      * A window that runs past the end of the file is cut short. With an ETag,
      * the read only happens while the file still carries it, so bytes from a
      * file replaced meanwhile are never mistaken for the one the caller knows.
+     * S3 checks the ETag as part of the read; `Local` pins the file open and
+     * hashes it, which costs a full pass over it before any byte is returned.
      *
      * @param  int<0, max>  $offset
      * @param  int<0, max>|null  $length

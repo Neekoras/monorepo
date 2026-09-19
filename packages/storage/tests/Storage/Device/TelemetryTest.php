@@ -51,4 +51,12 @@ final class TelemetryTest extends TestCase
 
         $this->assertArrayHasKey('storage.operation', $telemetry->histograms);
     }
+
+    public function testListingUploadsOnADeviceWithoutThemIsRefused(): void
+    {
+        $device = new Telemetry(new TestTelemetry(), new Local(sys_get_temp_dir()));
+
+        $this->expectException(\BadMethodCallException::class);
+        $device->listUploads();
+    }
 }
