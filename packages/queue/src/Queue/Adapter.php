@@ -327,14 +327,14 @@ abstract class Adapter
      * Deliberately narrow. \Error also covers exhaustion -- OutOfMemoryError and
      * the stack overflow \Error carries -- which says the host was short at that
      * moment, not that the work is impossible, and that is what the redelivery
-     * budget is for. Only the three that mean "this value can never satisfy this
+     * budget is for. Only the ones that mean "this value can never satisfy this
      * signature" are listed.
      */
-    private static function isUnrepeatable(\Throwable $error): bool
+    private function isUnrepeatable(\Throwable $error): bool
     {
+        // ArgumentCountError is a TypeError, so the first test already covers it.
         return $error instanceof \TypeError
-            || $error instanceof \ValueError
-            || $error instanceof \ArgumentCountError;
+            || $error instanceof \ValueError;
     }
 
     /**
@@ -451,7 +451,7 @@ abstract class Adapter
             // is rejected: reject() is where the broker decides between another
             // attempt and the dead letter, and it runs here — ahead of the error
             // report below, which is the only other place a host sees the failure.
-            if ($error instanceof PermanentFailure || self::isUnrepeatable($error)) {
+            if ($error instanceof PermanentFailure || $this->isUnrepeatable($error)) {
                 $message->terminal();
             }
 
