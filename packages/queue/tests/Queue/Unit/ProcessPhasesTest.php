@@ -99,6 +99,7 @@ final class ProcessPhasesTest extends TestCase
     {
         $consumer = new PhaseConsumer();
         $adapter = new PhaseAdapter($consumer);
+        $adapter->setTerminalOnTypeError();
 
         $adapter->runOne(
             $this->message(),
@@ -123,6 +124,7 @@ final class ProcessPhasesTest extends TestCase
     {
         $consumer = new PhaseConsumer();
         $adapter = new PhaseAdapter($consumer);
+        $adapter->setTerminalOnTypeError();
 
         $adapter->runOne(
             $this->message(),
@@ -137,6 +139,29 @@ final class ProcessPhasesTest extends TestCase
             static function (): void {},
         );
 
+        $this->assertSame(['reject'], $consumer->calls);
+        $this->assertFalse($consumer->terminal);
+    }
+
+    public function testATypeErrorIsRetriedUntilTheCallerAsksOtherwise(): void
+    {
+        $consumer = new PhaseConsumer();
+        $adapter = new PhaseAdapter($consumer);
+
+        $adapter->runOne(
+            $this->message(),
+            static function (): never {
+                throw new \TypeError('Document::__construct(): Argument #1 ($input) must be of type array, Document given');
+            },
+            static function (): void {},
+            static function (): void {},
+        );
+
+        // No setTerminalOnTypeError(), so this is what every release before it
+        // did. Broker\Redis routes a terminal message to the dead list instead
+        // of the failed one and retry() drains only failed, so flipping this
+        // default would silently change which queue-retry sweeps reach -- an
+        // upgrade is the wrong moment to decide that for somebody.
         $this->assertSame(['reject'], $consumer->calls);
         $this->assertFalse($consumer->terminal);
     }

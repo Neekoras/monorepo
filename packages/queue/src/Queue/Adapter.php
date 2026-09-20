@@ -307,6 +307,30 @@ abstract class Adapter
     }
 
     /**
+     * Whether a type error ends a message's life instead of spending its
+     * redelivery budget. {@see self::setTerminalOnTypeError()}.
+     */
+    private bool $terminalOnTypeError = false;
+
+    /**
+     * Treat a type error as a permanent failure.
+     *
+     * Off by default, so nothing changes for a caller that does not ask. The
+     * behaviour it turns on is a real change of destination -- Broker\Redis
+     * pushes a terminal message onto the dead list rather than the failed one,
+     * and retry() drains only failed -- so a queue whose operators sweep
+     * failures with task-queue-retry would stop seeing this class come back.
+     * That is the point of it, and it is not a decision this library should
+     * make on a caller's behalf at upgrade time.
+     */
+    public function setTerminalOnTypeError(bool $enabled = true): static
+    {
+        $this->terminalOnTypeError = $enabled;
+
+        return $this;
+    }
+
+    /**
      * Whether a failure is a fault in the code rather than in the world.
      *
      * A handler that cannot say so itself still should not be retried when the
@@ -451,7 +475,7 @@ abstract class Adapter
             // is rejected: reject() is where the broker decides between another
             // attempt and the dead letter, and it runs here — ahead of the error
             // report below, which is the only other place a host sees the failure.
-            if ($error instanceof PermanentFailure || $this->isUnrepeatable($error)) {
+            if ($error instanceof PermanentFailure || ($this->terminalOnTypeError && $this->isUnrepeatable($error))) {
                 $message->terminal();
             }
 
