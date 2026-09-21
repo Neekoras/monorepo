@@ -281,6 +281,95 @@ final class RedisStoreTest extends TestCase
         $this->assertSame($rounds, $winners, 'exactly one contender per round may take the claim');
     }
 
+    public function testSlowFollowerWarmsWhileLeaderDispatchesAndTakesOverWithoutReplay(): void
+    {
+        $time = new TestClock(new \DateTimeImmutable('2026-08-18 03:00:30'));
+        $clock = new readonly class ($time) implements \Utopia\Schedule\Clock {
+            public function __construct(private TestClock $time) {}
+
+            public function now(): \DateTimeImmutable
+            {
+                return $this->time->now();
+            }
+
+            public function sleep(float $seconds): void
+            {
+                \Fiber::suspend('sleep');
+            }
+        };
+        $rows = new RowSet([new Row('fn', 'v1')]);
+        $leader = new Scheduler(
+            source: new SnapshotSource($rows->list(...), fn(Row $row): Entry => new Entry(new Cron('* * * * *'))),
+            store: $this->store(),
+            token: 'leader',
+            clock: $clock,
+        );
+        $follower = new Scheduler(
+            source: new SnapshotSource($rows->list(...), function (Row $row): Entry {
+                \Fiber::suspend('loading');
+
+                return new Entry(new Cron('* * * * *'));
+            }),
+            store: new RedisStore($this->connect(), $this->key),
+            token: 'follower',
+            clock: $clock,
+        );
+        $delivered = [];
+        $dispatch = function (array $occurrences) use (&$delivered): void {
+            foreach ($occurrences as $occurrence) {
+                $this->assertInstanceOf(Occurrence::class, $occurrence);
+                $delivered[] = $occurrence->id . '@' . $occurrence->due->format('H:i:s');
+            }
+        };
+        $a = new \Fiber(fn() => $leader->run($dispatch));
+        $b = new \Fiber(fn() => $follower->run($dispatch));
+
+        try {
+            $a->start();
+            $this->assertSame('loading', $b->start(), 'the follower must load before leadership is available');
+            $this->assertFalse($follower->isReady());
+
+            // A six-minute initialization exceeds the recovery horizon, but
+            // the old process still delivers every due minute in real Redis.
+            for ($minute = 1; $minute <= 6; ++$minute) {
+                $time->advance(60);
+                $a->resume();
+            }
+            $this->assertSame(array_map(fn(int $minute): string => \sprintf('fn@03:%02d:00', $minute), range(1, 6)), $delivered);
+            $this->assertSame('sleep', $b->resume());
+            $this->assertTrue($follower->isReady());
+            $this->assertSame('leader', $this->store()->load()?->token);
+
+            // Both replicas see a newly added schedule while the follower
+            // remains warm. The leader covers its first occurrence.
+            $rows->rows[] = new Row('new', 'v1', activeFrom: $time->now());
+            $time->advance(60);
+            $a->resume();
+            $this->assertSame('loading', $b->resume());
+            $b->resume();
+            $this->assertSame(['fn@03:07:00', 'new@03:07:00'], \array_slice($delivered, -2));
+
+            $leader->stop();
+            $a->resume();
+            $released = $this->store()->load();
+            $this->assertInstanceOf(Claim::class, $released);
+            $this->assertSame('', $released->token);
+            $time->advance(60);
+            $b->resume();
+            $this->assertSame('follower', $this->store()->load()?->token);
+            $this->assertSame(['fn@03:08:00', 'new@03:08:00'], \array_slice($delivered, -2));
+            $this->assertCount(10, $delivered, 'handoff must neither lose a minute nor replay the new schedule');
+        } finally {
+            $leader->stop();
+            $follower->stop();
+            foreach ([$a, $b] as $fiber) {
+                while ($fiber->isSuspended()) {
+                    $fiber->resume();
+                }
+            }
+        }
+    }
+
     private function store(): RedisStore
     {
         return new RedisStore($this->redis, $this->key);

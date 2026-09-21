@@ -65,7 +65,7 @@ use Utopia\Telemetry\Histogram;
  * instance are not supported; two loops over one {@see Store} are — that is
  * the leader election.
  *
- * @phpstan-type Registered array{trigger: Trigger, payload: mixed, version: string, coverFrom: \DateTimeImmutable|null}
+ * @phpstan-type Registered array{trigger: Trigger, payload: mixed, version: string, activeFrom: \DateTimeImmutable|null, coverFrom: \DateTimeImmutable|null}
  */
 final class Scheduler
 {
@@ -103,6 +103,8 @@ final class Scheduler
 
     /** Cursor for incremental syncs; null forces the next sync to be full. */
     private ?\DateTimeImmutable $lastSyncAt = null;
+
+    private ?\DateTimeImmutable $lastReconciledAt = null;
 
     private float $nextSyncAt = 0.0;
 
@@ -290,6 +292,7 @@ final class Scheduler
                 'trigger' => $entry->trigger,
                 'payload' => $entry->payload,
                 'version' => $row->version,
+                'activeFrom' => $row->activeFrom,
                 'coverFrom' => $this->coverFrom($row->activeFrom, $since, $existing !== null),
             ];
         }
@@ -308,6 +311,7 @@ final class Scheduler
         }
 
         $this->lastSyncAt = $syncStart;
+        $this->lastReconciledAt = $this->clock->now();
         $this->reconcileDuration->record(microtime(true) - $started, ['full' => $full]);
     }
 
@@ -380,6 +384,19 @@ final class Scheduler
     public function count(): int
     {
         return \count($this->entries);
+    }
+
+    /**
+     * Whether a complete source reconciliation has finished recently enough
+     * for takeover. Followers can be ready without owning the claim. An empty
+     * source is ready too; row-level errors still follow the onError policy.
+     * Allow one sync cadence plus a tick for the loop to refresh its view.
+     */
+    public function isReady(): bool
+    {
+        return $this->lastReconciledAt instanceof \DateTimeImmutable
+            && (float) $this->clock->now()->format('U.u') - (float) $this->lastReconciledAt->format('U.u')
+                <= $this->syncSeconds + $this->tickSeconds;
     }
 
     /**
@@ -641,9 +658,9 @@ final class Scheduler
     }
 
     /**
-     * The loop: elect, reconcile on the source's cadence, then tick,
-     * dispatch and commit on a wall-anchored cadence. Followers idle and
-     * poll for the claim.
+     * The loop: reconcile on the source's cadence, then elect, tick,
+     * dispatch and commit on a wall-anchored cadence. Followers keep their
+     * schedules warm without holding up the active dispatcher.
      *
      * Anchoring ticks to the clock instead of sleeping a fixed span
      * after variable work keeps the tick phase from drifting. A handler
@@ -671,15 +688,19 @@ final class Scheduler
 
         try {
             while ($this->running) {
-                if (!$this->elect() instanceof Claim) {
-                    $this->clock->sleep((float) $this->tickSeconds);
-                    continue;
-                }
-
                 $this->syncIfDue();
 
-                $this->deliver($this->tick(), $handler);
-                $this->commit();
+                // A stop during initialization must not claim or dispatch work.
+                if (!$this->running) {
+                    break;
+                }
+
+                // Never advance shared coverage after a failed initial load.
+                // Once initialized, source failures retain the last good view.
+                if ($this->lastSyncAt instanceof \DateTimeImmutable) {
+                    $this->deliver($this->tick(), $handler);
+                    $this->commit();
+                }
 
                 if (!$this->running) {
                     break;
@@ -758,11 +779,22 @@ final class Scheduler
             return null; // lost the takeover race
         }
 
+        // The previous leader may have delivered changes this follower loaded
+        // while waiting. Rebase discovery coverage on its committed source view,
+        // not on this process's earlier reconciliation cursor.
+        if ($syncedUntil !== null) {
+            $seen = $this->moment($syncedUntil);
+            foreach ($this->entries as &$entry) {
+                $entry['coverFrom'] = $entry['activeFrom'] !== null && $entry['activeFrom'] > $seen
+                    ? $entry['activeFrom']
+                    : null;
+            }
+            unset($entry);
+        }
+
         // A tick left pending from before losing leadership must never
         // commit after re-acquiring: its window predates the successor's
         // coverage and the matching token would let it through the fence.
-        // Memory staleness needs no special-casing — the snapshot timer is
-        // already due after any stretch spent as a follower.
         $this->clearPending();
 
         return $next;
