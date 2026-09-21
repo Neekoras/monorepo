@@ -65,7 +65,7 @@ use Utopia\Telemetry\Histogram;
  * instance are not supported; two loops over one {@see Store} are — that is
  * the leader election.
  *
- * @phpstan-type Registered array{trigger: Trigger, payload: mixed, version: string, activeFrom: \DateTimeImmutable|null, coverFrom: \DateTimeImmutable|null}
+ * @phpstan-type Registered array{trigger: Trigger, payload: mixed, version: string, activeFrom: \DateTimeImmutable|null, replaced: bool, coverFrom: \DateTimeImmutable|null}
  */
 final class Scheduler
 {
@@ -291,6 +291,7 @@ final class Scheduler
                 'payload' => $entry->payload,
                 'version' => $row->version,
                 'activeFrom' => $row->activeFrom,
+                'replaced' => $existing !== null,
                 'coverFrom' => $this->coverFrom($row->activeFrom, $since, $existing !== null),
             ];
         }
@@ -630,6 +631,7 @@ final class Scheduler
         foreach ($this->pendingCovered as $id => $version) {
             if (isset($this->entries[$id]) && $this->entries[$id]['version'] === $version) {
                 $this->entries[$id]['coverFrom'] = null;
+                $this->entries[$id]['replaced'] = false;
             }
         }
 
@@ -775,7 +777,7 @@ final class Scheduler
         if ($syncedUntil !== null) {
             $seen = $this->moment($syncedUntil);
             foreach ($this->entries as &$entry) {
-                $entry['coverFrom'] = $this->coverFrom($entry['activeFrom'], $seen, false);
+                $entry['coverFrom'] = $this->coverFrom($entry['activeFrom'], $seen, $entry['replaced']);
             }
             unset($entry);
         }

@@ -60,6 +60,37 @@ final class ReconcileTest extends TestCase
         $this->assertSame([], $follower->tick(), 'the recovered one-shot is delivered only once');
     }
 
+    public function testWarmTakeoverKeepsPendingBackdatedReplacementCoverage(): void
+    {
+        $clock = new TestClock(new \DateTimeImmutable('2026-08-18 03:00:30'));
+        $store = new MemoryStore();
+        $set = new RowSet([new Row('job', 'v1', activeFrom: new \DateTimeImmutable('2026-08-18 03:00:00'))]);
+        $source = new SnapshotSource(
+            snapshot: $set->list(...),
+            make: fn(Row $row): Entry => new Entry(new At(new \DateTimeImmutable(
+                $row->version === 'v1' ? '2026-08-18 04:00:00' : '2026-08-18 03:00:45',
+            ))),
+        );
+        $leader = new Scheduler(source: $source, store: $store, clock: $clock);
+        $follower = new Scheduler(source: $source, store: $store, clock: $clock);
+        $leader->reconcile();
+        $leader->tick();
+        $leader->commit();
+        $follower->reconcile();
+
+        $clock->advance(30);
+        $set->rows = [new Row('job', 'v2', activeFrom: new \DateTimeImmutable('2026-08-18 03:00:20'))];
+        $follower->reconcile();
+        $this->assertSame([], $leader->tick());
+        $leader->commit();
+        $clock->advance(4);
+
+        $this->assertSame(['03:00:45'], $this->dues($follower->tick()));
+        $follower->commit();
+        $clock->advance(1);
+        $this->assertSame([], $follower->tick());
+    }
+
     public function testFullSnapshotDiffAddsUpdatesAndRemoves(): void
     {
         $clock = new TestClock(new \DateTimeImmutable('2026-08-18 03:00:30.000000'));
