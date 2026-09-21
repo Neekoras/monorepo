@@ -57,7 +57,7 @@ For stats-usage, validate buffered ClickHouse writes versus acknowledgement timi
 
 ## Release and rollout order
 
-1. Merge and release the NATS transport addition as 1.4.
+1. NATS transport support is released as [1.4.0](https://github.com/utopia-php/nats/releases/tag/1.4.0); the queue requires `^1.4`.
 2. Merge and release queue as a new major version: custom Redis connections must implement `execute`, and Cluster requires shared key placement. Release Platform with the queue-major allowance.
 3. Prepare Appwrite's package/lock updates, then Cloud's package/lock updates and removal of the batch-versus-coroutines clamp. Keep restrictions for adapters that cannot consume batches. Cloud must not enable this behavior against queue 4.
 4. Test both Redis and NATS integrations in staging; current NATS-backed staging traffic cannot validate the Redis path.
