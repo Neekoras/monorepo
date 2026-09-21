@@ -79,7 +79,11 @@ class Fastly implements Provider
 
                 try {
                     $status = $this->tls->getCertificateStatus($domain, $domainType);
-                } catch (Certificate) {
+                } catch (Certificate $exception) {
+                    if (!$exception->isBlocked()) {
+                        throw $exception;
+                    }
+
                     // Waiting on the domain owner: nothing is issued yet, so
                     // the hostname stays on its current service.
                     return $renewDate;
