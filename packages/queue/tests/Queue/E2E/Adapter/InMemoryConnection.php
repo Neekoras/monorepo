@@ -21,13 +21,17 @@ class InMemoryConnection implements Connection
     /** @var array<string, int> */
     private array $counters = [];
 
-    /** @var array<string, int> */
+    /** @var array<string, float> */
     private array $expires = [];
-    private int $now = 0;
+    private float $now = 0.0;
 
-    public function advance(int $seconds): void
+    public function advanceToNextExpiry(bool $justBefore = false): void
     {
-        $this->now += $seconds;
+        if ($this->expires === []) {
+            throw new \LogicException('No expiring keys');
+        }
+
+        $this->now = min($this->expires) - ($justBefore ? 0.5 : 0.0);
         foreach ($this->expires as $key => $expiry) {
             if ($expiry <= $this->now) {
                 $this->remove($key);

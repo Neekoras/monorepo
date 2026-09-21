@@ -97,7 +97,7 @@ final class BatchedReceiveTest extends TestCase
         foreach ($batch as $message) {
             $broker->commit($queue, $message);
         }
-        $connection->advance(91);
+        $connection->advanceToNextExpiry();
 
         $this->assertSame(1, $broker->getQueueSize($queue, failedJobs: true));
         $this->assertSame(0, $broker->reap($queue, olderThan: 0));
