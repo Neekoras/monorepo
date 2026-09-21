@@ -113,8 +113,11 @@ For a Kubernetes replacement, use `maxUnavailable: 0` and `maxSurge: 1`, and kee
 the old instance until the replacement is ready. Call `stop()` on termination
 and allow the current batch to finish. The loop commits its coverage and releases
 the claim; the prepared replacement resumes from that shared watermark.
-Leadership loss and crashes can still cause duplicate delivery. Consumers that
-need deduplication should use `Occurrence::key()`.
+Leadership loss and crashes can still cause duplicate delivery. A pending
+replacement definition can also replay during handoff: the shared watermark does
+not record which versions the predecessor saw, so retaining its catch-up coverage
+avoids dropping an unseen replacement. Consumers that need deduplication should
+use `Occurrence::key()`.
 
 All overlapping instances must use the same shared store. An old instance using
 `Store\Memory` cannot participate in that election. Also account for the extra
