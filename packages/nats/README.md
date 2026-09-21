@@ -363,7 +363,7 @@ NATS_URL=nats://host:4222 ./vendor/bin/phpunit --testsuite integration
 
 Apache-2.0
 
-### Pipelined requests
+### Concurrent requests
 
 `Connection::requests()` sends independent requests in one write and correlates their replies. It returns a result at each input index: either a `Message` or a `Throwable`. Inspect every result; one missing reply does not discard successful replies. The optional `resolved` callback receives each result as it arrives, before unrelated requests time out.
 
