@@ -321,4 +321,49 @@ final class RedisBrokerRecoveryTest extends TestCase
             $this->assertSame(['queue' => $queue->name], $messages[0]->getPayload());
         }
     }
+    public function testPooledMaintenanceRecoversAnExpiredClaim(): void
+    {
+        $broker = new Redis($this->connection, $this->connection, reapAfter: 0);
+        $pool = new \Utopia\Pools\Pool(new \Utopia\Pools\Adapter\Stack(), 'recovery', 1, fn(): Redis => $broker, timeout: 0.0);
+        $consumer = new \Utopia\Queue\Broker\Pool(consumer: $pool);
+        $broker->publish($this->queue, ['n' => 1]);
+        $this->assertCount(1, $consumer->receive($this->queue, 0));
+        $this->connection->advanceToNextExpiry();
+
+        $consumer->maintain();
+
+        $messages = $consumer->receive($this->queue, 0);
+        $this->assertCount(1, $messages);
+        $this->assertSame(['n' => 1], $messages[0]->getPayload());
+        $consumer->commit($this->queue, $messages[0]);
+        $this->assertSame([], $consumer->receive($this->queue, 0));
+    }
+
+    public function testBoundedReapAdvancesPastLiveClaimsAcrossBrokers(): void
+    {
+        foreach (range(1, 5) as $n) {
+            $this->broker->publish($this->queue, ['n' => $n]);
+        }
+        $claims = $this->broker->receive($this->queue, 0, 5);
+        $this->connection->advanceToNextExpiry();
+        foreach (\array_slice($claims, 0, 3) as $live) {
+            $this->broker->extend($this->queue, $live);
+        }
+
+        // Each window can be scanned by a different winner of the fleet lock.
+        foreach ([0, 1, 1] as $recovered) {
+            $broker = new Redis($this->connection, $this->connection);
+            $this->assertSame($recovered, $broker->reap($this->queue, olderThan: 0, limit: 1, scan: 2));
+        }
+        $messages = $this->broker->receive($this->queue, 0, 5);
+        $this->assertSame([4, 5], array_map(static fn(\Utopia\Queue\Message $message) => $message->getPayload()['n'], $messages));
+
+        // After reaching the head, wrap back to claims that were live before.
+        foreach ($messages as $message) {
+            $this->broker->commit($this->queue, $message);
+        }
+        $this->connection->advanceToNextExpiry();
+        $this->assertSame(2, $this->broker->reap($this->queue, olderThan: 0, scan: 2));
+    }
+
 }

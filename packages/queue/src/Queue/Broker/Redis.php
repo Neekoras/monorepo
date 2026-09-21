@@ -340,6 +340,12 @@ class Redis implements Synchronous, Consumer
         }
     }
 
+    /** Idle resource hook used by Utopia\Pools\Pool::maintain(). */
+    public function tick(): void
+    {
+        $this->maintain();
+    }
+
     public function close(): void
     {
         $this->closed = true;
@@ -503,8 +509,8 @@ class Redis implements Synchronous, Consumer
      *        are requeued; older ones are parked on the dead queue.
      * @param int|null $scan Read only this many claims from the stale end of the
      *        processing list, instead of the whole list. Bounds what one sweep
-     *        costs on a list holding years of stranded claims; what the window
-     *        misses, the next sweep reaches, because requeued claims leave it.
+     *        costs on a list holding years of stranded claims. Bounded sweeps
+     *        share a cursor so retained live claims cannot block newer claims.
      * @return int The number of claims requeued
      */
     public function reap(Queue $queue, int $olderThan = 90000, ?int $limit = null, ?int $maxAttempts = null, ?int $newerThan = null, ?int $scan = null): int
@@ -515,12 +521,19 @@ class Redis implements Synchronous, Consumer
         $requeued = 0;
 
         $size = $this->commands->listSize($processingList);
+        if ($size === 0) {
+            return 0;
+        }
 
-        // Claims are pushed on the head, so the oldest -- the stale end -- is
-        // the tail. A bounded scan starts there.
-        $claims = $scan === null
-            ? $this->commands->listRange($processingList, $size, 0)
-            : $this->commands->listRange($processingList, $scan, max(0, $size - $scan));
+        // Count from the tail: new claims arrive at the head. Share progress
+        // across brokers because a different pod may win each maintenance lock.
+        $cursorKey = "{$queue->namespace}.reap-cursor.{$queue->name}";
+        $offset = $scan === null ? 0 : (int) $this->commands->get($cursorKey);
+        if ($offset < 0 || $offset >= $size) {
+            $offset = 0;
+        }
+        $length = $scan === null ? $size : min(max(1, $scan), $size - $offset);
+        $claims = $this->commands->listRange($processingList, $length, max(0, $size - $offset - $length));
 
         foreach (array_reverse($claims) as $pid) {
             if ($limit !== null && $requeued >= $limit) {
@@ -528,6 +541,7 @@ class Redis implements Synchronous, Consumer
             }
 
             if (!\is_string($pid)) {
+                $offset++;
                 continue;
             }
 
@@ -535,10 +549,12 @@ class Redis implements Synchronous, Consumer
             $job = $this->getJob($queue, $pid);
             if ($job === false) {
                 $this->commands->listRemove($processingList, $pid);
+                $size--;
                 continue;
             }
 
             if ($job->getTimestamp() > $cutoff) {
+                $offset++;
                 continue;
             }
 
@@ -547,19 +563,26 @@ class Redis implements Synchronous, Consumer
             // job published long before the cutoff, which is exactly the claim
             // the timestamp alone would wrongly requeue out from under it.
             if (\is_string($this->commands->get("{$queue->namespace}.claims.{$queue->name}.{$pid}"))) {
+                $offset++;
                 continue;
             }
 
             if (($maxAttempts !== null && $job->getAttempts() >= $maxAttempts)
                 || ($newerThan !== null && $job->getTimestamp() < $now - $newerThan)) {
                 $this->commands->listRemove($processingList, $pid);
+                $size--;
                 $this->commands->leftPush("{$queue->namespace}.dead.{$queue->name}", $pid);
                 continue;
             }
 
             $this->requeue($queue, $job);
             $this->commands->listRemove($processingList, $pid);
+            $size--;
             $requeued++;
+        }
+
+        if ($scan !== null) {
+            $this->commands->set($cursorKey, (string) ($offset >= $size ? 0 : $offset));
         }
 
         return $requeued;
