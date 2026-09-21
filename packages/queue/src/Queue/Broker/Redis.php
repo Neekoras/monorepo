@@ -303,17 +303,15 @@ class Redis implements Synchronous, Consumer
         }
     }
 
-    public function publish(Queue $queue, array $payload, bool $priority = false): bool
+    public function publish(Queue $queue, array $payload): bool
     {
         $key = "{$queue->namespace}.queue.{$queue->name}";
         $envelope = $this->codec->encode($this->envelope($queue, $payload));
 
-        return $priority
-            ? $this->commands->rightPush($key, $envelope)
-            : $this->commands->leftPush($key, $envelope);
+        return $this->commands->leftPush($key, $envelope);
     }
 
-    public function enqueueMany(Queue $queue, array $payloads, bool $priority = false): bool
+    public function enqueueMany(Queue $queue, array $payloads): bool
     {
         if ($payloads === []) {
             return true;
@@ -326,9 +324,7 @@ class Redis implements Synchronous, Consumer
 
         $key = "{$queue->namespace}.queue.{$queue->name}";
 
-        return $priority
-            ? $this->commands->rightPushMany($key, $encoded)
-            : $this->commands->leftPushMany($key, $encoded);
+        return $this->commands->leftPushMany($key, $encoded);
     }
 
     /**

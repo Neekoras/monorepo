@@ -66,6 +66,41 @@ final class NatsBrokerTest extends TestCase
         $this->assertSame(1, $this->broker->getQueueSize($this->queue));
     }
 
+    public function testExistingQueueWithUnusedLegacyConsumerStillWorks(): void
+    {
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $this->broker->publish($this->queue, ['task' => 'existing']);
+        $admin = Connection::connect($url);
+        $replacement = new Nats(fn(): Connection => Connection::connect($url));
+        try {
+            $js = $admin->jetStream();
+            $stream = 'Q_' . strtoupper($this->queue->name);
+            $config = $js->getStreamInfo($stream)->config->toArray();
+            $legacy = 'q.' . $this->queue->name . '.priority';
+            $js->updateStream(new \Utopia\NATS\JetStream\StreamConfig(
+                name: $stream,
+                subjects: [...$config['subjects'], $legacy],
+                retention: \Utopia\NATS\JetStream\RetentionPolicy::WorkQueue,
+                metadata: $config['metadata'],
+            ));
+            $js->createConsumer($stream, new \Utopia\NATS\JetStream\ConsumerConfig(
+                durableName: 'worker_priority',
+                ackPolicy: \Utopia\NATS\JetStream\AckPolicy::Explicit,
+                filterSubject: $legacy,
+            ));
+            $replacement->publish($this->queue, ['task' => 'new']);
+            $messages = $replacement->receive($this->queue, 1, 2);
+            $this->assertSame(['existing', 'new'], array_map(static fn(Message $message): string => $message->getPayload()['task'], $messages));
+            foreach ($messages as $message) {
+                $replacement->commit($this->queue, $message);
+            }
+            $this->assertSame(0, $replacement->getQueueSize($this->queue));
+        } finally {
+            $replacement->close();
+            $admin->close();
+        }
+    }
+
     public static function failedAcknowledgement(): iterable
     {
         yield 'write not delivered' => [false];
@@ -133,16 +168,7 @@ final class NatsBrokerTest extends TestCase
         }
     }
 
-    public function testPriorityMessageJumpsAhead(): void
-    {
-        $this->broker->publish($this->queue, ['task' => 'normal']);
-        $this->broker->publish($this->queue, ['task' => 'urgent'], priority: true);
 
-        $message = $this->broker->receive($this->queue, 2)[0] ?? null;
-        $this->assertInstanceOf(Message::class, $message);
-        $this->assertSame('urgent', $message->getPayload()['task']);
-        $this->broker->commit($this->queue, $message);
-    }
 
     public function testRejectRedeliversAndCountsAttempts(): void
     {
@@ -347,7 +373,6 @@ final class NatsBrokerTest extends TestCase
         $info = $js->getStreamInfo('Q_' . strtoupper($name));
         $this->assertSame('Q_' . strtoupper($name), $info->config->name);
         $this->assertContains('q.' . strtolower($name) . '.normal', $info->config->subjects);
-        $this->assertContains('q.' . strtolower($name) . '.priority', $info->config->subjects);
     }
 
     /**
@@ -705,15 +730,7 @@ final class NatsBrokerTest extends TestCase
         $broker->close();
     }
 
-    public function testEnqueueManyHonoursThePriorityFlag(): void
-    {
-        $this->broker->enqueueMany($this->queue, [['task' => 'normal']]);
-        $this->broker->enqueueMany($this->queue, [['task' => 'urgent']], priority: true);
 
-        $message = $this->broker->receive($this->queue, 2)[0] ?? null;
-        $this->assertInstanceOf(Message::class, $message);
-        $this->assertSame('urgent', $message->getPayload()['task']);
-    }
 
     public function testEnqueueManyStoresNothingForAnEmptyBatch(): void
     {
@@ -1237,7 +1254,7 @@ final class NatsBrokerTest extends TestCase
 
         $js = Connection::connect($url)->jetStream();
         $stream = 'Q_' . strtoupper($queue->name);
-        foreach (['worker', 'worker_priority'] as $durable) {
+        foreach (['worker'] as $durable) {
             $config = $js->getConsumer($stream, $durable)->info(true)->config;
             $this->assertSame(8, $config->maxAckPending, "{$durable} must carry maxAckPending");
             $this->assertSame(16, $config->maxWaiting, "{$durable} must carry maxWaiting");
@@ -1302,7 +1319,6 @@ final class NatsBrokerTest extends TestCase
             'work' => $js->getStreamInfo($stream)->config->toArray(),
             'dead' => $js->getStreamInfo($stream . '_DEAD')->config->toArray(),
             'normal' => $js->getConsumer($stream, 'worker')->info(true)->config->toArray(),
-            'priority' => $js->getConsumer($stream, 'worker_priority')->info(true)->config->toArray(),
         ];
         $before = $snapshot();
 

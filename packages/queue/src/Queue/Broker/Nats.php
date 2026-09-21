@@ -31,7 +31,7 @@ use Utopia\Queue\Queue;
  * NATS JetStream broker.
  *
  * Each queue is a WorkQueue-retention stream (a message is removed once acked)
- * with two subjects — normal and priority — served by two durable pull consumers.
+ * with one work subject served by a durable pull consumer.
  * Redelivery and dead-lettering are native: a rejected message is NAK'd and
  * redelivered until MaxDeliver, after which it is TERM'd and copied to a per-queue
  * dead stream. This replaces the Redis broker's hand-rolled processing/failed/dead
@@ -79,10 +79,8 @@ class Nats implements Synchronous, Consumer, Bounded
     private const string DEAD_STREAM_SUFFIX = '_DEAD';
     private const string SUBJECT_PREFIX = 'q';
     private const string SUBJECT_NORMAL = 'normal';
-    private const string SUBJECT_PRIORITY = 'priority';
     private const string SUBJECT_DEAD = 'dead';
-    private const string CONSUMER_NORMAL = 'worker';
-    private const string CONSUMER_PRIORITY = 'worker_priority';
+    private const string CONSUMER_WORK = 'worker';
     private const string CONSUMER_RETRY = 'retry';
     private const string CONTENT_TYPE = 'Content-Type';
     private const string ADVISORY_MAX_DELIVERIES = '$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES';
@@ -111,7 +109,7 @@ class Nats implements Synchronous, Consumer, Bounded
     /** @var array<string, bool> queues whose streams/consumers have been provisioned */
     private array $provisioned = [];
 
-    /** @var array<string, array{normal: NatsConsumer, priority: NatsConsumer}> */
+    /** @var array<string, NatsConsumer> */
     private array $consumers = [];
 
     /** @var array<string, JetStreamMessage> in-flight messages keyed by pid, for commit/reject */
@@ -161,7 +159,7 @@ class Nats implements Synchronous, Consumer, Bounded
     /** @var list<\Throwable> failures owed to $onError, handed over off the lock */
     private array $deferred = [];
 
-    /** @var array<string, array<string, NatsConsumer>> commands-connection consumer handles, [stream][durable] */
+    /** @var array<string, NatsConsumer> commands-connection consumer handles, keyed by stream */
     private array $commandsConsumers = [];
 
     /**
@@ -413,18 +411,18 @@ class Nats implements Synchronous, Consumer, Bounded
         return new JetStreamMessage($this->commandsConnection(), $jsMessage->message);
     }
 
-    private function commandsConsumer(string $stream, string $durable): NatsConsumer
+    private function commandsConsumer(string $stream): NatsConsumer
     {
-        return $this->commandsConsumers[$stream][$durable] ??= $this->commandsJs()->getConsumer($stream, $durable);
+        return $this->commandsConsumers[$stream] ??= $this->commandsJs()->getConsumer($stream, self::CONSUMER_WORK);
     }
 
-    public function publish(Queue $queue, array $payload, bool $priority = false): bool
+    public function publish(Queue $queue, array $payload): bool
     {
         // Enveloped before the lock is taken. envelope() runs the caller's $messageId
         // closure, and the lock is a channel of one acquired with no timeout, so a
         // closure that reached back into the broker would wait for a lock its own call
         // is holding and hang the worker for good. Nothing here needs the socket.
-        $subject = $priority ? $this->prioritySubject($queue) : $this->workSubject($queue);
+        $subject = $this->workSubject($queue);
         $envelope = $this->envelope($queue, $payload);
 
         return $this->synchronize(function () use ($queue, $subject, $envelope): bool {
@@ -435,14 +433,14 @@ class Nats implements Synchronous, Consumer, Bounded
         });
     }
 
-    public function enqueueMany(Queue $queue, array $payloads, bool $priority = false): bool
+    public function enqueueMany(Queue $queue, array $payloads): bool
     {
         if ($payloads === []) {
             return true;
         }
 
         // Enveloped before the lock, for the reason publish() gives.
-        $subject = $priority ? $this->prioritySubject($queue) : $this->workSubject($queue);
+        $subject = $this->workSubject($queue);
 
         $messages = [];
         foreach ($payloads as $payload) {
@@ -682,23 +680,12 @@ class Nats implements Synchronous, Consumer, Bounded
         $key = $this->identity($queue);
         $this->drainDeadLetters($queue, $key);
 
-        // Priority first (no_wait poll), then the normal queue for up to $timeout.
-        $deliveries = $this->fetch($this->consumers[$key]['priority'], $max, 0.25, true);
-
-        // Waiting is only ever allowed with nothing in hand. Holding a message
-        // while blocking for company would add the whole receive timeout to the
-        // latency of a message already claimed.
-        if ($deliveries === []) {
-            // And it asks for exactly one. fetch($max, $timeout) does not return
-            // as soon as it has something: it collects until the batch fills or
-            // the deadline passes, so asking for a batch up front would make
-            // every message on a sparse queue $timeout late.
-            $deliveries = $this->fetch($this->consumers[$key]['normal'], 1, (float) $timeout, false);
-        }
+        // Fetch one message first so a sparse queue never waits for a batch to fill.
+        $deliveries = $this->fetch($this->consumers[$key], 1, (float) $timeout, false);
 
         // Whatever else is already waiting, on a poll that cannot block.
         if ($deliveries !== [] && \count($deliveries) < $max) {
-            $deliveries = array_merge($deliveries, $this->fetch($this->consumers[$key]['normal'], $max - \count($deliveries), 0.25, true));
+            $deliveries = array_merge($deliveries, $this->fetch($this->consumers[$key], $max - \count($deliveries), 0.25, true));
         }
 
         $messages = [];
@@ -1042,8 +1029,7 @@ class Nats implements Synchronous, Consumer, Bounded
                     return $this->commandsJs()->getStreamInfo($this->deadStream($queue))->state->messages;
                 }
 
-                return $this->commandsConsumer($stream, self::CONSUMER_NORMAL)->info(true)->numPending
-                    + $this->commandsConsumer($stream, self::CONSUMER_PRIORITY)->info(true)->numPending;
+                return $this->commandsConsumer($stream)->info(true)->numPending;
             } catch (JetStreamException $e) {
                 if ($e->apiError?->code === 404) {
                     return 0; // stream/consumer not provisioned yet — nothing enqueued
@@ -1198,7 +1184,7 @@ class Nats implements Synchronous, Consumer, Bounded
 
         $this->js()->createOrUpdateStream(new StreamConfig(
             name: $this->workStream($queue),
-            subjects: [$this->workSubject($queue), $this->prioritySubject($queue)],
+            subjects: [$this->workSubject($queue)],
             description: $key,
             retention: RetentionPolicy::WorkQueue,
             maxMsgs: $this->maxMsgs,
@@ -1231,30 +1217,17 @@ class Nats implements Synchronous, Consumer, Bounded
             metadata: [self::METADATA_IDENTITY => $key],
         ));
 
-        $this->consumers[$key] = [
-            'normal' => $this->js()->createConsumer($this->workStream($queue), new ConsumerConfig(
-                durableName: self::CONSUMER_NORMAL,
-                ackPolicy: AckPolicy::Explicit,
-                ackWait: $this->ackWait,
-                maxDeliver: $this->maxDeliver,
-                filterSubject: $this->workSubject($queue),
-                maxWaiting: $this->maxWaiting,
-                maxAckPending: $this->maxAckPending,
-                inactiveThreshold: $this->inactiveThreshold,
-                backoff: $this->backoff,
-            )),
-            'priority' => $this->js()->createConsumer($this->workStream($queue), new ConsumerConfig(
-                durableName: self::CONSUMER_PRIORITY,
-                ackPolicy: AckPolicy::Explicit,
-                ackWait: $this->ackWait,
-                maxDeliver: $this->maxDeliver,
-                filterSubject: $this->prioritySubject($queue),
-                maxWaiting: $this->maxWaiting,
-                maxAckPending: $this->maxAckPending,
-                inactiveThreshold: $this->inactiveThreshold,
-                backoff: $this->backoff,
-            )),
-        ];
+        $this->consumers[$key] = $this->js()->createConsumer($this->workStream($queue), new ConsumerConfig(
+            durableName: self::CONSUMER_WORK,
+            ackPolicy: AckPolicy::Explicit,
+            ackWait: $this->ackWait,
+            maxDeliver: $this->maxDeliver,
+            filterSubject: $this->workSubject($queue),
+            maxWaiting: $this->maxWaiting,
+            maxAckPending: $this->maxAckPending,
+            inactiveThreshold: $this->inactiveThreshold,
+            backoff: $this->backoff,
+        ));
 
         // Best-effort terminal dead-lettering for the crash-loop case: a worker that
         // dies (never reject()s) is redelivered by AckWait until maxDeliver, after which
@@ -1306,10 +1279,7 @@ class Nats implements Synchronous, Consumer, Bounded
             }
         }
 
-        $this->consumers[$key] = [
-            'normal' => $this->adoptConsumer($queue, self::CONSUMER_NORMAL),
-            'priority' => $this->adoptConsumer($queue, self::CONSUMER_PRIORITY),
-        ];
+        $this->consumers[$key] = $this->adoptConsumer($queue, self::CONSUMER_WORK);
 
         // Same advisory subscription provision() takes: a core subscription carries no
         // configuration, and a broker consuming a pre-provisioned queue still owes its
@@ -1428,7 +1398,7 @@ class Nats implements Synchronous, Consumer, Bounded
 
     /**
      * Subject namespace for a queue: a fixed root token plus the queue name as a single
-     * dot-free token, e.g. q.audits — the class tail (.normal/.priority/.dead) is appended
+     * dot-free token, e.g. q.audits — the class tail (.normal/.dead) is appended
      * by the callers below. subjectToken() collapses any dot in the name to '_' so the name
      * can never split into extra subject tokens, and ensure() rejects two names that
      * collapse to the same subject. Subscribe q.> to observe all queue traffic.
@@ -1441,11 +1411,6 @@ class Nats implements Synchronous, Consumer, Bounded
     private function workSubject(Queue $queue): string
     {
         return $this->subjectBase($queue) . '.' . self::SUBJECT_NORMAL;
-    }
-
-    private function prioritySubject(Queue $queue): string
-    {
-        return $this->subjectBase($queue) . '.' . self::SUBJECT_PRIORITY;
     }
 
     private function deadSubject(Queue $queue): string

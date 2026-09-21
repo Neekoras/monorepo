@@ -33,7 +33,7 @@ Redis Cluster requires a shared namespace hash tag before atomic multi-key opera
 
 ### NATS
 
-Keep JetStream responsible for pending deliveries, retry accounting, and recovery. Keep the current priority-first receive, blocking first normal message, and no-wait top-up. Incremental delivery inside the NATS client remains a possible later simplification; no public iterator API change is needed here.
+Keep JetStream responsible for pending deliveries, retry accounting, and recovery. Keep the blocking first message, and no-wait top-up. Incremental delivery inside the NATS client remains a possible later simplification; no public iterator API change is needed here.
 
 `Connection::requestBatch()` sends typed requests together using the same lifecycle as `request()`. `JetStream::ackBatch()` translates selected messages into individual acknowledgement requests and owns their confirmation semantics. Successful results are delivered before unrelated replies time out. Ambiguous writes are not replayed. The queue coalesces acknowledgements already waiting on its command connection, retaining per-message confirmation and error handling. If that connection disconnects, a broker configured with a connection factory drops its cached connection and handles under the lock. The next operation opens a new connection without replaying the failed operation or dropping other in-flight deliveries.
 
@@ -63,6 +63,8 @@ For stats-usage, validate buffered ClickHouse writes versus acknowledgement timi
 4. Test both Redis and NATS integrations in staging; current NATS-backed staging traffic cannot validate the Redis path.
 5. Open a stats-usage deployment canary with one coroutine, comparing batch 1, 8, 32, and 100 under comparable load. No production default changes before the correctness and efficiency gates pass.
 6. Expand only after queue progress, CPU efficiency, latency, and usage accounting checks pass.
+
+Queue 5 removes the `priority` argument from `publish`, `enqueueMany`, and `enqueue`, and removes priority ordering. Redis keeps the same list and existing payloads. NATS keeps `q.<name>.normal` and the `worker` durable, so existing normal messages remain consumable. Before upgrading a queue that used priority, stop priority producers and drain `worker_priority` with old workers, including pending and unacknowledged deliveries. New workers do not consume `q.<name>.priority`. An empty legacy consumer may remain; this change does not delete consumers or queued messages automatically. Do not run old priority producers alongside new workers.
 
 Before rollback, stop receiving, drain work, and recover expired reservation lists while a new consumer's maintenance path remains available. Verify the reservation registry is empty before retiring the last capable consumer. Old consumers can read the unchanged ready payloads but cannot recover new reservations. Reducing the batch to one alone is not a rollback procedure.
 

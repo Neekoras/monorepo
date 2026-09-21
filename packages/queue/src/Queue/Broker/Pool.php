@@ -16,12 +16,12 @@ readonly class Pool implements Synchronous, Consumer, Bounded
         private ?UtopiaPool $consumer = null,
     ) {}
 
-    public function publish(Queue $queue, array $payload, bool $priority = false): bool
+    public function publish(Queue $queue, array $payload): bool
     {
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
 
-    public function enqueueMany(Queue $queue, array $payloads, bool $priority = false): bool
+    public function enqueueMany(Queue $queue, array $payloads): bool
     {
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
