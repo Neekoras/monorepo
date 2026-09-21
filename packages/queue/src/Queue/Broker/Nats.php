@@ -869,7 +869,16 @@ class Nats implements Synchronous, Consumer, Bounded
         // the life of the worker, one per failed ack.
         try {
             $this->acknowledgements ??= new \Utopia\Queue\Buffer(fn(array $requests, ?callable $resolved): array
-                => $this->command(fn(): array => $this->commandsConnection()->requests($requests, 5.0, $resolved)));
+                => $this->command(function () use ($requests, $resolved): array {
+                    $results = [];
+                    $this->commandsConnection()->requests($requests, static function (int $index, \Utopia\NATS\Message|\Throwable $result) use (&$results, $resolved): void {
+                        $results[$index] = $result;
+                        if ($resolved !== null) {
+                            $resolved($index, $result);
+                        }
+                    }, 5.0);
+                    return $results;
+                }));
             $this->acknowledgements->request(['subject' => $jsMessage->message->replyTo, 'data' => '']);
         } finally {
             unset($this->inFlight[$pid]);
