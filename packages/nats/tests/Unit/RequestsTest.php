@@ -42,11 +42,10 @@ final class RequestsTest extends TestCase
         $this->assertInstanceOf(TimeoutException::class, $results[1]);
         $this->assertSame('3', $results[2]->data);
         $this->assertSame([2, 0, 1], $resolved, 'successful confirmations are delivered before the missing reply times out');
-        $property = new \ReflectionProperty($connection, 'pendingRequests');
-        $this->assertSame([], $property->getValue($connection));
+        $this->assertSame('1', $connection->requests([['subject' => 'work.1']])[0]->data);
         $connection->close();
     }
-    public function testAmbiguousWriteIsNotReplayedAndClearsPendingRequests(): void
+    public function testAmbiguousWriteIsNotReplayedAndDisconnects(): void
     {
         $fake = new FakeTransport();
         $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
@@ -62,7 +61,34 @@ final class RequestsTest extends TestCase
         $this->assertInstanceOf(\Utopia\NATS\Exception\ConnectionException::class, $results[0]);
         $this->assertInstanceOf(\Utopia\NATS\Exception\ConnectionException::class, $results[1]);
         $this->assertFalse($connection->isConnected());
-        $this->assertSame([], new \ReflectionProperty($connection, 'pendingRequests')->getValue($connection));
+        $connection->close();
+    }
+
+    public function testCallbackFailureDoesNotChangeOtherRequestOutcomes(): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
+        $fake->onWrite = static function (string $wire, FakeTransport $fake): void {
+            preg_match_all('/PUB work ([^ ]+) 0\r\n\r\n/', $wire, $matches, PREG_SET_ORDER);
+            foreach ($matches as $match) {
+                $fake->pushInbound("MSG {$match[1]} 1 2\r\nok\r\n");
+            }
+        };
+        $seen = [];
+        $failure = new \RuntimeException('Callback failed');
+        try {
+            $connection->requests([['subject' => 'work'], ['subject' => 'work']], 0.1, static function (int $index, $result) use (&$seen, $failure): void {
+                $seen[$index] = $result;
+                if ($index === 0) {
+                    throw $failure;
+                }
+            });
+            self::fail('Callback error must be surfaced');
+        } catch (\RuntimeException $error) {
+            $this->assertSame($failure, $error);
+        }
+        $this->assertSame(['ok', 'ok'], array_map(fn(\Throwable|\Utopia\NATS\Message $message) => $message->data, $seen));
+        $this->assertSame('ok', $connection->request('work')->data);
         $connection->close();
     }
 

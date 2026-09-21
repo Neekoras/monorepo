@@ -270,6 +270,7 @@ final class Connection
     /**
      * Pipeline independent requests. One reader correlates replies; ambiguous writes
      * are never replayed. Results retain their input indices after partial failure.
+     * A callback failure is rethrown after all outcomes are collected and cleaned up.
      * @param list<array{subject: string, data?: string}> $requests
      * @param (callable(int, Message|\Throwable): void)|null $resolved
      * @return list<Message|\Throwable>
@@ -277,6 +278,16 @@ final class Connection
     public function requests(array $requests, ?float $timeout = null, ?callable $resolved = null): array
     {
         $tokens = $results = [];
+        $callbackError = null;
+        $notify = static function (int $index, Message|\Throwable $result) use ($resolved, &$callbackError): void {
+            try {
+                if ($resolved !== null) {
+                    $resolved($index, $result);
+                }
+            } catch (\Throwable $error) {
+                $callbackError ??= $error;
+            }
+        };
         $timeout ??= $this->options->requestTimeout;
         $deadline = microtime(true) + $timeout;
         try {
@@ -307,16 +318,14 @@ final class Connection
                     if (isset($results[$index])) {
                         continue;
                     }
-                    if (!$this->pendingRequests[$token]['resolved']) {
+                    if (!($this->pendingRequests[$token]['resolved'] ?? false)) {
                         continue;
                     }
                     $message = $this->pendingRequests[$token]['message'];
                     $results[$index] = $message?->headers?->getStatus() === '503'
                         ? new NatsException('No responders for request')
                         : $message;
-                    if ($resolved !== null) {
-                        $resolved($index, $results[$index]);
-                    }
+                    $notify($index, $results[$index]);
                 }
                 if (\count($results) === \count($requests)) {
                     break;
@@ -334,21 +343,22 @@ final class Connection
                 }
             }
         } catch (\Throwable $error) {
-            if ($error instanceof ConnectionException) {
+            if ($error instanceof ConnectionException && !$error instanceof TimeoutException) {
                 $this->recycleDeadConnection(false);
             }
             foreach (array_keys($requests) as $index) {
                 if (!isset($results[$index])) {
                     $results[$index] = $error;
-                    if ($resolved !== null) {
-                        $resolved($index, $error);
-                    }
+                    $notify($index, $error);
                 }
             }
         } finally {
             foreach ($tokens as $token) {
                 unset($this->pendingRequests[$token]);
             }
+        }
+        if ($callbackError instanceof \Throwable) {
+            throw $callbackError;
         }
         ksort($results);
         return array_values($results);

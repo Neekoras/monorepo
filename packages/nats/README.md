@@ -359,13 +359,9 @@ $conn = Connection::connect(new ConnectionOptions(
 NATS_URL=nats://host:4222 ./vendor/bin/phpunit --testsuite integration
 ```
 
-## License
+## Concurrent requests
 
-Apache-2.0
-
-### Concurrent requests
-
-`Connection::requests()` sends independent requests in one write and correlates their replies. It returns a result at each input index: either a `Message` or a `Throwable`. Inspect every result; one missing reply does not discard successful replies. The optional `resolved` callback receives each result as it arrives, before unrelated requests time out.
+`Connection::requests()` sends independent requests in one write and correlates their replies. It returns a result at each input index: either a `Message` or a `Throwable`. Inspect every result; one missing reply does not discard successful replies. The optional `resolved` callback receives each result as it arrives, before unrelated requests time out. If the callback throws, remaining outcomes are still delivered and pending requests cleaned up before the first callback exception is thrown again.
 
 ```php
 $results = $connection->requests([
@@ -375,3 +371,7 @@ $results = $connection->requests([
 ```
 
 Use one owner for reading the connection. This differs from `requestMany()`, which sends one request and gathers several responses. Ambiguous writes are not replayed on reconnect. A queue can use this operation for individual confirmed acknowledgements without switching to cumulative `AckAll`.
+
+## License
+
+Apache-2.0
