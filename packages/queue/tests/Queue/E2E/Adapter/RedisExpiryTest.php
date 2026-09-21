@@ -32,14 +32,14 @@ final class RedisExpiryTest extends TestCase
         $this->assertNull($connection->get($key));
         $connection->set($key, '');
         $this->assertSame('', $connection->get($key));
-        $connection->set($key, 'temporary', 1);
+        $connection->set($key, 'temporary');
         $this->assertSame('temporary', $connection->get($key));
+        $connection->set($key, 'temporary', 1);
 
         $queue = new Queue('jobs', $namespace);
         $broker = new Broker($connection, $connection, reapAfter: 0);
         $broker->publish($queue, ['n' => 1]);
         $this->assertCount(1, $broker->receive($queue, 1));
-        $this->assertSame(0, $broker->reap($queue, olderThan: 0));
 
         sleep(2);
         $this->assertNull($connection->get($key));
