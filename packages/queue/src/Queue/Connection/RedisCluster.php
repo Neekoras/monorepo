@@ -166,7 +166,9 @@ class RedisCluster implements Connection
 
     public function get(string $key): array|string|null
     {
-        return $this->getRedis()->get($key);
+        $value = $this->getRedis()->get($key);
+
+        return $value === false ? null : $value;
     }
 
     public function listSize(string $key): int

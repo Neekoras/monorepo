@@ -173,7 +173,9 @@ class Redis implements Connection
 
     public function get(string $key): array|string|null
     {
-        return $this->call(fn(\Redis $redis): mixed => $redis->get($key), idempotent: true);
+        $value = $this->call(fn(\Redis $redis): mixed => $redis->get($key), idempotent: true);
+
+        return $value === false ? null : $value;
     }
 
     public function listSize(string $key): int

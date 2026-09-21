@@ -528,11 +528,16 @@ class Redis implements Synchronous, Consumer
         // Count from the tail: new claims arrive at the head. Share progress
         // across brokers because a different pod may win each maintenance lock.
         $cursorKey = "{$queue->namespace}.reap-cursor.{$queue->name}";
-        $offset = $scan === null ? 0 : (int) $this->commands->get($cursorKey);
-        if ($offset < 0 || $offset >= $size) {
+        $cursor = $scan === null ? [] : explode(':', (string) $this->commands->get($cursorKey));
+        $offset = (int) ($cursor[0] ?? 0);
+        $remaining = (int) ($cursor[1] ?? 0);
+        if ($offset < 0 || $offset >= $size || $remaining <= 0) {
             $offset = 0;
+            $remaining = $size;
         }
-        $length = $scan === null ? $size : min(max(1, $scan), $size - $offset);
+        // Finish the cycle's original window even if new claims keep arriving.
+        $remaining = min($remaining, $size - $offset);
+        $length = $scan === null ? $size : min(max(1, $scan), $remaining);
         $claims = $this->commands->listRange($processingList, $length, max(0, $size - $offset - $length));
 
         foreach (array_reverse($claims) as $pid) {
@@ -540,6 +545,7 @@ class Redis implements Synchronous, Consumer
                 break;
             }
 
+            $remaining--;
             if (!\is_string($pid)) {
                 $offset++;
                 continue;
@@ -549,7 +555,6 @@ class Redis implements Synchronous, Consumer
             $job = $this->getJob($queue, $pid);
             if ($job === false) {
                 $this->commands->listRemove($processingList, $pid);
-                $size--;
                 continue;
             }
 
@@ -570,19 +575,17 @@ class Redis implements Synchronous, Consumer
             if (($maxAttempts !== null && $job->getAttempts() >= $maxAttempts)
                 || ($newerThan !== null && $job->getTimestamp() < $now - $newerThan)) {
                 $this->commands->listRemove($processingList, $pid);
-                $size--;
                 $this->commands->leftPush("{$queue->namespace}.dead.{$queue->name}", $pid);
                 continue;
             }
 
             $this->requeue($queue, $job);
             $this->commands->listRemove($processingList, $pid);
-            $size--;
             $requeued++;
         }
 
         if ($scan !== null) {
-            $this->commands->set($cursorKey, (string) ($offset >= $size ? 0 : $offset));
+            $this->commands->set($cursorKey, "{$offset}:{$remaining}");
         }
 
         return $requeued;

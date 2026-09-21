@@ -366,4 +366,31 @@ final class RedisBrokerRecoveryTest extends TestCase
         $this->assertSame(2, $this->broker->reap($this->queue, olderThan: 0, scan: 2));
     }
 
+    public function testGrowingQueueDoesNotPreventRevisitingExpiredClaims(): void
+    {
+        foreach (range(1, 4) as $n) {
+            $this->broker->publish($this->queue, ['n' => $n]);
+        }
+        $this->broker->receive($this->queue, 0, 4);
+        $this->assertSame(0, $this->broker->reap($this->queue, olderThan: 0, scan: 2));
+        $this->connection->advanceToNextExpiry();
+
+        $recovered = [];
+        // Add faster than each sweep can scan; the cycle must still finish.
+        foreach (range(1, 3) as $round) {
+            foreach (range(1, 4) as $n) {
+                $this->broker->publish($this->queue, ['new' => $round * 4 + $n]);
+            }
+            $this->broker->receive($this->queue, 0, 4);
+            $broker = new Redis($this->connection, $this->connection);
+            $broker->reap($this->queue, olderThan: 0, scan: 2);
+            foreach ($broker->receive($this->queue, 0, 4) as $message) {
+                $recovered[] = $message->getPayload()['n'];
+                $broker->commit($this->queue, $message);
+            }
+        }
+        sort($recovered);
+        $this->assertSame([1, 2, 3, 4], $recovered);
+    }
+
 }
