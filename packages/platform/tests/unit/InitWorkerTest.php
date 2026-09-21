@@ -89,7 +89,14 @@ final class InitWorkerTest extends TestCase
 
 final class FakeConsumer implements Consumer
 {
-    public function receive(Queue $queue, int $timeout): ?Message
+    /** @return list<Message> */
+    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    {
+        return [];
+    }
+
+    // Keep the fake compatible with released queue versions in registry tests.
+    public function receive(Queue $queue, int $timeout): null
     {
         return null;
     }
