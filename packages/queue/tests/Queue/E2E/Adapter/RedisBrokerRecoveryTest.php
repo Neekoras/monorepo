@@ -85,17 +85,13 @@ final class RedisBrokerRecoveryTest extends TestCase
         $this->assertSame(1, $this->processingSize());
     }
 
-    public function testReapDropsClaimsWhosePayloadExpired(): void
+    public function testReapDropsLegacyClaimsWhosePayloadExpired(): void
     {
-        $this->broker->publish($this->queue, ['n' => 1]);
-        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
-        $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
-        $this->connection->remove('tests.jobs.recovery.' . $claimed->getPid());
-
+        // Pre-ownership-record deliveries could expire while processing.
+        $this->connection->leftPush('tests.processing.recovery', 'expired-legacy-pid');
         $requeued = $this->broker->reap($this->queue, olderThan: 0);
-
         $this->assertSame(0, $requeued);
-        $this->assertSame(0, $this->processingSize(), 'the unrecoverable claim is pruned');
+        $this->assertSame(0, $this->processingSize(), 'the unrecoverable legacy claim is pruned');
         $this->assertSame(0, $this->broker->getQueueSize($this->queue));
     }
 
@@ -226,9 +222,9 @@ final class RedisBrokerRecoveryTest extends TestCase
         $this->assertSame(0, $this->broker->getQueueSize($this->queue), 'no duplicate is enqueued');
     }
 
-    public function testExtendDoesNotReviveAnExpiredOwner(): void
+    public function testExtendRenewsHeartbeatWhileStillOwned(): void
     {
-        // Once ownership expires a late worker must not revive its old delivery.
+        // Heartbeat expiry permits recovery, but ownership lasts until actual takeover.
         $this->broker->publish($this->queue, ['n' => 1]);
         $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
@@ -237,7 +233,8 @@ final class RedisBrokerRecoveryTest extends TestCase
 
         $this->broker->extend($this->queue, $claimed);
 
-        $this->assertSame(1, $this->broker->reap($this->queue, olderThan: 0));
+        $this->assertSame(0, $this->broker->reap($this->queue, olderThan: 0));
+        $this->broker->commit($this->queue, $claimed);
         $this->assertSame(0, $this->processingSize());
     }
 

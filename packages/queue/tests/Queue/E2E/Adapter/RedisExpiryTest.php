@@ -69,7 +69,7 @@ trait ShortExpiry
     public function execute(string $script, array $keys, array $args): mixed
     {
         if (str_starts_with($script, '-- KEYS: reservations, reservation,')) {
-            $args[1] = 1;
+            $args[0] = 1;
         }
         return parent::execute($script, $keys, $args);
     }

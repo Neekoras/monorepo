@@ -16,7 +16,7 @@ class Redis implements Synchronous, Consumer
     private const int RECONNECT_BACKOFF_MS = 100;
     private const int RECONNECT_MAX_BACKOFF_MS = 5_000;
 
-    /** Claim lifetime; handlers refresh it every third of this interval. */
+    /** Heartbeat lifetime; handlers refresh it every third of this interval. */
     private const int CLAIM_TTL = 90;
 
     /** Lock expiry schedules the next fleet sweep; never release it early. */
@@ -26,7 +26,8 @@ class Redis implements Synchronous, Consumer
     private const int REAP_LIMIT = 1_000;
 
     private bool $closed = false;
-    private ?\Utopia\Queue\Buffer $settlements = null;
+    /** @var array<string, \Utopia\Queue\Buffer> */
+    private array $settlements = [];
 
     /**
      * Queues attempted by this broker, keyed by namespace/name pairs.
@@ -166,10 +167,11 @@ class Redis implements Synchronous, Consumer
             $pid = $message->getPid();
             $keys[] = "{$queue->namespace}.jobs.{$queue->name}.{$pid}";
             $keys[] = "{$queue->namespace}.claims.{$queue->name}.{$pid}";
+            $keys[] = "{$queue->namespace}.owners.{$queue->name}.{$pid}";
             $args[] = $raw;
             $args[] = $pid;
         }
-        $this->script($this->receive, 'claim', $keys, [$queue->jobTtl, self::CLAIM_TTL, $token, \count($messages), ...$args, ...$poison]);
+        $this->script($this->receive, 'claim', $keys, [self::CLAIM_TTL, $token, \count($messages), ...$args, ...$poison]);
         return $messages;
     }
 
@@ -188,7 +190,7 @@ class Redis implements Synchronous, Consumer
         $pid = $message->getPid();
         $outcome = $success ? 'success' : 'failed';
         $list = $success === null ? 'queue' : ($message->isTerminal() ? 'dead' : 'failed');
-        $this->settlements ??= new \Utopia\Queue\Buffer(function (array $requests, ?callable $resolved): array {
+        $this->settlements[$queue->namespace] ??= new \Utopia\Queue\Buffer(function (array $requests, ?callable $resolved): array {
             $keys = $args = [];
             foreach ($requests as [$requestKeys, $requestArgs]) {
                 array_push($keys, ...$requestKeys);
@@ -196,14 +198,15 @@ class Redis implements Synchronous, Consumer
             }
             return array_map(static fn($result): mixed => $result === false ? new \RedisException('Queue settlement failed') : $result, $this->script($this->commands, 'settle', $keys, $args));
         });
-        $result = $this->settlements->request([[
+        $result = $this->settlements[$queue->namespace]->request([[
             "{$queue->namespace}.claims.{$queue->name}.{$pid}",
             "{$queue->namespace}.jobs.{$queue->name}.{$pid}",
             "{$queue->namespace}.processing.{$queue->name}",
             "{$queue->namespace}.stats.{$queue->name}.processing",
             "{$queue->namespace}.stats.{$queue->name}.{$outcome}",
             "{$queue->namespace}.{$list}.{$queue->name}",
-        ], [$message->getReceipt() ?? '', $pid, $success === null ? 2 : ($success ? 1 : 0)]]);
+            "{$queue->namespace}.owners.{$queue->name}.{$pid}",
+        ], [$message->getReceipt() ?? '', $pid, $success === null ? 2 : ($success ? 1 : 0), $queue->jobTtl]]);
         if ($result !== 1) {
             throw new \RuntimeException('Queue delivery is no longer owned by this consumer');
         }
@@ -225,9 +228,10 @@ class Redis implements Synchronous, Consumer
         $keys = $tokens = [];
         foreach ($messages as $message) {
             $keys[] = "{$queue->namespace}.claims.{$queue->name}.{$message->getPid()}";
+            $keys[] = "{$queue->namespace}.owners.{$queue->name}.{$message->getPid()}";
             $tokens[] = $message->getReceipt() ?? '';
         }
-        foreach (array_chunk($keys, self::REAP_LIMIT) as $index => $chunk) {
+        foreach (array_chunk($keys, self::REAP_LIMIT * 2) as $index => $chunk) {
             $this->script($this->commands, 'extend', $chunk, [self::CLAIM_TTL, ...\array_slice($tokens, $index * self::REAP_LIMIT, self::REAP_LIMIT)]);
         }
     }
@@ -441,9 +445,14 @@ class Redis implements Synchronous, Consumer
                 continue;
             }
 
-            // The payload expired: the claim is unrecoverable, drop it.
+            $ownerKey = "{$queue->namespace}.owners.{$queue->name}.{$pid}";
+            $owner = $this->commands->get($ownerKey);
+            // Only legacy payloads expire while processing.
             $job = $this->getJob($queue, $pid);
             if ($job === false) {
+                if (\is_string($owner)) {
+                    throw new \RuntimeException('Queue delivery payload is missing');
+                }
                 $this->commands->listRemove($processing, $pid);
                 continue;
             }
@@ -454,16 +463,19 @@ class Redis implements Synchronous, Consumer
                 continue;
             }
 
-            if (($maxAttempts !== null && $job->getAttempts() >= $maxAttempts)
-                || ($newerThan !== null && $job->getTimestamp() < $now - $newerThan)) {
-                $this->commands->listRemove($processing, $pid);
-                $this->commands->leftPush("{$queue->namespace}.dead.{$queue->name}", $pid);
-                continue;
+            $dead = ($maxAttempts !== null && $job->getAttempts() >= $maxAttempts)
+                || ($newerThan !== null && $job->getTimestamp() < $now - $newerThan);
+            $moved = $this->script($this->commands, 'reclaim', [
+                $ownerKey, "{$queue->namespace}.claims.{$queue->name}.{$pid}",
+                "{$queue->namespace}.jobs.{$queue->name}.{$pid}", $processing,
+                "{$queue->namespace}.stats.{$queue->name}.processing",
+                "{$queue->namespace}." . ($dead ? 'dead' : 'queue') . ".{$queue->name}",
+            ], [\is_string($owner) ? $owner : '', $pid, $dead ? '' : $this->retryPayload($queue, $job), $queue->jobTtl]);
+            if ($moved && !$dead) {
+                $requeued++;
+            } elseif (!$moved) {
+                $retained++;
             }
-
-            $this->requeue($queue, $job);
-            $this->commands->listRemove($processing, $pid);
-            $requeued++;
         }
 
         if ($scan !== null) {
@@ -479,6 +491,11 @@ class Redis implements Synchronous, Consumer
      */
     private function requeue(Queue $queue, Message $job): void
     {
+        $this->commands->leftPush("{$queue->namespace}.queue.{$queue->name}", $this->retryPayload($queue, $job));
+    }
+
+    private function retryPayload(Queue $queue, Message $job): string
+    {
         $payload = [
             'pid' => uniqid(more_entropy: true),
             'queue' => $queue->name,
@@ -486,7 +503,7 @@ class Redis implements Synchronous, Consumer
             'payload' => $job->getPayload(),
             'attempts' => $job->getAttempts() + 1,
         ];
-        $this->commands->leftPush("{$queue->namespace}.queue.{$queue->name}", $this->codec->encode($payload));
+        return $this->codec->encode($payload);
     }
 
     private function getJob(Queue $queue, string $pid): Message|false

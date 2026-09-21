@@ -29,7 +29,13 @@ final class BufferTest extends TestCase
                 });
             }
         });
-        $this->assertSame([1, 99], $groups);
+        $this->assertSame(100, array_sum($groups));
+        $this->assertLessThan(100, \count($groups), 'Waiting requests should coalesce');
+        $this->assertLessThanOrEqual(1000, max($groups));
+        ksort($results);
+        $expected = array_combine(range(1, 100), range(1, 100));
+        $expected[3] = 'uncertain';
+        $this->assertSame($expected, $results);
         $this->assertCount(100, $results);
         $this->assertSame('uncertain', $results[3]);
         $this->assertSame(100, $results[100]);

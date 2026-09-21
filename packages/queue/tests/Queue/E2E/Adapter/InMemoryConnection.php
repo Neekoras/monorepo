@@ -20,8 +20,8 @@ class InMemoryConnection implements Connection
         $operations = [['script' => $script, 'keys' => $keys, 'args' => $args]];
         if (str_starts_with($script, 'local function settle')) {
             $operations = [];
-            foreach (array_chunk($keys, 6) as $index => $chunk) {
-                $operations[] = ['script' => '-- KEYS: claim,', 'keys' => $chunk, 'args' => \array_slice($args, $index * 3, 3)];
+            foreach (array_chunk($keys, 7) as $index => $chunk) {
+                $operations[] = ['script' => '-- KEYS: claim,', 'keys' => $chunk, 'args' => \array_slice($args, $index * 4, 4)];
             }
         }
         $grouped = str_starts_with($script, 'local function settle');
@@ -39,24 +39,26 @@ class InMemoryConnection implements Connection
                 }
                 $results[] = $batch;
             } elseif (str_starts_with($script, '-- KEYS: reservations, reservation,')) {
-                for ($i = 0; $i < $args[3]; $i++) {
-                    $this->set($keys[6 + 2 * $i], $args[4 + 2 * $i], $args[0]);
-                    $this->set($keys[7 + 2 * $i], $args[2], $args[1]);
-                    $this->leftPush($keys[2], $args[5 + 2 * $i]);
+                for ($i = 0; $i < $args[2]; $i++) {
+                    $this->set($keys[6 + 3 * $i], $args[3 + 2 * $i]);
+                    $this->set($keys[7 + 3 * $i], $args[1], $args[0]);
+                    $this->set($keys[8 + 3 * $i], $args[1]);
+                    $this->leftPush($keys[2], $args[4 + 2 * $i]);
                 }
-                foreach (\array_slice($args, 4 + 2 * $args[3]) as $raw) {
+                foreach (\array_slice($args, 3 + 2 * $args[2]) as $raw) {
                     $this->leftPush($keys[5], $raw);
                 }
-                $this->incrementBy($keys[3], $args[3]);
-                $this->incrementBy($keys[4], $args[3]);
+                $this->incrementBy($keys[3], $args[2]);
+                $this->incrementBy($keys[4], $args[2]);
                 unset($this->lists[$keys[1]], $this->reservations[$keys[0]][$keys[1]]);
-                $results[] = $args[3];
+                $results[] = $args[2];
             } elseif (str_starts_with($script, '-- KEYS: claim,')) {
-                if ($this->get($keys[0]) !== $args[0] || !$this->listRemove($keys[2], $args[1])) {
+                if ($this->get($keys[6]) !== $args[0] || !$this->listRemove($keys[2], $args[1])) {
                     $results[] = 0;
                     continue;
                 }
                 $this->remove($keys[0]);
+                $this->remove($keys[6]);
                 if ($args[2] === 2) {
                     $raw = $this->get($keys[1]);
                     if (\is_string($raw)) {
@@ -66,6 +68,9 @@ class InMemoryConnection implements Connection
                     $this->remove($keys[1]);
                 } else {
                     $this->leftPush($keys[5], $args[1]);
+                    if ($args[3] > 0) {
+                        $this->set($keys[1], $this->get($keys[1]), $args[3]);
+                    }
                 }
                 $this->decrement($keys[3]);
                 if ($args[2] !== 2) {
@@ -73,10 +78,25 @@ class InMemoryConnection implements Connection
                 }
                 $results[] = 1;
             } elseif (str_starts_with($script, '-- Claim keys')) {
-                foreach ($keys as $i => $key) {
-                    if ($this->get($key) === $args[$i + 1]) {
-                        $this->set($key, $args[$i + 1], $args[0]);
+                foreach (array_chunk($keys, 2) as $i => [$claim, $owner]) {
+                    if ($this->get($owner) === $args[$i + 1]) {
+                        $this->set($claim, $args[$i + 1], $args[0]);
                     }
+                }
+                $results[] = 1;
+            } elseif (str_starts_with($script, '-- KEYS: owner,')) {
+                if (($this->get($keys[0]) ?? '') !== $args[0] || $this->get($keys[1]) !== null
+                    || $this->get($keys[2]) === null || !$this->listRemove($keys[3], $args[1])) {
+                    $results[] = 0;
+                    continue;
+                }
+                $this->remove($keys[0]);
+                $this->decrement($keys[4]);
+                $this->leftPush($keys[5], $args[2] === '' ? $args[1] : $args[2]);
+                if ($args[2] !== '') {
+                    $this->remove($keys[2]);
+                } elseif ($args[3] > 0) {
+                    $this->set($keys[2], $this->get($keys[2]), $args[3]);
                 }
                 $results[] = 1;
             } elseif (str_starts_with($script, '-- Discover candidates')) {

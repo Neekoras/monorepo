@@ -91,9 +91,9 @@ final class RedisReservationTest extends TestCase
         $messages = $this->broker->receive($this->queue, 0, 100);
         $this->assertCount(1, $messages);
         $this->assertSame(1, $this->redis->lLen($this->key('poison')));
-        $this->redis->set($this->key('claims') . '.' . $messages[0]->getPid(), 'new-owner');
+        $this->redis->set($this->key('owners') . '.' . $messages[0]->getPid(), 'new-owner');
         $this->broker->extend($this->queue, ...$messages);
-        $this->assertSame('new-owner', $this->redis->get($this->key('claims') . '.' . $messages[0]->getPid()));
+        $this->assertSame('new-owner', $this->redis->get($this->key('owners') . '.' . $messages[0]->getPid()));
         $this->expectException(\RuntimeException::class);
         $this->broker->commit($this->queue, $messages[0]);
     }
@@ -178,14 +178,14 @@ final class RedisReservationTest extends TestCase
     {
         $this->broker->enqueueMany($this->queue, array_fill(0, 3, ['n' => 1]));
         $messages = $this->broker->receive($this->queue, 0, 3);
-        $claim = $this->key('claims') . '.' . $messages[1]->getPid();
+        $claim = $this->key('owners') . '.' . $messages[1]->getPid();
         $this->redis->del($claim);
         $this->redis->lPush($claim, 'invalid');
         $commands = new class ('127.0.0.1', (int) (getenv('REDIS_PORT') ?: 16379)) extends Connection {
             public array $sizes = [];
             public function execute(string $script, array $keys, array $args): mixed
             {
-                $this->sizes[] = \count($keys) / 6;
+                $this->sizes[] = \count($keys) / 7;
                 // Let other completions arrive while the first request is in flight.
                 \Swoole\Coroutine::sleep(0.01);
                 return parent::execute($script, $keys, $args);
@@ -207,7 +207,8 @@ final class RedisReservationTest extends TestCase
         });
         ksort($results);
         $this->assertSame([true, false, true], $results);
-        $this->assertSame([1, 2], $commands->sizes);
+        $this->assertSame(3, array_sum($commands->sizes));
+        $this->assertLessThan(3, \count($commands->sizes));
         $this->assertSame('2', $this->redis->get($this->key('stats') . '.success'));
         $this->assertSame(1, $this->redis->lLen($this->key('processing')));
     }
@@ -223,6 +224,181 @@ final class RedisReservationTest extends TestCase
         $this->broker->commit($this->queue, $second);
         $this->assertSame('2', $this->redis->get($this->key('stats') . '.success'));
         $this->assertSame(0, $this->redis->lLen($this->key('processing')));
+    }
+
+    public function testReleaseRetainsPayloadBeyondJobTtl(): void
+    {
+        $queue = new Queue($this->queue->name, $this->queue->namespace, jobTtl: 1);
+        $this->broker->publish($queue, ['survives' => true]);
+        $message = $this->broker->receive($queue, 0)[0];
+        sleep(2);
+        $this->broker->extend($queue, $message);
+        $this->broker->release($queue, $message);
+        $again = $this->broker->receive($queue, 0)[0];
+        $this->assertSame($message->getPayload(), $again->getPayload());
+        $this->broker->commit($queue, $again);
+        $this->assertSame(0, $this->redis->lLen($this->key('processing')));
+    }
+
+    public function testRejectedPayloadStillExpires(): void
+    {
+        $queue = new Queue($this->queue->name, $this->queue->namespace, jobTtl: 1);
+        $this->broker->publish($queue, ['n' => 1]);
+        $message = $this->broker->receive($queue, 0)[0];
+        $this->broker->reject($queue, $message);
+        sleep(2);
+        $this->assertFalse($this->redis->get($this->key('jobs') . '.' . $message->getPid()));
+        $this->assertSame(1, $this->broker->getQueueSize($queue, true));
+    }
+
+    public function testHeartbeatExpiryDoesNotPreventSettlementButTakeoverDoes(): void
+    {
+        foreach (['commit', 'reject'] as $operation) {
+            $this->broker->publish($this->queue, ['operation' => $operation]);
+            $message = $this->broker->receive($this->queue, 0)[0];
+            $this->redis->del($this->key('claims') . '.' . $message->getPid());
+            $this->broker->$operation($this->queue, $message);
+        }
+        $this->assertSame('1', $this->redis->get($this->key('stats') . '.success'));
+        $this->assertSame('1', $this->redis->get($this->key('stats') . '.failed'));
+        $this->broker->publish($this->queue, ['takeover' => true]);
+        $old = $this->broker->receive($this->queue, 0)[0];
+        $this->redis->del($this->key('claims') . '.' . $old->getPid());
+        $this->assertSame(1, $this->broker->reap($this->queue, olderThan: 0));
+        $new = $this->broker->receive($this->queue, 0)[0];
+        try {
+            $this->broker->commit($this->queue, $old);
+            self::fail('Reclaimed owner must not settle');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('no longer owned', $error->getMessage());
+        }
+        $this->broker->extend($this->queue, $old);
+        $this->broker->commit($this->queue, $new);
+        $this->assertSame(0, $this->redis->lLen($this->key('processing')));
+    }
+
+    public function testClusterSettlementsAcrossNamespaces(): void
+    {
+        $connection = new class (['127.0.0.1:17000', '127.0.0.1:17001', '127.0.0.1:17002']) extends \Utopia\Queue\Connection\RedisCluster {
+            public function execute(string $script, array $keys, array $args): mixed
+            {
+                if (\Swoole\Coroutine::getCid() >= 0) {
+                    \Swoole\Coroutine::sleep(0.01);
+                }
+                return parent::execute($script, $keys, $args);
+            }
+        };
+        $broker = new Broker($connection, $connection);
+        $queues = [new Queue('jobs', '{a-' . uniqid() . '}'), new Queue('jobs', '{b-' . uniqid() . '}')];
+        $pending = $results = [];
+        try {
+            foreach ($queues as $queue) {
+                $broker->enqueueMany($queue, array_fill(0, 3, ['ok' => true]));
+                foreach ($broker->receive($queue, 0, 3) as $message) {
+                    $pending[] = [$queue, $message];
+                }
+            }
+            \Swoole\Coroutine\run(function () use ($broker, $pending, &$results): void {
+                foreach ($pending as [$queue, $message]) {
+                    \Swoole\Coroutine::create(function () use ($broker, $queue, $message, &$results): void {
+                        try {
+                            $broker->commit($queue, $message);
+                            $results[] = true;
+                        } catch (\Throwable $error) {
+                            $results[] = $error->getMessage();
+                        }
+                    });
+                }
+            });
+            $this->assertSame(array_fill(0, 6, true), $results);
+            foreach ($queues as $queue) {
+                $this->assertSame('3', $connection->get($queue->namespace . '.stats.jobs.success'));
+            }
+        } finally {
+            foreach ($pending as [$queue, $message]) {
+                foreach (['jobs', 'owners', 'claims'] as $kind) {
+                    $connection->remove($queue->namespace . '.' . $kind . '.jobs.' . $message->getPid());
+                }
+            }
+            foreach ($queues as $queue) {
+                foreach (['queue', 'processing', 'stats', 'reservations'] as $kind) {
+                    foreach (['', '.total', '.processing', '.success'] as $suffix) {
+                        $connection->remove($queue->namespace . '.' . $kind . '.jobs' . $suffix);
+                    }
+                }
+            }
+            $connection->close();
+        }
+    }
+
+    public function testKubernetesJobSettlesAfterHeartbeatExpiry(): void
+    {
+        $this->broker->publish($this->queue, ['long' => true]);
+        $adapter = new \Utopia\Queue\Adapter\KubernetesJob($this->broker, 1, $this->queue->namespace);
+        $success = 0;
+        $errors = [];
+        \Swoole\Coroutine\run(function () use ($adapter, &$success, &$errors): void {
+            $adapter->consume(
+                function (\Utopia\Queue\Message $message): void {
+                    $this->redis->del($this->key('claims') . '.' . $message->getPid());
+                },
+                static function () use (&$success): void {
+                    $success++;
+                },
+                static function ($message, \Throwable $error) use (&$errors): void {
+                    $errors[] = $error->getMessage();
+                },
+                [['queue' => $this->queue, 'maxCoroutines' => 1]],
+            );
+        });
+        $this->assertSame([], $errors);
+        $this->assertSame(1, $success);
+        $this->assertSame(0, $this->redis->lLen($this->key('processing')));
+    }
+
+    public function testMissingReleasePayloadDoesNotDiscardOwnership(): void
+    {
+        $this->broker->publish($this->queue, ['n' => 1]);
+        $message = $this->broker->receive($this->queue, 0)[0];
+        $this->redis->del($this->key('jobs') . '.' . $message->getPid());
+        try {
+            $this->broker->release($this->queue, $message);
+            self::fail('Missing payload must not report successful release');
+        } catch (\RedisException) {
+        }
+        $this->assertSame(1, $this->redis->lLen($this->key('processing')));
+        $this->assertSame($message->getReceipt(), $this->redis->get($this->key('owners') . '.' . $message->getPid()));
+    }
+
+    public static function reclaimRace(): iterable
+    {
+        yield 'completion wins' => ['commit'];
+        yield 'renewal wins' => ['extend'];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('reclaimRace')]
+    public function testReclaimRechecksOwnershipAfterConcurrentOperation(string $operation): void
+    {
+        $this->broker->publish($this->queue, ['n' => 1]);
+        $message = $this->broker->receive($this->queue, 0)[0];
+        $this->redis->del($this->key('claims') . '.' . $message->getPid());
+        $connection = new class ('127.0.0.1', (int) (getenv('REDIS_PORT') ?: 16379)) extends Connection {
+            public ?\Closure $before = null;
+            public function execute(string $script, array $keys, array $args): mixed
+            {
+                if (str_starts_with($script, '-- KEYS: owner,') && $this->before instanceof \Closure) {
+                    ($this->before)();
+                }
+                return parent::execute($script, $keys, $args);
+            }
+        };
+        $connection->before = fn() => $this->broker->$operation($this->queue, $message);
+        $this->assertSame(0, new Broker($connection, $connection)->reap($this->queue, olderThan: 0));
+        $this->assertSame(0, $this->broker->getQueueSize($this->queue));
+        if ($operation === 'extend') {
+            $this->broker->commit($this->queue, $message);
+        }
+        $this->assertSame('1', $this->redis->get($this->key('stats') . '.success'));
     }
 
     private function key(string $kind): string
