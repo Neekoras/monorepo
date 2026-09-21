@@ -17,6 +17,7 @@ use Utopia\NATS\Exception\NatsException;
 use Utopia\NATS\Exception\PermissionException;
 use Utopia\NATS\Exception\ProtocolException;
 use Utopia\NATS\Exception\TimeoutException;
+use Utopia\NATS\Internal\CallbackException;
 use Utopia\NATS\Protocol\Parser;
 use Utopia\NATS\Protocol\ServerOp;
 use Utopia\NATS\Protocol\Writer;
@@ -98,8 +99,7 @@ final class Connection
     // Mux inbox for request-reply
     private ?Subscription $inboxSub = null;
     private string $inboxPrefix = '';
-    /** @var array<string, array{message: ?Message, resolved: bool}> */
-    private array $pendingRequests = [];
+    private bool $collecting = false;
 
     // Reconnection
     /** @var list<string> */
@@ -142,6 +142,11 @@ final class Connection
     {
         $this->ensureConnected();
 
+        $this->send($this->encode($subject, $data, $replyTo, $headers));
+    }
+
+    private function encode(string $subject, string $data, ?string $replyTo, ?Headers $headers): string
+    {
         $hasHeaders = $headers instanceof \Utopia\NATS\Headers && $headers->all() !== [];
 
         if ($hasHeaders && isset($this->serverInfo) && !$this->serverInfo->headersSupported) {
@@ -157,13 +162,10 @@ final class Connection
             );
         }
 
-        if ($hasHeaders) {
-            $cmd = $this->writer->hpub($subject, $headerWire, $data, $replyTo);
-        } else {
-            $cmd = $this->writer->pub($subject, $data, $replyTo);
-        }
+        return $hasHeaders
+            ? $this->writer->hpub($subject, $headerWire, $data, $replyTo)
+            : $this->writer->pub($subject, $data, $replyTo);
 
-        $this->send($cmd);
     }
 
     public function subscribe(string $subject, ?\Closure $callback = null, ?string $queue = null): Subscription
@@ -171,14 +173,15 @@ final class Connection
         $this->ensureConnected();
 
         $sid = (string) $this->nextSid++;
+        $slow = $this->options->onSlowConsumer;
         $sub = new Subscription(
             $sid,
             $subject,
             $queue,
-            $callback,
+            $callback instanceof \Closure ? fn(Message $message) => $this->notify($callback, $message) : null,
             $this->options->subPendingMsgsLimit,
             $this->options->subPendingBytesLimit,
-            $this->options->onSlowConsumer,
+            $slow instanceof \Closure ? fn(Subscription $subscription) => $this->notify($slow, $subscription) : null,
         );
         $sub->setConnection($this);
 
@@ -207,64 +210,119 @@ final class Connection
 
     public function request(string $subject, string $data = '', ?float $timeout = null, ?Headers $headers = null): Message
     {
-        try {
-            return $this->requestOnce($subject, $data, $timeout, $headers);
-        } catch (ProtocolException $error) {
-            // Only a stale connection: the server closed it for missed PINGs
-            // before this PUB was written, so nothing was accepted, and
-            // handleError() has already reconnected. Other closing errors may
-            // arrive after the server processed the request, so they surface.
-            if (!str_contains(strtolower($error->getMessage()), 'stale connection') || $this->status !== self::STATUS_CONNECTED) {
-                throw $error;
+        $request = new Request($subject, $data, $headers);
+        for ($attempt = 0; ; $attempt++) {
+            $result = null;
+            $this->requestBatch([$request], static function (int $index, Message|\Throwable $response) use (&$result): void {
+                $result = $response;
+            }, $timeout);
+            // Only the single-request API retries a server's explicit stale rejection.
+            // Ambiguous writes and other errors are never replayed.
+            if ($attempt === 0 && $result instanceof ProtocolException
+                && str_contains(strtolower($result->getMessage()), 'stale connection')
+                && $this->options->allowReconnect && $this->status === self::STATUS_DISCONNECTED) {
+                $this->attemptReconnect();
+                continue;
             }
-
-            return $this->requestOnce($subject, $data, $timeout, $headers);
+            if ($result instanceof \Throwable) {
+                throw $result;
+            }
+            return $result ?? throw new \LogicException('Request completed without an outcome');
         }
     }
 
-    private function requestOnce(string $subject, string $data, ?float $timeout, ?Headers $headers): Message
+    /**
+     * Send independent requests together. Deliver indexed outcomes as replies arrive.
+     * One response deadline starts after writing; ambiguous writes are never replayed.
+     * Callback exceptions abort collection, not already-sent remote work.
+     *
+     * @param list<Request> $requests
+     * @param \Closure(int, Message|\Throwable): void $reply
+     */
+    public function requestBatch(array $requests, \Closure $reply, ?float $timeout = null): void
     {
-        $this->ensureConnected();
-
+        $this->assertReadable();
         $timeout ??= $this->options->requestTimeout;
-        $this->ensureInboxSub();
-
-        $token = Inbox::generateId();
-        $replyTo = $this->inboxPrefix . '.' . $token;
-        $this->pendingRequests[$token] = ['message' => null, 'resolved' => false];
-
-        $this->publish($subject, $data, $replyTo, $headers);
-
-        $deadline = microtime(true) + $timeout;
-
-        while (!$this->pendingRequests[$token]['resolved']) {
-            $remaining = $deadline - microtime(true);
-            if ($remaining <= 0) {
-                unset($this->pendingRequests[$token]);
-                throw new TimeoutException("Request timed out after {$timeout}s");
+        if (!is_finite($timeout) || $timeout <= 0 || !array_is_list($requests)) {
+            throw new \InvalidArgumentException('Requests must be a list with a finite positive timeout');
+        }
+        foreach ($requests as $request) {
+            if (!$request instanceof Request) {
+                throw new \InvalidArgumentException('Expected Request objects');
             }
-
+        }
+        if ($requests === []) {
+            return;
+        }
+        $pending = [];
+        $publishing = $written = false;
+        $this->collecting = true;
+        try {
             try {
-                $this->processMessage($remaining);
-            } catch (\Throwable $error) {
-                unset($this->pendingRequests[$token]);
-                throw $error;
+                $this->ensureConnected();
+                $this->ensureInboxSub();
+                $wire = '';
+                foreach ($requests as $index => $request) {
+                    $token = Inbox::generateId();
+                    $pending[$token] = $index;
+                    $wire .= $this->encode($request->subject, $request->data, $this->inboxPrefix . '.' . $token, $request->headers);
+                }
+                $publishing = true;
+                $this->transport->write($wire);
+                $written = true;
+                $deadline = hrtime(true) / 1e9 + $timeout;
+                while ($pending !== []) {
+                    $remaining = $deadline - hrtime(true) / 1e9;
+                    if ($remaining <= 0) {
+                        throw new TimeoutException("Requests timed out after {$timeout}s");
+                    }
+                    $this->checkPings();
+                    $message = $this->readMessage($remaining, reconnect: false);
+                    $token = $message instanceof Message ? $this->extractInboxToken($message->subject) : null;
+                    if ($token !== null && isset($pending[$token])) {
+                        $index = $pending[$token];
+                        unset($pending[$token]);
+                        $response = $message->headers?->getStatus() === '503'
+                            ? new NatsException('No responders for request') : $message;
+                        $this->notify($reply, $index, $response);
+                    }
+                }
+            } catch (NatsException $error) {
+                if ($written && $error instanceof TimeoutException) {
+                    $error = new TimeoutException("Request timed out after {$timeout}s", previous: $error);
+                }
+                if ($error instanceof ConnectionException && (!$written || !$error instanceof TimeoutException)) {
+                    $this->recycleDeadConnection(false);
+                }
+                if (!$publishing) {
+                    throw $error;
+                }
+                foreach ($pending as $index) {
+                    $this->notify($reply, $index, $error);
+                }
             }
+        } catch (CallbackException $error) {
+            throw $error->cause;
+        } finally {
+            $this->collecting = false;
         }
+    }
 
-        $msg = $this->pendingRequests[$token]['message'];
-        unset($this->pendingRequests[$token]);
-
-        if ($msg === null) {
-            throw new TimeoutException("Request timed out after {$timeout}s");
+    private function assertReadable(): void
+    {
+        if ($this->collecting) {
+            throw new \LogicException('Cannot read the connection while collecting requests');
         }
+    }
 
-        // Check for no responders (status 503)
-        if ($msg->headers !== null && $msg->headers->getStatus() === '503') {
-            throw new NatsException('No responders for request');
+    /** Preserve exception provenance across protocol dispatch and application callbacks. */
+    private function notify(\Closure $callback, mixed ...$arguments): void
+    {
+        try {
+            $callback(...$arguments);
+        } catch (\Throwable $error) {
+            throw $this->collecting && !$error instanceof CallbackException ? new CallbackException($error) : $error;
         }
-
-        return $msg;
     }
 
     /**
@@ -280,6 +338,7 @@ final class Connection
      */
     public function requestMany(string $subject, string $data = '', array $opts = []): array
     {
+        $this->assertReadable();
         $this->ensureConnected();
 
         $max = $opts['max'] ?? null;
@@ -344,6 +403,7 @@ final class Connection
      */
     public function tick(): void
     {
+        $this->assertReadable();
         $this->checkPings();
         $this->collectPongs();
     }
@@ -375,6 +435,7 @@ final class Connection
      */
     public function processMessage(?float $timeout = null): ?Message
     {
+        $this->assertReadable();
         $this->checkPings();
 
         return $this->readMessage($timeout);
@@ -384,14 +445,17 @@ final class Connection
      * The read half of {@see self::processMessage()}, without the keepalive
      * check, so maintenance can drain the socket without writing to it.
      */
-    private function readMessage(?float $timeout = null): ?Message
+    private function readMessage(?float $timeout = null, bool $reconnect = true): ?Message
     {
         try {
             [$op, $data] = $this->parser->next($timeout);
-        } catch (TimeoutException) {
+        } catch (TimeoutException $error) {
+            if (!$reconnect) {
+                throw $error;
+            }
             return null;
         } catch (ConnectionException $e) {
-            if ($this->options->allowReconnect && $this->status !== self::STATUS_CLOSED) {
+            if ($reconnect && $this->options->allowReconnect && $this->status !== self::STATUS_CLOSED) {
                 $this->attemptReconnect();
                 return null;
             }
@@ -431,6 +495,7 @@ final class Connection
 
     public function flush(?float $timeout = null): void
     {
+        $this->assertReadable();
         $this->ensureConnected();
         $timeout ??= $this->options->connectTimeout;
 
@@ -454,6 +519,7 @@ final class Connection
 
     public function drain(?float $timeout = null): void
     {
+        $this->assertReadable();
         if ($this->status !== self::STATUS_CONNECTED) {
             return;
         }
@@ -507,14 +573,13 @@ final class Connection
             $sub->setInactive();
         }
         $this->subscriptions = [];
-        $this->pendingRequests = [];
 
         if (isset($this->transport)) {
             $this->transport->close();
         }
 
         if ($previousStatus === self::STATUS_CONNECTED && $this->options->onClose instanceof \Closure) {
-            ($this->options->onClose)();
+            $this->notify($this->options->onClose);
         }
     }
 
@@ -717,13 +782,9 @@ final class Connection
             sid: $data['sid'],
         );
 
-        // Check if this is a reply to a pending request (mux inbox)
-        if ($this->inboxSub instanceof \Utopia\NATS\Subscription && $data['sid'] === $this->inboxSub->sid) {
-            $token = $this->extractInboxToken($data['subject']);
-            if ($token !== null && isset($this->pendingRequests[$token])) {
-                $this->pendingRequests[$token] = ['message' => $msg, 'resolved' => true];
-                return $msg;
-            }
+        // Private inbox replies belong to the active request reader, never a backlog.
+        if ($this->inboxSub instanceof Subscription && $data['sid'] === $this->inboxSub->sid) {
+            return $msg;
         }
 
         // Dispatch to subscription
@@ -757,15 +818,13 @@ final class Connection
         $message = \is_string($data) ? $data : 'Unknown server error';
         $error = self::mapServerError($message);
 
-        if ($this->options->onError instanceof \Closure) {
-            ($this->options->onError)(new NatsException($message));
+        // Closing errors must make the connection unusable even when onError throws.
+        if (self::closesConnection($message)) {
+            $this->recycleDeadConnection(!$this->collecting && self::reconnectsAfter($message));
         }
 
-        // The server has already closed the socket for these errors, but the
-        // status still reads "connected", so the next publish() would write into
-        // a dead socket and return success. Recycle the connection here instead.
-        if (self::closesConnection($message)) {
-            $this->recycleDeadConnection(self::reconnectsAfter($message));
+        if ($this->options->onError instanceof \Closure) {
+            $this->notify($this->options->onError, new NatsException($message));
         }
 
         throw $error;
@@ -899,7 +958,7 @@ final class Connection
     private function handleLameDuck(): void
     {
         if ($this->options->onLameDuck instanceof \Closure) {
-            ($this->options->onLameDuck)();
+            $this->notify($this->options->onLameDuck);
         }
 
         $others = array_values(array_filter(
@@ -909,7 +968,7 @@ final class Connection
 
         // Only proactively reconnect when a different server is available;
         // otherwise ride out the current connection until it is closed.
-        if ($others !== [] && $this->options->allowReconnect) {
+        if ($others !== [] && !$this->collecting && $this->options->allowReconnect) {
             $this->serverPool = [...$others, $this->currentServer];
             $this->attemptReconnect();
         }
@@ -919,7 +978,7 @@ final class Connection
      * Emit the keepalive PING when one is due, and act on a spent budget first.
      *
      * Only called from paths that also read the socket -- {@see
-     * self::processMessage()} and {@see self::tick()} -- because a PING is only
+     * self::processMessage()}, {@see self::requestBatch()} and {@see self::tick()} -- because a PING is only
      * half a keepalive. It is the read that clears $outstandingPings, so a
      * caller that sends without reading marches the count to maxPingsOut and
      * declares a healthy connection stale. See {@see self::ensureConnected()}
@@ -927,7 +986,8 @@ final class Connection
      */
     private function checkPings(): void
     {
-        if ($this->status !== self::STATUS_CONNECTED) {
+        // Drain received operations before sending another probe or judging its reply.
+        if ($this->status !== self::STATUS_CONNECTED || $this->parser->hasBufferedData()) {
             return;
         }
 
@@ -944,7 +1004,10 @@ final class Connection
             $this->send($this->writer->ping());
             $this->outstandingPings++;
             $this->lastPingTime = $now;
-        } catch (ConnectionException) {
+        } catch (ConnectionException $error) {
+            if ($this->collecting) {
+                throw $error;
+            }
             if ($this->options->allowReconnect) {
                 $this->attemptReconnect();
             }
@@ -961,7 +1024,8 @@ final class Connection
      */
     private function checkStale(): bool
     {
-        if ($this->status !== self::STATUS_CONNECTED) {
+        // An owed PONG may already be buffered, including between request batches.
+        if ($this->status !== self::STATUS_CONNECTED || $this->parser->hasBufferedData()) {
             return false;
         }
 
@@ -969,7 +1033,7 @@ final class Connection
             return false;
         }
 
-        if ($this->options->allowReconnect) {
+        if (!$this->collecting && $this->options->allowReconnect) {
             $this->attemptReconnect();
 
             return true;
@@ -987,7 +1051,7 @@ final class Connection
         $this->status = self::STATUS_RECONNECTING;
 
         if ($this->options->onDisconnect instanceof \Closure) {
-            ($this->options->onDisconnect)();
+            $this->notify($this->options->onDisconnect);
         }
 
         if (isset($this->transport)) {
@@ -1028,10 +1092,12 @@ final class Connection
                     }
 
                     if ($this->options->onReconnect instanceof \Closure) {
-                        ($this->options->onReconnect)();
+                        $this->notify($this->options->onReconnect);
                     }
 
                     return;
+                } catch (CallbackException $error) {
+                    throw $error;
                 } catch (\Throwable) {
                     continue;
                 }
@@ -1075,11 +1141,12 @@ final class Connection
         try {
             $this->transport->write($data);
         } catch (ConnectionException $e) {
-            if ($this->options->allowReconnect && $this->status !== self::STATUS_CLOSED) {
+            if (!$this->collecting && $this->options->allowReconnect && $this->status !== self::STATUS_CLOSED) {
                 $this->bufferPending($data);
                 $this->attemptReconnect();
                 return;
             }
+            $this->recycleDeadConnection(false);
             throw $e;
         }
     }
@@ -1093,7 +1160,7 @@ final class Connection
     {
         if (!self::reconnectBufferAccepts($this->pendingBufferBytes, \strlen($data), $this->options->reconnectBufSize)) {
             if ($this->options->onError instanceof \Closure) {
-                ($this->options->onError)(new NatsException('Reconnect buffer full; dropping pending message'));
+                $this->notify($this->options->onError, new NatsException('Reconnect buffer full; dropping pending message'));
             }
             return;
         }

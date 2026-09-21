@@ -17,6 +17,12 @@ final class Parser
         private readonly Transport $transport,
     ) {}
 
+    /** Whether received bytes remain to be parsed before another transport read. */
+    public function hasBufferedData(): bool
+    {
+        return $this->buffer !== '';
+    }
+
     /**
      * Read and parse the next server operation.
      *
