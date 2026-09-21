@@ -2,32 +2,29 @@
 
 declare(strict_types=1);
 
-namespace Tests\Unit;
+namespace Tests\E2E\Adapter;
 
-use PHPUnit\Framework\TestCase;
-use Tests\E2E\Adapter\InMemoryConnection;
 use Utopia\Queue\Broker\Redis as Broker;
 use Utopia\Queue\Message;
 use Utopia\Queue\Queue;
 
-final class BatchedReceiveTest extends TestCase
+final class BatchedReceiveTest extends RedisTestCase
 {
-    private const string NAMESPACE = 'tests';
     private const string QUEUE = 'batched';
 
-    private function broker(InMemoryConnection $connection): Broker
+    private function broker(\Utopia\Queue\Connection $connection): Broker
     {
         return new Broker($connection, $connection);
     }
 
     private function queue(): Queue
     {
-        return new Queue(self::QUEUE, self::NAMESPACE);
+        return new Queue(self::QUEUE, $this->namespace);
     }
 
     public function testClaimsUpToTheRequestedMaximum(): void
     {
-        $connection = new InMemoryConnection();
+        $connection = $this->connection;
         $broker = $this->broker($connection);
         $queue = $this->queue();
 
@@ -44,7 +41,7 @@ final class BatchedReceiveTest extends TestCase
 
     public function testReturnsWhatIsThereRatherThanWaitingForTheBatchToFill(): void
     {
-        $connection = new InMemoryConnection();
+        $connection = $this->connection;
         $broker = $this->broker($connection);
         $queue = $this->queue();
 
@@ -55,7 +52,7 @@ final class BatchedReceiveTest extends TestCase
 
     public function testAnEmptyQueueYieldsAnEmptyBatch(): void
     {
-        $broker = $this->broker(new InMemoryConnection());
+        $broker = $this->broker($this->connection);
 
         $this->assertSame([], $broker->receive($this->queue(), 0, 8));
     }
@@ -65,7 +62,7 @@ final class BatchedReceiveTest extends TestCase
      */
     public function testReceiveDefaultsToOne(): void
     {
-        $connection = new InMemoryConnection();
+        $connection = $this->connection;
         $broker = $this->broker($connection);
         $queue = $this->queue();
 
@@ -83,7 +80,7 @@ final class BatchedReceiveTest extends TestCase
 
     public function testEveryMessageInTheBatchIsClaimed(): void
     {
-        $connection = new InMemoryConnection();
+        $connection = $this->connection;
         $broker = $this->broker($connection);
         $queue = $this->queue();
 
@@ -105,7 +102,7 @@ final class BatchedReceiveTest extends TestCase
 
     public function testNonPositiveCountsReceiveOneAndClosedConsumersReturnNothing(): void
     {
-        $broker = $this->broker(new InMemoryConnection());
+        $broker = $this->broker($this->connection);
         $queue = $this->queue();
         foreach ([0, -1] as $n) {
             $broker->publish($queue, ['n' => $n]);
@@ -120,7 +117,7 @@ final class BatchedReceiveTest extends TestCase
 
     public function testPooledConsumersHonorDefaultAndExplicitCounts(): void
     {
-        $broker = $this->broker(new InMemoryConnection());
+        $broker = $this->broker($this->connection);
         $queue = $this->queue();
         $pool = new \Utopia\Pools\Pool(new \Utopia\Pools\Adapter\Stack(), 'consume', 1, fn(): Broker => $broker, timeout: 0.0);
         $consumer = new \Utopia\Queue\Broker\Pool(consumer: $pool);
@@ -140,17 +137,17 @@ final class BatchedReceiveTest extends TestCase
      */
     public function testOnePoisonMessageDoesNotTakeTheBatchWithIt(): void
     {
-        $connection = new InMemoryConnection();
+        $connection = $this->connection;
         $broker = $this->broker($connection);
         $queue = $this->queue();
 
         $broker->publish($queue, ['n' => 1]);
-        $connection->leftPush(self::NAMESPACE . '.queue.' . self::QUEUE, '{"truncated"');
+        $connection->leftPush($this->namespace . '.queue.' . self::QUEUE, '{"truncated"');
         $broker->publish($queue, ['n' => 3]);
 
         $batch = $broker->receive($queue, 0, 8);
 
         $this->assertSame([1, 3], array_map(static fn(Message $m): int => $m->getPayload()['n'], $batch));
-        $this->assertSame(1, $connection->listSize(self::NAMESPACE . '.poison.' . self::QUEUE));
+        $this->assertSame(1, $connection->listSize($this->namespace . '.poison.' . self::QUEUE));
     }
 }

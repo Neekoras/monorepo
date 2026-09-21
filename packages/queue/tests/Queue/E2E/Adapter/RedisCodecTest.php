@@ -2,11 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Tests\Unit;
+namespace Tests\E2E\Adapter;
 
 use PHPUnit\Framework\Attributes\DataProvider;
-use PHPUnit\Framework\TestCase;
-use Tests\E2E\Adapter\InMemoryConnection;
 use Utopia\Queue\Broker\Redis as Broker;
 use Utopia\Queue\Codec;
 use Utopia\Queue\Codec\Compat;
@@ -15,9 +13,8 @@ use Utopia\Queue\Codec\Json;
 use Utopia\Queue\Message;
 use Utopia\Queue\Queue;
 
-final class RedisCodecTest extends TestCase
+final class RedisCodecTest extends RedisTestCase
 {
-    private const string NAMESPACE = 'tests';
     private const string QUEUE = 'codec';
 
     /**
@@ -37,9 +34,9 @@ final class RedisCodecTest extends TestCase
     #[DataProvider('codecs')]
     public function testPublishAndReceiveRoundTrip(Codec $codec): void
     {
-        $connection = new InMemoryConnection();
+        $connection = $this->connection;
         $broker = new Broker($connection, $connection, $codec);
-        $queue = new Queue(self::QUEUE, self::NAMESPACE);
+        $queue = new Queue(self::QUEUE, $this->namespace);
 
         $broker->publish($queue, ['to' => 'a@example.com', 'attempt' => 1]);
         $message = $broker->receive($queue, 0)[0] ?? null;
@@ -56,19 +53,19 @@ final class RedisCodecTest extends TestCase
     #[DataProvider('codecs')]
     public function testTheClaimStoresTheBytesAsTheyArrived(Codec $codec): void
     {
-        $connection = new InMemoryConnection();
+        $connection = $this->connection;
         $broker = new Broker($connection, $connection, $codec);
-        $queue = new Queue(self::QUEUE, self::NAMESPACE);
+        $queue = new Queue(self::QUEUE, $this->namespace);
 
         $broker->publish($queue, ['n' => 1]);
-        $published = $connection->listRange(self::NAMESPACE . '.queue.' . self::QUEUE, 1, 0)[0];
+        $published = $connection->listRange($this->namespace . '.queue.' . self::QUEUE, 1, 0)[0];
 
         $message = $broker->receive($queue, 0)[0] ?? null;
         $this->assertInstanceOf(Message::class, $message);
 
         $this->assertSame(
             $published,
-            $connection->get(self::NAMESPACE . '.jobs.' . self::QUEUE . '.' . $message->getPid()),
+            $connection->get($this->namespace . '.jobs.' . self::QUEUE . '.' . $message->getPid()),
         );
     }
 
@@ -77,8 +74,8 @@ final class RedisCodecTest extends TestCase
      */
     public function testCompatReadsAMessageAnEarlierReleaseWrote(): void
     {
-        $connection = new InMemoryConnection();
-        $queue = new Queue(self::QUEUE, self::NAMESPACE);
+        $connection = $this->connection;
+        $queue = new Queue(self::QUEUE, $this->namespace);
 
         new Broker($connection, $connection, new Json())->publish($queue, ['n' => 1]);
 
@@ -95,11 +92,11 @@ final class RedisCodecTest extends TestCase
      */
     public function testAnUnreadableMessageIsParkedAndTheQueueKeepsMoving(): void
     {
-        $connection = new InMemoryConnection();
+        $connection = $this->connection;
         $broker = new Broker($connection, $connection, new Json());
-        $queue = new Queue(self::QUEUE, self::NAMESPACE);
+        $queue = new Queue(self::QUEUE, $this->namespace);
 
-        $key = self::NAMESPACE . '.queue.' . self::QUEUE;
+        $key = $this->namespace . '.queue.' . self::QUEUE;
         $poison = '{"pid":"a","queue":"codec"'; // truncated mid-write
         $connection->leftPush($key, $poison);
         $broker->publish($queue, ['n' => 1]);
@@ -107,7 +104,7 @@ final class RedisCodecTest extends TestCase
         $this->assertNotInstanceOf(Message::class, ($broker->receive($queue, 0)[0] ?? null), 'the unreadable message is not handed to a handler');
         $this->assertSame(
             [$poison],
-            $connection->listRange(self::NAMESPACE . '.poison.' . self::QUEUE, 1, 0),
+            $connection->listRange($this->namespace . '.poison.' . self::QUEUE, 1, 0),
             'the bytes are set aside for a human, not discarded',
         );
 
@@ -122,13 +119,13 @@ final class RedisCodecTest extends TestCase
      */
     public function testAWellFormedNonEnvelopeIsParked(): void
     {
-        $connection = new InMemoryConnection();
+        $connection = $this->connection;
         $broker = new Broker($connection, $connection, new Json());
-        $queue = new Queue(self::QUEUE, self::NAMESPACE);
+        $queue = new Queue(self::QUEUE, $this->namespace);
 
-        $connection->leftPush(self::NAMESPACE . '.queue.' . self::QUEUE, '{"hello":"world"}');
+        $connection->leftPush($this->namespace . '.queue.' . self::QUEUE, '{"hello":"world"}');
 
         $this->assertNotInstanceOf(Message::class, ($broker->receive($queue, 0)[0] ?? null));
-        $this->assertSame(1, $connection->listSize(self::NAMESPACE . '.poison.' . self::QUEUE));
+        $this->assertSame(1, $connection->listSize($this->namespace . '.poison.' . self::QUEUE));
     }
 }

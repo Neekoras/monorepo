@@ -75,7 +75,7 @@ final class LockingTest extends TestCase
 
     public function testDefaultLockSerializesConcurrentOperations(): void
     {
-        $connection = new class extends InMemoryConnection {
+        $connection = new class (new Recorder()) extends RecordingConnection {
             public int $active = 0;
             public int $peak = 0;
             public function ping(): bool
