@@ -100,6 +100,7 @@ final class Connection
     private string $inboxPrefix = '';
     /** @var array<string, array{message: ?Message, resolved: bool}> */
     private array $pendingRequests = [];
+    private bool $collecting = false;
 
     // Reconnection
     /** @var list<string> */
@@ -142,6 +143,11 @@ final class Connection
     {
         $this->ensureConnected();
 
+        $this->send($this->encode($subject, $data, $replyTo, $headers));
+    }
+
+    private function encode(string $subject, string $data, ?string $replyTo, ?Headers $headers): string
+    {
         $hasHeaders = $headers instanceof \Utopia\NATS\Headers && $headers->all() !== [];
 
         if ($hasHeaders && isset($this->serverInfo) && !$this->serverInfo->headersSupported) {
@@ -157,13 +163,10 @@ final class Connection
             );
         }
 
-        if ($hasHeaders) {
-            $cmd = $this->writer->hpub($subject, $headerWire, $data, $replyTo);
-        } else {
-            $cmd = $this->writer->pub($subject, $data, $replyTo);
-        }
+        return $hasHeaders
+            ? $this->writer->hpub($subject, $headerWire, $data, $replyTo)
+            : $this->writer->pub($subject, $data, $replyTo);
 
-        $this->send($cmd);
     }
 
     public function subscribe(string $subject, ?\Closure $callback = null, ?string $queue = null): Subscription
@@ -207,6 +210,7 @@ final class Connection
 
     public function request(string $subject, string $data = '', ?float $timeout = null, ?Headers $headers = null): Message
     {
+        $this->assertReadable();
         try {
             return $this->requestOnce($subject, $data, $timeout, $headers);
         } catch (ProtocolException $error) {
@@ -259,109 +263,114 @@ final class Connection
             throw new TimeoutException("Request timed out after {$timeout}s");
         }
 
-        // Check for no responders (status 503)
-        if ($msg->headers !== null && $msg->headers->getStatus() === '503') {
-            throw new NatsException('No responders for request');
+        $response = $this->response($msg);
+        if ($response instanceof NatsException) {
+            throw $response;
         }
 
-        return $msg;
+        return $response;
     }
 
     /**
-     * Pipeline independent requests. One reader correlates replies; ambiguous writes
-     * are never replayed. Results retain their input indices after partial failure.
-     * A callback failure is rethrown after all outcomes are collected and cleaned up.
-     * @param list<array{subject: string, data?: string}> $requests
-     * @param (callable(int, Message|\Throwable): void)|null $resolved
-     * @return list<Message|\Throwable>
+     * Send independent requests together and deliver indexed outcomes as replies arrive.
+     * One response deadline starts after writing. Ambiguous writes are never replayed.
+     * A callback exception aborts collection, not already-sent remote work.
+     *
+     * @param list<array{subject: string, data?: string, headers?: Headers|null}> $requests
+     * @param \Closure(int, Message|\Throwable): void $reply
      */
-    public function requests(array $requests, ?float $timeout = null, ?callable $resolved = null): array
+    public function requests(array $requests, \Closure $reply, ?float $timeout = null): void
     {
-        $tokens = $results = [];
-        $callbackError = null;
-        $notify = static function (int $index, Message|\Throwable $result) use ($resolved, &$callbackError): void {
-            try {
-                if ($resolved !== null) {
-                    $resolved($index, $result);
-                }
-            } catch (\Throwable $error) {
-                $callbackError ??= $error;
-            }
-        };
+        $this->assertReadable();
         $timeout ??= $this->options->requestTimeout;
-        $deadline = microtime(true) + $timeout;
+        if (!is_finite($timeout) || $timeout <= 0 || !array_is_list($requests)) {
+            throw new \InvalidArgumentException('Requests must be a list with a finite positive timeout');
+        }
+        foreach ($requests as $request) {
+            if (!\is_array($request) || !isset($request['subject']) || !\is_string($request['subject'])
+                || $request['subject'] === '' || preg_match('/[\s\x00*>]/', $request['subject'])
+                || str_starts_with($request['subject'], '.') || str_ends_with($request['subject'], '.')
+                || str_contains($request['subject'], '..')
+                || (\array_key_exists('data', $request) && !\is_string($request['data']))
+                || (isset($request['headers']) && !$request['headers'] instanceof Headers)) {
+                throw new \InvalidArgumentException('Invalid request subject, data, or headers');
+            }
+        }
+        if ($requests === []) {
+            return;
+        }
+        $tokens = [];
+        $this->collecting = true;
         try {
             $this->ensureConnected();
             $this->ensureInboxSub();
             $wire = '';
             foreach ($requests as $index => $request) {
-                $subject = $request['subject'];
-                $data = $request['data'] ?? '';
-                if ($subject === '' || preg_match('/[\s\x00]/', $subject)) {
-                    throw new \InvalidArgumentException('Invalid request subject');
-                }
-                if (\strlen($data) > $this->serverInfo->maxPayload) {
-                    throw new MaxPayloadException('Request exceeds server maximum payload');
-                }
                 $token = Inbox::generateId();
-                $tokens[$index] = $token;
-                $this->pendingRequests[$token] = ['message' => null, 'resolved' => false];
-                $wire .= $this->writer->pub($subject, $data, $this->inboxPrefix . '.' . $token);
+                $tokens[$token] = $index;
+                $wire .= $this->encode($request['subject'], $request['data'] ?? '', $this->inboxPrefix . '.' . $token, $request['headers'] ?? null);
             }
-            if ($wire !== '') {
-                // send() may replay buffered writes on reconnect; confirmations must
-                // instead surface uncertainty to their individual callers.
+            $failure = null;
+            try {
+                // send() buffers and replays on reconnect; uncertain requests must not.
                 $this->transport->write($wire);
+            } catch (ConnectionException $error) {
+                $this->recycleDeadConnection(false);
+                $failure = $error;
             }
-            while (\count($results) < \count($requests)) {
-                foreach ($tokens as $index => $token) {
-                    if (isset($results[$index])) {
-                        continue;
+            $deadline = hrtime(true) / 1e9 + $timeout;
+            while ($tokens !== [] && !$failure instanceof \Utopia\NATS\Exception\ConnectionException) {
+                try {
+                    $remaining = $deadline - hrtime(true) / 1e9;
+                    if ($remaining <= 0) {
+                        throw new TimeoutException("Requests timed out after {$timeout}s");
                     }
-                    if (!($this->pendingRequests[$token]['resolved'] ?? false)) {
-                        continue;
+                    [$op, $data] = $this->parser->next($remaining);
+                } catch (NatsException $error) {
+                    if ($error instanceof ConnectionException && !$error instanceof TimeoutException) {
+                        $this->recycleDeadConnection(false);
                     }
-                    $message = $this->pendingRequests[$token]['message'];
-                    $results[$index] = $message?->headers?->getStatus() === '503'
-                        ? new NatsException('No responders for request')
-                        : $message;
-                    $notify($index, $results[$index]);
-                }
-                if (\count($results) === \count($requests)) {
+                    $failure = $error;
                     break;
                 }
-                $remaining = $deadline - microtime(true);
-                if ($remaining <= 0) {
-                    throw new TimeoutException("Requests timed out after {$timeout}s");
+                if ($op === ServerOp::Err) {
+                    try {
+                        $this->dispatchOp($op, $data);
+                    } catch (NatsException $error) {
+                        $failure = $error;
+                    }
+                    break;
                 }
-                // No automatic reconnect/read retry during an outstanding group.
-                try {
-                    [$op, $data] = $this->parser->next($remaining);
-                    $this->dispatchOp($op, $data);
-                } catch (TimeoutException) {
-                    throw new TimeoutException("Requests timed out after {$timeout}s");
+                $message = $this->dispatchOp($op, $data);
+                $token = $message instanceof \Utopia\NATS\Message ? $this->extractInboxToken($message->subject) : null;
+                if ($token !== null && isset($tokens[$token])) {
+                    $index = $tokens[$token];
+                    unset($tokens[$token]);
+                    $reply($index, $this->response($message));
                 }
             }
-        } catch (\Throwable $error) {
-            if ($error instanceof ConnectionException && !$error instanceof TimeoutException) {
-                $this->recycleDeadConnection(false);
-            }
-            foreach (array_keys($requests) as $index) {
-                if (!isset($results[$index])) {
-                    $results[$index] = $error;
-                    $notify($index, $error);
+            if ($failure instanceof \Utopia\NATS\Exception\NatsException) {
+                foreach ($tokens as $index) {
+                    $reply($index, $failure);
                 }
             }
         } finally {
-            foreach ($tokens as $token) {
-                unset($this->pendingRequests[$token]);
-            }
+            $this->collecting = false;
         }
-        if ($callbackError instanceof \Throwable) {
-            throw $callbackError;
+    }
+
+    private function assertReadable(): void
+    {
+        if ($this->collecting) {
+            throw new \LogicException('Cannot read the connection while collecting requests');
         }
-        ksort($results);
-        return array_values($results);
+    }
+
+    private function response(Message $message): Message|NatsException
+    {
+        return $message->headers?->getStatus() === '503'
+            ? new NatsException('No responders for request')
+            : $message;
     }
 
     /**
@@ -377,6 +386,7 @@ final class Connection
      */
     public function requestMany(string $subject, string $data = '', array $opts = []): array
     {
+        $this->assertReadable();
         $this->ensureConnected();
 
         $max = $opts['max'] ?? null;
@@ -441,6 +451,7 @@ final class Connection
      */
     public function tick(): void
     {
+        $this->assertReadable();
         $this->checkPings();
         $this->collectPongs();
     }
@@ -472,6 +483,7 @@ final class Connection
      */
     public function processMessage(?float $timeout = null): ?Message
     {
+        $this->assertReadable();
         $this->checkPings();
 
         return $this->readMessage($timeout);
@@ -483,6 +495,7 @@ final class Connection
      */
     private function readMessage(?float $timeout = null): ?Message
     {
+        $this->assertReadable();
         try {
             [$op, $data] = $this->parser->next($timeout);
         } catch (TimeoutException) {
@@ -528,6 +541,7 @@ final class Connection
 
     public function flush(?float $timeout = null): void
     {
+        $this->assertReadable();
         $this->ensureConnected();
         $timeout ??= $this->options->connectTimeout;
 
@@ -551,6 +565,7 @@ final class Connection
 
     public function drain(?float $timeout = null): void
     {
+        $this->assertReadable();
         if ($this->status !== self::STATUS_CONNECTED) {
             return;
         }
@@ -819,8 +834,9 @@ final class Connection
             $token = $this->extractInboxToken($data['subject']);
             if ($token !== null && isset($this->pendingRequests[$token])) {
                 $this->pendingRequests[$token] = ['message' => $msg, 'resolved' => true];
-                return $msg;
             }
+            // Request readers own replies; never accumulate them in the subscription backlog.
+            return $msg;
         }
 
         // Dispatch to subscription

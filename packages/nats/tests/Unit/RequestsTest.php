@@ -4,10 +4,16 @@ declare(strict_types=1);
 
 namespace Utopia\NATS\Tests\Unit;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Utopia\NATS\Connection;
 use Utopia\NATS\ConnectionOptions;
+use Utopia\NATS\Exception\ConnectionException;
+use Utopia\NATS\Exception\MaxPayloadException;
+use Utopia\NATS\Exception\NatsException;
 use Utopia\NATS\Exception\TimeoutException;
+use Utopia\NATS\Headers;
+use Utopia\NATS\Message;
 use Utopia\NATS\Tests\Unit\Support\FakeTransport;
 
 final class RequestsTest extends TestCase
@@ -15,7 +21,7 @@ final class RequestsTest extends TestCase
     public function testPipelinesRequestsAndRetainsOutOfOrderPartialReplies(): void
     {
         $fake = new FakeTransport();
-        $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): \Utopia\NATS\Tests\Unit\Support\FakeTransport => $fake));
+        $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
         $groups = [];
         $fake->onWrite = static function (string $wire, FakeTransport $fake) use (&$groups): void {
             preg_match_all('/PUB work\.(\d+) ([^ ]+) 0\r\n\r\n/', $wire, $matches, PREG_SET_ORDER);
@@ -24,27 +30,26 @@ final class RequestsTest extends TestCase
             }
             $groups[] = \count($matches);
             foreach (array_reverse($matches) as $match) {
-                if ($match[1] === '2') {
-                    continue;
+                if ($match[1] !== '2') {
+                    $fake->pushInbound("MSG {$match[2]} 1 1\r\n{$match[1]}\r\n");
                 }
-                $subject = $match[2];
-                $fake->pushInbound("MSG {$subject} 1 1\r\n{$match[1]}\r\n");
             }
         };
-        $resolved = [];
-        $results = $connection->requests([
+        $results = [];
+        $connection->requests([
             ['subject' => 'work.1'], ['subject' => 'work.2'], ['subject' => 'work.3'],
-        ], 0.01, static function (int $index) use (&$resolved): void {
-            $resolved[] = $index;
-        });
+        ], static function (int $index, Message|\Throwable $result) use (&$results): void {
+            $results[$index] = $result;
+        }, 0.01);
         $this->assertSame([3], $groups, 'all requests are sent before waiting for replies');
         $this->assertSame('1', $results[0]->data);
         $this->assertInstanceOf(TimeoutException::class, $results[1]);
         $this->assertSame('3', $results[2]->data);
-        $this->assertSame([2, 0, 1], $resolved, 'successful confirmations are delivered before the missing reply times out');
-        $this->assertSame('1', $connection->requests([['subject' => 'work.1']])[0]->data);
+        $this->assertSame([2, 0, 1], array_keys($results), 'successful replies arrive before the missing reply times out');
+        $this->assertSame('1', $connection->request('work.1')->data);
         $connection->close();
     }
+
     public function testAmbiguousWriteIsNotReplayedAndDisconnects(): void
     {
         $fake = new FakeTransport();
@@ -53,43 +58,184 @@ final class RequestsTest extends TestCase
         $fake->onWrite = static function (string $wire) use (&$writes): void {
             if (str_starts_with($wire, 'PUB ')) {
                 $writes++;
-                throw new \Utopia\NATS\Exception\ConnectionException('Lost connection after write');
+                throw new ConnectionException('Lost connection after write');
             }
         };
-        $results = $connection->requests([['subject' => 'first'], ['subject' => 'second']]);
+        $results = [];
+        $connection->requests([['subject' => 'first'], ['subject' => 'second']], static function (int $index, Message|\Throwable $result) use (&$results): void {
+            $results[$index] = $result;
+        });
         $this->assertSame(1, $writes);
-        $this->assertInstanceOf(\Utopia\NATS\Exception\ConnectionException::class, $results[0]);
-        $this->assertInstanceOf(\Utopia\NATS\Exception\ConnectionException::class, $results[1]);
+        $this->assertInstanceOf(ConnectionException::class, $results[0]);
+        $this->assertInstanceOf(ConnectionException::class, $results[1]);
         $this->assertFalse($connection->isConnected());
         $connection->close();
     }
 
-    public function testCallbackFailureDoesNotChangeOtherRequestOutcomes(): void
+    public function testCallbackFailureAbortsAndLeavesConnectionUsable(): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(subPendingMsgsLimit: 1, onSlowConsumer: static fn() => self::fail('Late replies must not accumulate'), transportFactory: fn(): FakeTransport => $fake));
+        $this->respond($fake);
+        $seen = [];
+        // Even transport-shaped callback errors must not become request failures.
+        $failure = new ConnectionException('Callback failed');
+        try {
+            $connection->requests(array_fill(0, 4, ['subject' => 'work']), static function (int $index, Message|\Throwable $result) use (&$seen, $failure): never {
+                $seen[$index] = $result;
+                throw $failure;
+            });
+            self::fail('Callback error must be surfaced');
+        } catch (ConnectionException $error) {
+            $this->assertSame($failure, $error);
+        }
+        $this->assertSame([0], array_keys($seen));
+        $this->assertSame('ok', $connection->request('work')->data);
+        $connection->close();
+    }
+
+    public function testHeadersAndNoRespondersRetainIndependentOutcomes(): void
     {
         $fake = new FakeTransport();
         $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
+        $observed = '';
+        $fake->onWrite = static function (string $wire, FakeTransport $fake) use (&$observed): void {
+            if (preg_match('/HPUB work ([^ ]+) (\d+) (\d+)\r\n/', $wire, $match)) {
+                $observed = $wire;
+                $fake->pushInbound("MSG {$match[1]} 1 2\r\nok\r\n");
+            }
+            if (preg_match('/PUB missing ([^ ]+) 0\r\n/', $wire, $match)) {
+                $header = "NATS/1.0 503\r\n\r\n";
+                $length = \strlen($header);
+                $fake->pushInbound("HMSG {$match[1]} 1 {$length} {$length}\r\n{$header}\r\n");
+            }
+        };
+        $headers = new Headers();
+        $headers->set('Trace', 'example');
+        $results = [];
+        $connection->requests([
+            ['subject' => 'work', 'data' => 'payload', 'headers' => $headers],
+            ['subject' => 'missing'],
+        ], static function (int $index, Message|\Throwable $result) use (&$results): void {
+            $results[$index] = $result;
+        });
+        $this->assertStringContainsString("Trace: example\r\n", $observed);
+        $this->assertStringContainsString("\r\npayload\r\n", $observed);
+        $this->assertSame('ok', $results[0]->data);
+        $this->assertInstanceOf(NatsException::class, $results[1]);
+        $connection->close();
+    }
+
+    public static function invalid(): iterable
+    {
+        yield 'subject' => [[['subject' => 'bad subject']], 1.0];
+        yield 'wildcard' => [[['subject' => 'work.*']], 1.0];
+        yield 'empty token' => [[['subject' => 'work..x']], 1.0];
+        yield 'missing subject' => [[['data' => 'x']], 1.0];
+        yield 'data' => [[['subject' => 'work', 'data' => null]], 1.0];
+        yield 'headers' => [[['subject' => 'work', 'headers' => []]], 1.0];
+        yield 'not a list' => [['key' => ['subject' => 'work']], 1.0];
+        yield 'timeout' => [[['subject' => 'work']], 0.0];
+        yield 'infinite timeout' => [[['subject' => 'work']], INF];
+        yield 'invalid later request' => [[['subject' => 'work'], ['subject' => '']], 1.0];
+    }
+
+    #[DataProvider('invalid')]
+    public function testInvalidInputDoesNotWriteOrInvokeCallbacks(array $requests, float $timeout): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
+        $before = $fake->written;
+        $called = false;
+        try {
+            $connection->requests($requests, static function () use (&$called): void {
+                $called = true;
+            }, $timeout);
+            self::fail('Invalid input must throw');
+        } catch (\InvalidArgumentException) {
+        }
+        $this->assertSame($before, $fake->written);
+        $this->assertFalse($called);
+        $connection->close();
+    }
+
+    public function testEmptyInputNeedsNoConnection(): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
+        $connection->close();
+        $before = $fake->written;
+        $connection->requests([], static fn() => self::fail('Empty batch must not invoke callback'));
+        $this->assertSame($before, $fake->written);
+    }
+
+    public function testOversizedLaterRequestDoesNotPublishEarlierRequests(): void
+    {
+        $fake = new FakeTransport(['max_payload' => 16]);
+        $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
+        try {
+            $connection->requests([
+                ['subject' => 'work'], ['subject' => 'work', 'data' => str_repeat('x', 17)],
+            ], static fn() => self::fail('Validation must not invoke callback'));
+            self::fail('Payload validation must throw');
+        } catch (MaxPayloadException) {
+        }
+        $this->assertStringNotContainsString('PUB ', $fake->written);
+        $this->respond($fake);
+        $this->assertSame('ok', $connection->request('work')->data);
+        $connection->close();
+    }
+
+    public function testCallbackCannotReadConnectionReentrantly(): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
+        $this->respond($fake);
+        $refused = 0;
+        $connection->requests([['subject' => 'work']], function () use ($connection, &$refused): void {
+            foreach ([fn(): \Utopia\NATS\Message => $connection->request('work'), $connection->processMessage(...), fn(): array => $connection->requestMany('work'), fn() => $connection->wait(1), $connection->flush(...), $connection->tick(...), $connection->drain(...), fn() => $connection->requests([], static fn() => null)] as $read) {
+                try {
+                    $read();
+                    self::fail('Nested read must be refused');
+                } catch (\LogicException) {
+                    $refused++;
+                }
+            }
+        });
+        $this->assertSame(8, $refused);
+        $this->assertSame('ok', $connection->request('work')->data);
+        $connection->close();
+    }
+
+    public function testSharedDeadlineStartsAfterWriteAndIncludesCallbacks(): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
+        $this->respond($fake);
+        $respond = $fake->onWrite;
+        $fake->onWrite = static function (string $wire, FakeTransport $fake) use ($respond): void {
+            usleep(30_000);
+            $respond($wire, $fake);
+        };
+        $results = [];
+        $connection->requests(array_fill(0, 2, ['subject' => 'work']), static function (int $index, Message|\Throwable $result) use (&$results): void {
+            $results[$index] = $result;
+            if ($index === 0) {
+                usleep(30_000);
+            }
+        }, 0.01);
+        $this->assertSame('ok', $results[0]->data, 'writing does not consume the response timeout');
+        $this->assertInstanceOf(TimeoutException::class, $results[1], 'callbacks do not reset the shared deadline');
+        $connection->close();
+    }
+
+    private function respond(FakeTransport $fake): void
+    {
         $fake->onWrite = static function (string $wire, FakeTransport $fake): void {
             preg_match_all('/PUB work ([^ ]+) 0\r\n\r\n/', $wire, $matches, PREG_SET_ORDER);
             foreach ($matches as $match) {
                 $fake->pushInbound("MSG {$match[1]} 1 2\r\nok\r\n");
             }
         };
-        $seen = [];
-        $failure = new \RuntimeException('Callback failed');
-        try {
-            $connection->requests([['subject' => 'work'], ['subject' => 'work']], 0.1, static function (int $index, $result) use (&$seen, $failure): void {
-                $seen[$index] = $result;
-                if ($index === 0) {
-                    throw $failure;
-                }
-            });
-            self::fail('Callback error must be surfaced');
-        } catch (\RuntimeException $error) {
-            $this->assertSame($failure, $error);
-        }
-        $this->assertSame(['ok', 'ok'], array_map(fn(\Throwable|\Utopia\NATS\Message $message) => $message->data, $seen));
-        $this->assertSame('ok', $connection->request('work')->data);
-        $connection->close();
     }
-
 }

@@ -361,16 +361,26 @@ NATS_URL=nats://host:4222 ./vendor/bin/phpunit --testsuite integration
 
 ## Concurrent requests
 
-`Connection::requests()` sends independent requests in one write and correlates their replies. It returns a result at each input index: either a `Message` or a `Throwable`. Inspect every result; one missing reply does not discard successful replies. The optional `resolved` callback receives each result as it arrives, before unrelated requests time out. If the callback throws, remaining outcomes are still delivered and pending requests cleaned up before the first callback exception is thrown again.
+`Connection::requests()` sends independent requests together and delivers each outcome to `reply` as it arrives. The callback receives the original input index and either a `Message` or a `Throwable`. One missing reply does not delay successful replies or discard their outcomes.
 
 ```php
-$results = $connection->requests([
-    ['subject' => 'service.first', 'data' => 'one'],
-    ['subject' => 'service.second', 'data' => 'two'],
-], timeout: 5.0);
+$connection->requests(
+    requests: [
+        ['subject' => 'service.first', 'data' => 'one'],
+        ['subject' => 'service.second', 'data' => 'two', 'headers' => $headers],
+    ],
+    reply: function (int $index, Message|Throwable $result): void {
+        // Handle this request's reply or failure.
+    },
+    timeout: 5.0,
+);
 ```
 
-Use one owner for reading the connection. This differs from `requestMany()`, which sends one request and gathers several responses. Ambiguous writes are not replayed on reconnect. A queue can use this operation for individual confirmed acknowledgements without switching to cumulative `AckAll`.
+The method returns `void`; collect results in the callback if you need an array. Completion order can differ from input order. The timeout is one response deadline for the whole group, starting after the write, rather than a separate wait per reply. Callback execution counts toward that deadline. Empty input performs no I/O. Invalid input throws before any request is published; request headers and payload limits follow `request()`.
+
+If the callback throws, collection stops immediately, pending state is cleaned up, and the exception propagates. Requests already sent are not cancelled or replayed. Later replies can still arrive. Use one owner for reading the connection; nested reads from the callback throw `LogicException`.
+
+This differs from `requestMany()`, which sends one request and gathers several responses. Ambiguous writes are not replayed on reconnect. A queue can use this operation for individual confirmed acknowledgements without switching to cumulative `AckAll`.
 
 ## License
 
