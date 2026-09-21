@@ -83,6 +83,56 @@ final class RequestsTest extends TestCase
         $connection->close();
     }
 
+    public static function bufferedReplies(): iterable
+    {
+        yield [false, false];
+        yield [false, true];
+        yield [true, false];
+        yield [true, true];
+    }
+
+    #[DataProvider('bufferedReplies')]
+    public function testBufferedPongAndRepliesAreReadBeforeKeepalive(bool $reconnect, bool $pongLast): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(
+            allowReconnect: $reconnect,
+            pingInterval: 0.0,
+            maxPingsOut: 1,
+            transportFactory: fn(): FakeTransport => $fake,
+        ));
+        $fake->answerPings = false;
+        $subjects = [];
+        $fake->onWrite = static function (string $wire, FakeTransport $fake) use (&$subjects, $pongLast): void {
+            if (str_starts_with($wire, 'PUB ')) {
+                preg_match_all('/PUB work ([^ ]+) 0\r\n\r\n/', $wire, $matches);
+                $subjects = $matches[1];
+            } elseif ($wire === "PING\r\n") {
+                // One transport read buffers +OK, the PONG, and both replies.
+                $fake->pushInbound($pongLast ? "+OK\r\n" : "+OK\r\nPONG\r\n");
+                foreach ($subjects as $subject) {
+                    $fake->pushInbound("MSG {$subject} 1 2\r\nok\r\n");
+                }
+                if ($pongLast) {
+                    $fake->pushInbound("PONG\r\n");
+                }
+            }
+        };
+        $results = [];
+        $connection->requestBatch([new Request('work'), new Request('work')], static function (int $index, Message|\Throwable $result) use (&$results): void {
+            $results[$index] = $result;
+        });
+        $this->assertCount(2, $results);
+        foreach ($results as $result) {
+            $this->assertInstanceOf(Message::class, $result);
+            $this->assertSame('ok', $result->data);
+        }
+        $this->assertTrue($connection->isConnected());
+        $this->assertSame(2, substr_count($fake->written, 'PUB work '));
+        $this->assertSame('ok', $connection->request('work')->data);
+        $connection->close();
+    }
+
     public static function keepalive(): iterable
     {
         yield 'request, silent peer' => [false, false];

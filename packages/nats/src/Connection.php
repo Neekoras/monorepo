@@ -986,7 +986,8 @@ final class Connection
      */
     private function checkPings(): void
     {
-        if ($this->status !== self::STATUS_CONNECTED) {
+        // Drain received operations before sending another probe or judging its reply.
+        if ($this->status !== self::STATUS_CONNECTED || $this->parser->hasBufferedData()) {
             return;
         }
 
@@ -1023,7 +1024,8 @@ final class Connection
      */
     private function checkStale(): bool
     {
-        if ($this->status !== self::STATUS_CONNECTED) {
+        // An owed PONG may already be buffered, including between request batches.
+        if ($this->status !== self::STATUS_CONNECTED || $this->parser->hasBufferedData()) {
             return false;
         }
 
