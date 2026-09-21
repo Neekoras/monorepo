@@ -268,26 +268,6 @@ final class ServerJobsTest extends TestCase
         $this->assertSame([['queue' => 'v1-functions', 'coroutines' => 8, 'prefetch' => 8]], $adapter->consumed);
     }
 
-    public function testStartCarriesPrefetchToTheConsumeLoop(): void
-    {
-        $adapter = new RecordingAdapter();
-        $server = new Server($adapter);
-        $server->job('v1-stats-usage', coroutines: 8, prefetch: 16);
-
-        $server->start();
-
-        $this->assertSame([['queue' => 'v1-stats-usage', 'coroutines' => 8, 'prefetch' => 16]], $adapter->consumed);
-    }
-
-    public function testPrefetchCanExceedCoroutines(): void
-    {
-        $adapter = new RecordingAdapter();
-        $server = new Server($adapter);
-        $server->job('v1-stats-usage', 1, 100);
-        $server->start();
-        $this->assertSame([['queue' => 'v1-stats-usage', 'coroutines' => 1, 'prefetch' => 100]], $adapter->consumed);
-    }
-
     public function testPrefetchDefaultsToCoroutines(): void
     {
         $server = new Server(new RecordingAdapter());

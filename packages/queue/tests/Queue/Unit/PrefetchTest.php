@@ -10,6 +10,7 @@ use Utopia\Queue\Adapter\Swoole;
 use Utopia\Queue\Consumer;
 use Utopia\Queue\Message;
 use Utopia\Queue\Queue;
+use Utopia\Queue\Server;
 
 final class PrefetchTest extends TestCase
 {
@@ -54,22 +55,34 @@ final class PrefetchTest extends TestCase
         $confirmationsAtFourthHandler = null;
         $errors = [];
         Coroutine\run(function () use ($consumer, &$running, &$peak, &$handled, &$confirmationsAtFourthHandler, &$errors): void {
-            $adapter = new Swoole($consumer, 1);
-            $adapter->consume(function () use ($consumer, &$running, &$peak, &$handled, &$confirmationsAtFourthHandler): void {
+            $adapter = new class ($consumer, 1) extends Swoole {
+                public function start(): self
+                {
+                    foreach ($this->onWorkerStart as $callback) {
+                        $callback('0');
+                    }
+                    return $this;
+                }
+            };
+            $server = new Server($adapter);
+            $server->job('jobs', coroutines: 1, prefetch: 4)->action(function () use ($consumer, &$running, &$peak, &$handled, &$confirmationsAtFourthHandler): void {
                 $peak = max($peak, ++$running);
                 if (++$handled === 4) {
                     $confirmationsAtFourthHandler = $consumer->confirmed;
                 }
                 Coroutine::sleep(0.001);
                 $running--;
-            }, function () use ($consumer, $adapter): void {
+            });
+            $server->shutdown()->action(function () use ($consumer, $adapter): void {
                 if ($consumer->confirmed === 20) {
                     $adapter->stop();
                 }
-            }, function ($message, $error) use (&$errors, $adapter): void {
+            });
+            $server->error()->inject('error')->action(function ($error) use (&$errors, $adapter): void {
                 $errors[] = $error->getMessage();
                 $adapter->stop();
-            }, [['queue' => new Queue('jobs'), 'coroutines' => 1, 'prefetch' => 4]]);
+            });
+            $server->start();
         });
         $this->assertSame([], $errors);
         $this->assertSame(20, $handled);

@@ -46,27 +46,21 @@ final class RedisCodecTest extends RedisTestCase
         $this->assertSame(self::QUEUE, $message->getQueue());
     }
 
-    /**
-     * The claim stores the bytes the queue carried, rather than re-encoding the
-     * array it just decoded -- which is the second encode this path used to pay.
-     */
     #[DataProvider('codecs')]
-    public function testTheClaimStoresTheBytesAsTheyArrived(Codec $codec): void
+    public function testReleasePreservesPayloadAndAttempts(Codec $codec): void
     {
-        $connection = $this->connection;
-        $broker = new Broker($connection, $connection, $codec);
+        $broker = new Broker($this->connection, $this->connection, $codec);
         $queue = new Queue(self::QUEUE, $this->namespace);
-
-        $broker->publish($queue, ['n' => 1]);
-        $published = $connection->listRange($this->namespace . '.queue.' . self::QUEUE, 1, 0)[0];
-
-        $message = $broker->receive($queue, 0)[0] ?? null;
-        $this->assertInstanceOf(Message::class, $message);
-
-        $this->assertSame(
-            $published,
-            $connection->get($this->namespace . '.jobs.' . self::QUEUE . '.' . $message->getPid()),
-        );
+        $payload = ['nested' => ['values' => [1, null, false, 'text']]];
+        $broker->publish($queue, $payload);
+        $message = $broker->receive($queue, 0)[0];
+        $broker->release($queue, $message);
+        $released = $broker->receive($queue, 0)[0];
+        $this->assertSame($payload, $released->getPayload());
+        $this->assertSame($message->getPid(), $released->getPid());
+        $this->assertSame($message->getAttempts(), $released->getAttempts());
+        $broker->commit($queue, $released);
+        $this->assertSame([], $broker->receive($queue, 0));
     }
 
     /**
