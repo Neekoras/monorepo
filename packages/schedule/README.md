@@ -103,12 +103,11 @@ leader dispatches. A replacement loads its initial snapshot while the old leader
 continues to run. Use a distinct Redis key for each independent scheduler, such as
 its region and task name.
 
-`$scheduler->isReady()` reports whether a source reconciliation finished within
-`syncSeconds + tickSeconds`. It is false before the first successful load and
-becomes false when refreshes stop completing. An empty source can be ready;
-individual row errors still follow the configured `onError` policy. Readiness
-does not require leadership, and does not prove that dispatch is progressing.
-The host application must expose this value through its readiness endpoint.
+`$scheduler->isReady()` reports whether initial loading completed. An empty
+source can be ready; individual row errors still follow the configured `onError`
+policy. Readiness does not require leadership and stays true if a later refresh
+fails: the scheduler retains its last good view. The host application must expose
+this value through its readiness endpoint and monitor dispatch progress separately.
 
 For a Kubernetes replacement, use `maxUnavailable: 0` and `maxSurge: 1`, and keep
 the old instance until the replacement is ready. Call `stop()` on termination

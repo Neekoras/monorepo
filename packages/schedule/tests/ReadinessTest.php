@@ -14,36 +14,12 @@ use Utopia\Schedule\Trigger\Cron;
 
 final class ReadinessTest extends TestCase
 {
-    public function testReadinessRequiresARecentCompletedSnapshotIncludingAnEmptySource(): void
+    public function testAnEmptySourceIsReadyAfterLoading(): void
     {
-        $clock = new TestClock(new \DateTimeImmutable('2026-08-18 03:00:00'));
-        $state = new class {
-            public bool $fail = false;
-        };
         $scheduler = new Scheduler(
-            source: new SnapshotSource(function () use ($state, $clock): array {
-                if ($state->fail) {
-                    throw new \RuntimeException('source unavailable');
-                }
-                $clock->advance(360);
-
-                return [];
-            }, fn(Row $row): Entry => new Entry(new Cron('* * * * *'))),
-            clock: $clock,
+            source: new SnapshotSource(fn(): array => [], fn(Row $row): Entry => new Entry(new Cron('* * * * *'))),
         );
         $this->assertFalse($scheduler->isReady());
-        $scheduler->reconcile();
-        $this->assertTrue($scheduler->isReady(), 'freshness starts when loading finishes, not when it begins');
-        $clock->advance(12);
-        $this->assertFalse($scheduler->isReady());
-        $state->fail = true;
-        try {
-            $scheduler->reconcile();
-            $this->fail('the source must fail');
-        } catch (\RuntimeException) {
-            $this->assertFalse($scheduler->isReady(), 'failed refreshes cannot restore readiness');
-        }
-        $state->fail = false;
         $scheduler->reconcile();
         $this->assertTrue($scheduler->isReady());
     }

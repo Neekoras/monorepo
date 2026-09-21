@@ -65,7 +65,7 @@ use Utopia\Telemetry\Histogram;
  * instance are not supported; two loops over one {@see Store} are — that is
  * the leader election.
  *
- * @phpstan-type Registered array{trigger: Trigger, payload: mixed, version: string, activeFrom: \DateTimeImmutable|null, coverFrom: \DateTimeImmutable|null}
+ * @phpstan-type Registered array{trigger: Trigger, payload: mixed, version: string, coverFrom: \DateTimeImmutable|null}
  */
 final class Scheduler
 {
@@ -103,8 +103,6 @@ final class Scheduler
 
     /** Cursor for incremental syncs; null forces the next sync to be full. */
     private ?\DateTimeImmutable $lastSyncAt = null;
-
-    private ?\DateTimeImmutable $lastReconciledAt = null;
 
     private float $nextSyncAt = 0.0;
 
@@ -292,7 +290,6 @@ final class Scheduler
                 'trigger' => $entry->trigger,
                 'payload' => $entry->payload,
                 'version' => $row->version,
-                'activeFrom' => $row->activeFrom,
                 'coverFrom' => $this->coverFrom($row->activeFrom, $since, $existing !== null),
             ];
         }
@@ -311,7 +308,6 @@ final class Scheduler
         }
 
         $this->lastSyncAt = $syncStart;
-        $this->lastReconciledAt = $this->clock->now();
         $this->reconcileDuration->record(microtime(true) - $started, ['full' => $full]);
     }
 
@@ -386,17 +382,10 @@ final class Scheduler
         return \count($this->entries);
     }
 
-    /**
-     * Whether a complete source reconciliation has finished recently enough
-     * for takeover. Followers can be ready without owning the claim. An empty
-     * source is ready too; row-level errors still follow the onError policy.
-     * Allow one sync cadence plus a tick for the loop to refresh its view.
-     */
+    /** Whether initial loading completed, including an empty source, on a leader or follower. */
     public function isReady(): bool
     {
-        return $this->lastReconciledAt instanceof \DateTimeImmutable
-            && (float) $this->clock->now()->format('U.u') - (float) $this->lastReconciledAt->format('U.u')
-                <= $this->syncSeconds + $this->tickSeconds;
+        return $this->lastSyncAt instanceof \DateTimeImmutable;
     }
 
     /**
@@ -697,7 +686,7 @@ final class Scheduler
 
                 // Never advance shared coverage after a failed initial load.
                 // Once initialized, source failures retain the last good view.
-                if ($this->lastSyncAt instanceof \DateTimeImmutable) {
+                if ($this->isReady()) {
                     $this->deliver($this->tick(), $handler);
                     $this->commit();
                 }
@@ -785,9 +774,9 @@ final class Scheduler
         if ($syncedUntil !== null) {
             $seen = $this->moment($syncedUntil);
             foreach ($this->entries as &$entry) {
-                $entry['coverFrom'] = $entry['activeFrom'] !== null && $entry['activeFrom'] > $seen
-                    ? $entry['activeFrom']
-                    : null;
+                if ($entry['coverFrom'] !== null && $entry['coverFrom'] <= $seen) {
+                    $entry['coverFrom'] = null;
+                }
             }
             unset($entry);
         }
