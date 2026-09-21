@@ -12,6 +12,95 @@ use Utopia\Queue\Connection;
  */
 class InMemoryConnection implements Connection
 {
+    private array $reservations = [];
+
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        $results = [];
+        $operations = [['script' => $script, 'keys' => $keys, 'args' => $args]];
+        if (str_starts_with($script, 'local function settle')) {
+            $operations = [];
+            foreach (array_chunk($keys, 6) as $index => $chunk) {
+                $operations[] = ['script' => '-- KEYS: claim,', 'keys' => $chunk, 'args' => \array_slice($args, $index * 3, 3)];
+            }
+        }
+        $grouped = str_starts_with($script, 'local function settle');
+        foreach ($operations as $operation) {
+            $keys = $operation['keys'];
+            $args = $operation['args'];
+            $script = $operation['script'];
+            if (str_starts_with($script, '-- KEYS: ready,')) {
+                $batch = $this->rightPopMany($keys[0], $args[0], 0);
+                foreach ($batch as $raw) {
+                    $this->leftPush($keys[2], $raw);
+                }
+                if ($batch !== []) {
+                    $this->reservations[$keys[1]][$keys[2]] = $this->now + $args[1];
+                }
+                $results[] = $batch;
+            } elseif (str_starts_with($script, '-- KEYS: reservations, reservation,')) {
+                for ($i = 0; $i < $args[3]; $i++) {
+                    $this->set($keys[6 + 2 * $i], $args[4 + 2 * $i], $args[0]);
+                    $this->set($keys[7 + 2 * $i], $args[2], $args[1]);
+                    $this->leftPush($keys[2], $args[5 + 2 * $i]);
+                }
+                foreach (\array_slice($args, 4 + 2 * $args[3]) as $raw) {
+                    $this->leftPush($keys[5], $raw);
+                }
+                $this->incrementBy($keys[3], $args[3]);
+                $this->incrementBy($keys[4], $args[3]);
+                unset($this->lists[$keys[1]], $this->reservations[$keys[0]][$keys[1]]);
+                $results[] = $args[3];
+            } elseif (str_starts_with($script, '-- KEYS: claim,')) {
+                if ($this->get($keys[0]) !== $args[0] || !$this->listRemove($keys[2], $args[1])) {
+                    $results[] = 0;
+                    continue;
+                }
+                $this->remove($keys[0]);
+                if ($args[2] === 2) {
+                    $raw = $this->get($keys[1]);
+                    if (\is_string($raw)) {
+                        $this->rightPush($keys[5], $raw);
+                    } $this->remove($keys[1]);
+                } elseif ($args[2] === 1) {
+                    $this->remove($keys[1]);
+                } else {
+                    $this->leftPush($keys[5], $args[1]);
+                }
+                $this->decrement($keys[3]);
+                if ($args[2] !== 2) {
+                    $this->increment($keys[4]);
+                }
+                $results[] = 1;
+            } elseif (str_starts_with($script, '-- Claim keys')) {
+                foreach ($keys as $i => $key) {
+                    if ($this->get($key) === $args[$i + 1]) {
+                        $this->set($key, $args[$i + 1], $args[0]);
+                    }
+                }
+                $results[] = 1;
+            } elseif (str_starts_with($script, '-- Discover candidates')) {
+                $results[] = array_keys(array_filter($this->reservations[$keys[0]] ?? [], fn($deadline): bool => $deadline <= $this->now));
+            } elseif (str_starts_with($script, '-- KEYS: reservations, ready,')) {
+                $moved = 0;
+                foreach ($this->reservations[$keys[0]] ?? [] as $key => $deadline) {
+                    if ($deadline > $this->now) {
+                        continue;
+                    }
+                    while (($raw = $this->leftPop($key, 0)) !== false) {
+                        $this->rightPush($keys[1], $raw);
+                        $moved++;
+                    }
+                    unset($this->reservations[$keys[0]][$key]);
+                }
+                $results[] = $moved;
+            } else {
+                throw new \LogicException('Unknown script');
+            }
+        }
+        return $grouped ? $results : $results[0];
+    }
+
     /** @var array<string, list<mixed>> */
     private array $lists = [];
 

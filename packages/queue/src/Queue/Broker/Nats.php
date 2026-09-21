@@ -765,13 +765,30 @@ class Nats implements Synchronous, Consumer, Bounded
      * Silent for a message that is no longer in flight: a handler racing its own
      * completion must not turn into an error on a job that already finished.
      */
-    public function extend(Queue $queue, Message $message): void
+    /** Return prefetched work without treating shutdown as a handler failure. */
+    public function release(Queue $queue, Message ...$messages): void
     {
-        $jsMessage = $this->inFlight[$message->getPid()] ?? null;
+        $this->command(function () use ($messages): void {
+            foreach ($messages as $message) {
+                $pid = $message->getPid();
+                if (isset($this->inFlight[$pid])) {
+                    $this->onCommands($this->inFlight[$pid])->nak();
+                    unset($this->inFlight[$pid]);
+                }
+            }
+        });
+    }
 
-        if ($jsMessage instanceof JetStreamMessage) {
-            $this->command(fn() => $this->onCommands($jsMessage)->inProgress());
-        }
+    public function extend(Queue $queue, Message ...$messages): void
+    {
+        $this->command(function () use ($messages): void {
+            foreach ($messages as $message) {
+                $jsMessage = $this->inFlight[$message->getPid()] ?? null;
+                if ($jsMessage instanceof JetStreamMessage) {
+                    $this->onCommands($jsMessage)->inProgress();
+                }
+            }
+        });
     }
 
     /**
@@ -832,6 +849,8 @@ class Nats implements Synchronous, Consumer, Bounded
         return true;
     }
 
+    private ?\Utopia\Queue\Buffer $acknowledgements = null;
+
     public function commit(Queue $queue, Message $message): void
     {
         $pid = $message->getPid();
@@ -849,7 +868,9 @@ class Nats implements Synchronous, Consumer, Bounded
         // Left behind, the entry has no owner and pins a JetStreamMessage for
         // the life of the worker, one per failed ack.
         try {
-            $this->command(fn() => $this->onCommands($jsMessage)->ackSync());
+            $this->acknowledgements ??= new \Utopia\Queue\Buffer(fn(array $requests, ?callable $resolved): array
+                => $this->command(fn(): array => $this->commandsConnection()->requests($requests, 5.0, $resolved)));
+            $this->acknowledgements->request(['subject' => $jsMessage->message->replyTo, 'data' => '']);
         } finally {
             unset($this->inFlight[$pid]);
         }

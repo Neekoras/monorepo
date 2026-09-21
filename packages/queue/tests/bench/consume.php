@@ -74,8 +74,7 @@ const DEFAULTS = [
     'repeat' => '3',
     'sleep-ms' => '0',
     'cpu-iters' => '0',
-    // Messages one receive may claim at once, bounded by --coroutines. This is
-    // the knob the batched consume path exists for; 1 is the old behaviour.
+    // Messages to prefetch, independently of --coroutines.
     'batch' => '1',
     'label' => '',
     // Milliseconds between child starts, so provisioning does not storm. It costs the
@@ -148,10 +147,10 @@ final class Timed implements Consumer
         $this->inner->close();
     }
 
-    public function extend(Queue $queue, Message $message): void
+    public function extend(Queue $queue, Message ...$messages): void
     {
         if (is_callable([$this->inner, 'extend'])) {
-            $this->inner->extend($queue, $message);
+            $this->inner->extend($queue, ...$messages);
         }
     }
 
@@ -234,7 +233,7 @@ function consume(array $args): array
     $queue = queueFor($args['backend']);
 
     $slots = max(1, (int) $args['coroutines']);
-    $batch = max(1, min($slots, (int) $args['batch']));
+    $batch = max(1, (int) $args['batch']);
     $share = (int) $args['share'];
     $sleep = ((float) $args['sleep-ms']) / 1000;
     $iters = (int) $args['cpu-iters'];

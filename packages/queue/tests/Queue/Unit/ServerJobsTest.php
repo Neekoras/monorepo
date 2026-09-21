@@ -279,25 +279,13 @@ final class ServerJobsTest extends TestCase
         $this->assertSame([['queue' => 'v1-stats-usage', 'maxCoroutines' => 16, 'batch' => 8]], $adapter->consumed);
     }
 
-    /**
-     * A batch larger than the handler slots waiting for it would claim messages
-     * this worker cannot start -- out of the broker, and invisible to the idle
-     * replica that could have run them.
-     */
-    public function testStartRefusesABatchLargerThanTheCoroutineCap(): void
+    public function testBatchCanExceedCoroutines(): void
     {
         $adapter = new RecordingAdapter();
         $server = new Server($adapter);
-        $server->job('v1-stats-usage', 4, 16);
-
-        $this->expectException(\Exception::class);
-        $this->expectExceptionMessageMatches('/batch cannot exceed the handler slots/');
-
-        try {
-            $server->start();
-        } finally {
-            $this->assertSame([], $adapter->consumed, 'the refusal lands before any loop starts');
-        }
+        $server->job('v1-stats-usage', 1, 100);
+        $server->start();
+        $this->assertSame([['queue' => 'v1-stats-usage', 'maxCoroutines' => 1, 'batch' => 100]], $adapter->consumed);
     }
 
     public function testBatchDefaultsToOneAndIsFloored(): void

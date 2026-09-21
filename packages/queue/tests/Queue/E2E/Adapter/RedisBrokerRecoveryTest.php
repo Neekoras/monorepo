@@ -226,10 +226,9 @@ final class RedisBrokerRecoveryTest extends TestCase
         $this->assertSame(0, $this->broker->getQueueSize($this->queue), 'no duplicate is enqueued');
     }
 
-    public function testExtendRevivesAClaimWhoseKeyExpired(): void
+    public function testExtendDoesNotReviveAnExpiredOwner(): void
     {
-        // The adapter beats extend() while a handler runs; a beat after the key
-        // lapsed (a long GC pause, a slow beat) must put the protection back.
+        // Once ownership expires a late worker must not revive its old delivery.
         $this->broker->publish($this->queue, ['n' => 1]);
         $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
@@ -238,8 +237,8 @@ final class RedisBrokerRecoveryTest extends TestCase
 
         $this->broker->extend($this->queue, $claimed);
 
-        $this->assertSame(0, $this->broker->reap($this->queue, olderThan: 0));
-        $this->assertSame(1, $this->processingSize(), 'the extended claim stays with its worker');
+        $this->assertSame(1, $this->broker->reap($this->queue, olderThan: 0));
+        $this->assertSame(0, $this->processingSize());
     }
 
     public function testMaintainReapsTheQueuesThisBrokerServed(): void
@@ -345,11 +344,12 @@ final class RedisBrokerRecoveryTest extends TestCase
             $this->broker->publish($this->queue, ['n' => $n]);
         }
         $claims = $this->broker->receive($this->queue, 0, 5);
-        $this->connection->advanceToNextExpiry();
+        $this->connection->advanceToNextExpiry(justBefore: true);
         foreach (\array_slice($claims, 0, 3) as $live) {
             $this->broker->extend($this->queue, $live);
         }
 
+        $this->connection->advanceToNextExpiry();
         // Each window can be scanned by a different winner of the fleet lock.
         foreach ([0, 1, 1] as $recovered) {
             $broker = new Redis($this->connection, $this->connection);

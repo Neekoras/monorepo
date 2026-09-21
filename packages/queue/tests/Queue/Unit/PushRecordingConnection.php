@@ -13,6 +13,12 @@ use Utopia\Queue\Connection;
  */
 final class PushRecordingConnection implements Connection
 {
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        $this->leftPush($keys[5], $args[1]);
+        return [1];
+    }
+
     /** @var list<array{0: string, 1: string}> */
     public array $calls = [];
 

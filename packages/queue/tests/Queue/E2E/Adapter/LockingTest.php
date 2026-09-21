@@ -114,6 +114,7 @@ final class LockingTest extends TestCase
      */
     public static function operationProvider(): iterable
     {
+        yield 'execute' => ['execute', ['return 1', [], []], [1]];
         yield 'rightPushArray' => ['rightPushArray', ['queue', ['a' => 1]], true];
         yield 'rightPushMany' => ['rightPushMany', ['queue', ['{"a":1}', '{"b":2}']], true];
         yield 'rightPopArray' => ['rightPopArray', ['queue', 5], ['popped' => 'right']];
@@ -189,6 +190,12 @@ class RecordingLock implements Lock
 
 class RecordingConnection implements Connection
 {
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        $this->record('execute', [$script, $keys, $args]);
+        return [1];
+    }
+
     public function __construct(private readonly Recorder $recorder) {}
 
     private function record(string $method, array $args): void
@@ -380,6 +387,11 @@ class RecordingConnection implements Connection
 
 class ThrowingConnection implements Connection
 {
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        throw new \LogicException('Script execution is not supported by this test connection');
+    }
+
     public function rightPushArray(string $queue, array $payload): bool
     {
         return true;

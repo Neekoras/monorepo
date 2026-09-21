@@ -27,7 +27,7 @@ final class SwooleRedisClusterTest extends Base
 
     protected function getQueue(): Queue
     {
-        return new Queue('swoole-redis-cluster');
+        return new Queue('swoole-redis-cluster', '{utopia-queue}');
     }
 
     public function testPriorityJobIsConsumedBeforeNormalJobs(): void

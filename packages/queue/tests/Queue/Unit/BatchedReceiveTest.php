@@ -97,7 +97,6 @@ final class BatchedReceiveTest extends TestCase
         foreach ($batch as $message) {
             $broker->commit($queue, $message);
         }
-        $connection->advanceToNextExpiry();
 
         $this->assertSame(1, $broker->getQueueSize($queue, failedJobs: true));
         $this->assertSame(0, $broker->reap($queue, olderThan: 0));
@@ -136,39 +135,6 @@ final class BatchedReceiveTest extends TestCase
     }
 
     /**
-     * Between the pop and the write to the processing list, the batch exists
-     * nowhere else. A failure there has to put it back.
-     */
-    public function testAFailedClaimPutsTheWholeBatchBack(): void
-    {
-        $connection = new FailingClaimConnection();
-        $connection->failClaim = true;
-        $broker = new Broker($connection, $connection);
-        $queue = $this->queue();
-
-        foreach (range(1, 4) as $n) {
-            $broker->publish($queue, ['n' => $n]);
-        }
-
-        try {
-            $broker->receive($queue, 0, 4);
-            $this->fail('the claim failure must reach the caller');
-        } catch (\RuntimeException) {
-        }
-
-        $this->assertSame(4, $broker->getQueueSize($queue), 'nothing is lost');
-
-        $connection->failClaim = false;
-        $batch = $broker->receive($queue, 0, 4);
-
-        $this->assertSame(
-            [1, 2, 3, 4],
-            array_map(static fn(Message $m): int => $m->getPayload()['n'], $batch),
-            'and the batch comes back in the order it left',
-        );
-    }
-
-    /**
      * One unreadable message in a batch is parked on its own; the rest are
      * delivered, because nothing about a batch is acknowledged together.
      */
@@ -186,20 +152,5 @@ final class BatchedReceiveTest extends TestCase
 
         $this->assertSame([1, 3], array_map(static fn(Message $m): int => $m->getPayload()['n'], $batch));
         $this->assertSame(1, $connection->listSize(self::NAMESPACE . '.poison.' . self::QUEUE));
-    }
-}
-
-final class FailingClaimConnection extends InMemoryConnection
-{
-    public bool $failClaim = false;
-
-    #[\Override]
-    public function leftPushMany(string $queue, array $payloads): bool
-    {
-        if ($this->failClaim) {
-            throw new \RuntimeException('claim failed');
-        }
-
-        return parent::leftPushMany($queue, $payloads);
     }
 }

@@ -469,14 +469,13 @@ class Server
                     // first overlap. Refuse here so a concurrency that a serialising
                     // consumer -- Broker\Redis and Broker\Nats both are -- carries safely
                     // cannot reach production as a crash loop on one that is not.
-                    if ($maxCoroutines > 1 && $consumer instanceof Exclusive) {
+                    if (max($maxCoroutines, $batch) > 1 && $consumer instanceof Exclusive) {
                         throw new Exception(\sprintf(
-                            "Queue '%s' is registered with job('%s', %d), but its consumer %s drives a single socket that only one coroutine may read at a time. Register it as job('%s', 1) and add replicas for throughput.",
+                            "Queue '%s' is registered with job('%s', %d), but its consumer %s drives a single socket that only one coroutine may read at a time. Use one coroutine with batch 1 and add replicas for throughput.",
                             $queueName,
                             $queueName,
                             $maxCoroutines,
                             $consumer::class,
-                            $queueName,
                         ));
                     }
 
@@ -489,32 +488,15 @@ class Server
                     // workers in front of it. Refuse it here, the way an exclusive
                     // consumer's cap is refused, rather than let it be found in a graph.
                     $ceiling = $consumer instanceof Bounded ? $consumer->inFlightCeiling() : null;
-                    if ($ceiling !== null && $ceiling <= $maxCoroutines) {
+                    if ($ceiling !== null && $ceiling <= max($maxCoroutines, $batch)) {
                         throw new Exception(\sprintf(
-                            "Queue '%s' is registered with job('%s', %d), but its consumer %s holds at most %d message(s) in flight. Messages sleeping in backoff hold a slot each, so the handlers can take every slot the consumer has and the queue stops being delivered into. Raise the in-flight ceiling (Broker\\Nats: maxAckPending) above %d, or lower the coroutine cap.",
+                            "Queue '%s' is registered with job('%s', %d), but its consumer %s holds at most %d message(s) in flight. Waiting retries also count toward this ceiling, so filling it with local deliveries can stop further delivery. Raise the in-flight ceiling (Broker\\Nats: maxAckPending) above %d, or lower the batch and coroutine limits.",
                             $queueName,
                             $queueName,
                             $maxCoroutines,
                             $consumer::class,
                             $ceiling,
-                            $maxCoroutines,
-                        ));
-                    }
-
-                    // A batch above the coroutine count would claim messages this
-                    // worker has nowhere to run: they would wait here, out of the
-                    // broker and invisible to every idle replica, until a handler
-                    // ahead of them finished. It is also what keeps the in-flight
-                    // ceiling honest -- reserving a slot per message is why a batch
-                    // cannot push more messages unacknowledged than maxCoroutines.
-                    if ($batch > $maxCoroutines) {
-                        throw new Exception(\sprintf(
-                            "Queue '%s' is registered with job('%s', %d, %d): a batch cannot exceed the handler slots waiting for it. Raise the coroutine count, or lower the batch to %d.",
-                            $queueName,
-                            $queueName,
-                            $maxCoroutines,
-                            $batch,
-                            $maxCoroutines,
+                            max($maxCoroutines, $batch),
                         ));
                     }
 
