@@ -54,12 +54,23 @@ final class RedisBrokerRecoveryTest extends TestCase
         $this->connection->set($key, $codec->encode($job));
     }
 
+    /**
+     * Kill the claim's heartbeat, which is what an actual dead worker looks
+     * like: on a live broker the claim key expires CLAIM_TTL after the last
+     * beat, and the in-memory connection has no clock to expire it with.
+     */
+    private function orphan(string $pid): void
+    {
+        $this->connection->remove('tests.claims.recovery.' . $pid);
+    }
+
     public function testReapRequeuesAStrandedClaim(): void
     {
         $this->broker->publish($this->queue, ['n' => 1]);
         $claimed = $this->broker->receive($this->queue, 0);
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->assertSame(1, $this->processingSize(), 'the claim is on the processing list');
+        $this->orphan($claimed->getPid());
 
         $requeued = $this->broker->reap($this->queue, olderThan: 0);
 
@@ -104,12 +115,14 @@ final class RedisBrokerRecoveryTest extends TestCase
 
         $claimed = $this->broker->receive($this->queue, 0);
         $this->assertSame(0, $claimed->getAttempts());
+        $this->orphan($claimed->getPid());
 
         foreach ([1, 2] as $attempt) {
             $this->broker->reap($this->queue, olderThan: 0);
             $claimed = $this->broker->receive($this->queue, 0);
             $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
             $this->assertSame($attempt, $claimed->getAttempts());
+            $this->orphan($claimed->getPid());
         }
 
         $requeued = $this->broker->reap($this->queue, olderThan: 0, maxAttempts: 2);
@@ -197,11 +210,93 @@ final class RedisBrokerRecoveryTest extends TestCase
         $claimed = $this->broker->receive($this->queue, 0);
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->backdate($claimed->getPid(), 3600);
+        $this->orphan($claimed->getPid());
 
         $requeued = $this->broker->reap($this->queue, olderThan: 0, newerThan: 600);
 
         $this->assertSame(0, $requeued);
         $this->assertSame(0, $this->processingSize());
         $this->assertSame(1, $this->deadSize(), 'the ancient claim is parked, not re-run');
+    }
+
+    public function testAHeartbeatedClaimIsNeverReaped(): void
+    {
+        // The failure the heartbeat exists to prevent: a job published long
+        // before the cutoff, claimed by a live worker still running it. The
+        // timestamp alone reads it as stranded; the claim key says otherwise.
+        $this->broker->publish($this->queue, ['n' => 1]);
+        $claimed = $this->broker->receive($this->queue, 0);
+        $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
+        $this->backdate($claimed->getPid(), 3600);
+
+        $requeued = $this->broker->reap($this->queue, olderThan: 0);
+
+        $this->assertSame(0, $requeued, 'the live claim is left with its worker');
+        $this->assertSame(1, $this->processingSize());
+        $this->assertSame(0, $this->broker->getQueueSize($this->queue), 'no duplicate is enqueued');
+    }
+
+    public function testExtendRevivesAClaimWhoseKeyExpired(): void
+    {
+        // The adapter beats extend() while a handler runs; a beat after the key
+        // lapsed (a long GC pause, a slow beat) must put the protection back.
+        $this->broker->publish($this->queue, ['n' => 1]);
+        $claimed = $this->broker->receive($this->queue, 0);
+        $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
+        $this->backdate($claimed->getPid(), 3600);
+        $this->orphan($claimed->getPid());
+
+        $this->broker->extend($this->queue, $claimed);
+
+        $this->assertSame(0, $this->broker->reap($this->queue, olderThan: 0));
+        $this->assertSame(1, $this->processingSize(), 'the extended claim stays with its worker');
+    }
+
+    public function testMaintainReapsTheQueuesThisBrokerServed(): void
+    {
+        // reapAfter: 0 stands in for a fleet whose every worker heartbeats, so
+        // a missing claim key alone marks the worker dead.
+        $broker = new Redis($this->connection, $this->connection, reapAfter: 0);
+        $broker->publish($this->queue, ['n' => 1]);
+        $claimed = $broker->receive($this->queue, 0);
+        $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
+        $this->orphan($claimed->getPid());
+
+        $broker->maintain();
+
+        $this->assertSame(0, $this->processingSize(), 'the stranded claim is reclaimed by the sweep');
+        $this->assertSame(1, $broker->getQueueSize($this->queue), 'the message is back on the queue');
+    }
+
+    public function testTheReapLockAdmitsOneSweepPerInterval(): void
+    {
+        // Every pod's maintenance loop calls maintain(); the lock is what turns
+        // that into one sweep per queue per interval, fleet-wide. The in-memory
+        // connection never expires the lock, so the second sweep here is any
+        // sweep inside the interval, whichever pod runs it.
+        $broker = new Redis($this->connection, $this->connection, reapAfter: 0);
+        $broker->publish($this->queue, ['n' => 1]);
+        $claimed = $broker->receive($this->queue, 0);
+        $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
+        $this->orphan($claimed->getPid());
+        $broker->maintain();
+        $this->assertSame(0, $this->processingSize());
+
+        $stranded = $broker->receive($this->queue, 0);
+        $this->assertInstanceOf(\Utopia\Queue\Message::class, $stranded);
+        $this->orphan($stranded->getPid());
+
+        $broker->maintain();
+
+        $this->assertSame(1, $this->processingSize(), 'a sweep inside the interval finds the lock held and leaves the queue alone');
+    }
+
+    public function testMaintainSweepsNothingBeforeTheFirstReceive(): void
+    {
+        // Which queues exist is learned from receiving, so a broker that has
+        // served nothing has nothing to sweep -- and must not invent keys.
+        $this->broker->maintain();
+
+        $this->assertNull($this->connection->get('tests.reap-lock.recovery'));
     }
 }

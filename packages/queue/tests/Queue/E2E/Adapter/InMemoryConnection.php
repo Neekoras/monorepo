@@ -172,6 +172,17 @@ class InMemoryConnection implements Connection
         return true;
     }
 
+    public function setNotExists(string $key, string $value, int $ttl = 0): bool
+    {
+        if (\array_key_exists($key, $this->values)) {
+            return false;
+        }
+
+        $this->values[$key] = $value;
+
+        return true;
+    }
+
     public function get(string $key): array|string|null
     {
         return $this->values[$key] ?? null;

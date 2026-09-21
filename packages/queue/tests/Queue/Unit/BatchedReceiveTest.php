@@ -107,8 +107,8 @@ final class BatchedReceiveTest extends TestCase
     }
 
     /**
-     * The whole point of the change: a batch of N costs N + 3 writes to claim,
-     * not 4N.
+     * The whole point of the change: a batch of N costs 2N + 3 writes to claim
+     * (job key and claim heartbeat per message, three shared writes), not 5N.
      */
     public function testTheClaimCostsThreeCommandsRegardlessOfBatchSize(): void
     {
@@ -126,16 +126,16 @@ final class BatchedReceiveTest extends TestCase
         $this->assertCount(8, $batch);
         $this->assertSame(0, $connection->commands('rightPop'), 'the blocking pop is the batch pop');
         $this->assertSame(1, $connection->commands('rightPopMany'), 'one BLMPOP for the wait and the whole batch');
-        $this->assertSame(8, $connection->commands('set'), 'one job key each -- a TTL cannot be shared');
+        $this->assertSame(16, $connection->commands('set'), 'a job key and a claim heartbeat each -- a TTL cannot be shared');
         $this->assertSame(1, $connection->commands('leftPushMany'), 'one command for every claim');
         $this->assertSame(2, $connection->commands('incrementBy'), 'two counters, moved once each');
         $this->assertSame(0, $connection->commands('leftPush'), 'the per-message writes are gone');
         $this->assertSame(0, $connection->commands('increment'));
 
         $this->assertSame(
-            12,
+            20,
             array_sum($connection->counts),
-            'N + 4 commands for a batch of 8, where one at a time costs 5N = 40',
+            '2N + 4 commands for a batch of 8, where one at a time costs 6N = 48',
         );
     }
 
