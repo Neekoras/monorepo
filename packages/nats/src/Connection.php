@@ -276,6 +276,7 @@ final class Connection
                     if ($remaining <= 0) {
                         throw new TimeoutException("Requests timed out after {$timeout}s");
                     }
+                    $this->checkPings();
                     $message = $this->readMessage($remaining, reconnect: false);
                     $token = $message instanceof Message ? $this->extractInboxToken($message->subject) : null;
                     if ($token !== null && isset($pending[$token])) {
@@ -977,7 +978,7 @@ final class Connection
      * Emit the keepalive PING when one is due, and act on a spent budget first.
      *
      * Only called from paths that also read the socket -- {@see
-     * self::processMessage()} and {@see self::tick()} -- because a PING is only
+     * self::processMessage()}, {@see self::requestBatch()} and {@see self::tick()} -- because a PING is only
      * half a keepalive. It is the read that clears $outstandingPings, so a
      * caller that sends without reading marches the count to maxPingsOut and
      * declares a healthy connection stale. See {@see self::ensureConnected()}
@@ -1002,7 +1003,10 @@ final class Connection
             $this->send($this->writer->ping());
             $this->outstandingPings++;
             $this->lastPingTime = $now;
-        } catch (ConnectionException) {
+        } catch (ConnectionException $error) {
+            if ($this->collecting) {
+                throw $error;
+            }
             if ($this->options->allowReconnect) {
                 $this->attemptReconnect();
             }
@@ -1027,7 +1031,7 @@ final class Connection
             return false;
         }
 
-        if ($this->options->allowReconnect) {
+        if (!$this->collecting && $this->options->allowReconnect) {
             $this->attemptReconnect();
 
             return true;

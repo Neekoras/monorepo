@@ -41,7 +41,9 @@ final class JetStream
     }
 
     /**
-     * Confirm individual acknowledgements for the selected messages, never AckAll.
+     * Confirm acknowledgements for the selected messages using the consumer policy.
+     * AckPolicy::Explicit is required to leave unselected messages unacknowledged.
+     * With AckPolicy::All, acknowledging a later message also acknowledges earlier ones.
      * @param list<JetStreamMessage> $messages
      * @param \Closure(int, ?\Throwable): void $confirmed Null means server-confirmed.
      */

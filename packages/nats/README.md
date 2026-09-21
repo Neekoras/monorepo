@@ -380,7 +380,7 @@ $connection->requestBatch(
 
 If the callback throws, collection stops immediately, pending state is cleaned up, and the exception propagates. Requests already sent are not cancelled or replayed. Later replies can still arrive. Use one owner for reading the connection; nested reads from the callback throw `LogicException`.
 
-This differs from `requestMany()`, which sends one request and gathers several responses. Ambiguous writes are not replayed on reconnect. Use `JetStream::ackBatch()` to confirm a selected list of `JetStreamMessage` instances. JetStream constructs each acknowledgement; its callback receives the original index and `null` on server confirmation or a `Throwable` on failure. Messages outside the list are not acknowledged. This does not use cumulative `AckAll`.
+This differs from `requestMany()`, which sends one request and gathers several responses. Ambiguous writes are not replayed on reconnect. Use `JetStream::ackBatch()` to confirm a selected list of `JetStreamMessage` instances. JetStream constructs each acknowledgement; its callback receives the original index and `null` on server confirmation or a `Throwable` on failure. The consumer's configured acknowledgement policy still applies. Use `AckPolicy::Explicit` to leave messages outside the list unacknowledged. With `AckPolicy::All`, acknowledging a later message also acknowledges earlier messages, including those outside the list.
 
 ```php
 $jetStream->ackBatch($messages, function (int $index, ?Throwable $error): void {

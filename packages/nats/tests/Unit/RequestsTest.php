@@ -83,6 +83,57 @@ final class RequestsTest extends TestCase
         $connection->close();
     }
 
+    public static function keepalive(): iterable
+    {
+        yield 'request, silent peer' => [false, false];
+        yield 'batch, silent peer' => [true, false];
+        yield 'request, failed ping' => [false, true];
+        yield 'batch, failed ping' => [true, true];
+    }
+
+    #[DataProvider('keepalive')]
+    public function testKeepaliveFailureDoesNotReplayRequests(bool $batch, bool $failedWrite): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(
+            allowReconnect: true,
+            maxReconnectAttempts: 1,
+            pingInterval: 0.0,
+            maxPingsOut: 1,
+            transportFactory: fn(): FakeTransport => $fake,
+        ));
+        $fake->answerPings = false;
+        $before = substr_count($fake->written, "PING\r\n");
+        if ($failedWrite) {
+            $fake->onWrite = static function (string $wire): void {
+                if ($wire === "PING\r\n") {
+                    throw new ConnectionException('PING write failed');
+                }
+            };
+        }
+        $outcomes = [];
+        for ($attempt = 0; $attempt < ($failedWrite ? 1 : 2); $attempt++) {
+            try {
+                if ($batch) {
+                    $connection->requestBatch([new Request('work')], static function (int $index, Message|\Throwable $result) use (&$outcomes): void {
+                        $outcomes[] = $result;
+                    }, 0.01);
+                } else {
+                    $connection->request('work', timeout: 0.01);
+                }
+            } catch (ConnectionException $error) {
+                $outcomes[] = $error;
+            }
+        }
+        $this->assertCount($failedWrite ? 1 : 2, $outcomes);
+        $this->assertInstanceOf(ConnectionException::class, $outcomes[array_key_last($outcomes)]);
+        $this->assertNotInstanceOf(TimeoutException::class, $outcomes[array_key_last($outcomes)]);
+        $this->assertSame($before + 1, substr_count($fake->written, "PING\r\n"));
+        $this->assertSame(1, substr_count($fake->written, 'PUB work '));
+        $this->assertFalse($connection->isConnected());
+        $connection->close();
+    }
+
     public function testPipelinesRequestsAndRetainsOutOfOrderPartialReplies(): void
     {
         $fake = new FakeTransport();
