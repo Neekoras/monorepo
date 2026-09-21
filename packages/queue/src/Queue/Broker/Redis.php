@@ -6,12 +6,11 @@ use Utopia\Queue\Codec;
 use Utopia\Queue\Codec\Json;
 use Utopia\Queue\Connection;
 use Utopia\Queue\Consumer;
-use Utopia\Queue\Consumer\Batched;
 use Utopia\Queue\Message;
 use Utopia\Queue\Publisher\Synchronous;
 use Utopia\Queue\Queue;
 
-class Redis implements Synchronous, Consumer, Batched
+class Redis implements Synchronous, Consumer
 {
     private const int POP_TIMEOUT = 2;
     private const int RECONNECT_BACKOFF_MS = 100;
@@ -41,7 +40,7 @@ class Redis implements Synchronous, Consumer, Batched
     private bool $closed = false;
 
     /**
-     * Queues this broker has received from, keyed namespace.name -- the sweep
+     * Queues this broker has received from, keyed by namespace/name pairs -- the sweep
      * in {@see self::maintain()} can only reap what it has seen served.
      *
      * @var array<string, Queue>
@@ -89,12 +88,7 @@ class Redis implements Synchronous, Consumer, Batched
         return $this;
     }
 
-    public function receive(Queue $queue, int $timeout): ?Message
-    {
-        return $this->receiveBatch($queue, $timeout, 1)[0] ?? null;
-    }
-
-    public function receiveBatch(Queue $queue, int $timeout, int $max): array
+    public function consume(Queue $queue, int $timeout, int $n = 1): array
     {
         if ($this->isClosed()) {
             return [];
@@ -102,7 +96,7 @@ class Redis implements Synchronous, Consumer, Batched
 
         // An idle queue's stranded claims still need sweeping, so the queue is
         // remembered on the attempt, not on the first message.
-        $this->served["{$queue->namespace}.{$queue->name}"] ??= $queue;
+        $this->served[serialize([$queue->namespace, $queue->name])] ??= $queue;
 
         $key = "{$queue->namespace}.queue.{$queue->name}";
 
@@ -114,8 +108,8 @@ class Redis implements Synchronous, Consumer, Batched
             // company that is not coming. A batch of one stays on BRPOP, which
             // keeps LMPOP's Redis 7.0 floor on the consumers that asked for a
             // batch rather than on every deployment.
-            if ($max > 1) {
-                $batch = $this->receive->rightPopMany($key, $max, $timeout);
+            if ($n > 1) {
+                $batch = $this->receive->rightPopMany($key, $n, $timeout);
             } else {
                 $raw = $this->receive->rightPop($key, $timeout);
                 $batch = \is_string($raw) && $raw !== '' ? [$raw] : [];
@@ -351,7 +345,7 @@ class Redis implements Synchronous, Consumer, Batched
         $this->closed = true;
     }
 
-    /** @phpstan-impure close() flips this from another coroutine mid-receive(). */
+    /** @phpstan-impure close() flips this from another coroutine mid-consume(). */
     private function isClosed(): bool
     {
         return $this->closed;
@@ -487,7 +481,7 @@ class Redis implements Synchronous, Consumer, Batched
     }
 
     /**
-     * Requeue claims whose worker died between receive() and commit/reject —
+     * Requeue claims whose worker died between consume() and commit/reject —
      * their messages sit on the processing list, invisible to consumers and to
      * retry(), until this reclaims them.
      *
@@ -528,7 +522,7 @@ class Redis implements Synchronous, Consumer, Batched
             ? $this->commands->listRange($processingList, $size, 0)
             : $this->commands->listRange($processingList, $scan, max(0, $size - $scan));
 
-        foreach ($claims as $pid) {
+        foreach (array_reverse($claims) as $pid) {
             if ($limit !== null && $requeued >= $limit) {
                 break;
             }

@@ -4,13 +4,12 @@ namespace Utopia\Queue\Broker;
 
 use Utopia\Pools\Pool as UtopiaPool;
 use Utopia\Queue\Consumer;
-use Utopia\Queue\Consumer\Batched;
 use Utopia\Queue\Consumer\Bounded;
 use Utopia\Queue\Message;
 use Utopia\Queue\Publisher\Synchronous;
 use Utopia\Queue\Queue;
 
-readonly class Pool implements Synchronous, Consumer, Batched, Bounded
+readonly class Pool implements Synchronous, Consumer, Bounded
 {
     public function __construct(
         private ?UtopiaPool $publisher = null,
@@ -46,30 +45,9 @@ readonly class Pool implements Synchronous, Consumer, Batched, Bounded
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
 
-    public function receive(Queue $queue, int $timeout): ?Message
+    public function consume(Queue $queue, int $timeout, int $n = 1): array
     {
-        return $this->delegate($this->consumer, __FUNCTION__, \func_get_args());
-    }
-
-    /**
-     * One lease for the whole batch, and one per acknowledgment after it.
-     *
-     * Declared unconditionally, like the ack-extension methods below, because
-     * what a pool holds is only knowable once a lease is taken -- so the
-     * capability is probed there and a broker without it falls back to the
-     * single receive rather than the pool refusing to batch at all.
-     */
-    public function receiveBatch(Queue $queue, int $timeout, int $max): array
-    {
-        return $this->consumer?->use(function (Consumer $adapter) use ($queue, $timeout, $max): array {
-            if ($adapter instanceof Batched) {
-                return $adapter->receiveBatch($queue, $timeout, $max);
-            }
-
-            $message = $adapter->receive($queue, $timeout);
-
-            return $message instanceof Message ? [$message] : [];
-        }) ?? [];
+        return $this->delegate($this->consumer, __FUNCTION__, \func_get_args()) ?? [];
     }
 
     public function commit(Queue $queue, Message $message): void
@@ -97,7 +75,7 @@ readonly class Pool implements Synchronous, Consumer, Batched, Bounded
      * hold a broker with no notion of extension (Redis), and this class is the
      * consumer for those too.
      *
-     * Correct while the pool leases the same broker to a message's receive()
+     * Correct while the pool leases the same broker to a message's consume()
      * and its extend() -- true at size 1, which is the documented wiring, and
      * the same assumption commit() and reject() already make. At a larger size
      * a lease can land on a broker that never held this message, whose in-flight

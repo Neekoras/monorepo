@@ -12,7 +12,7 @@ use Utopia\Queue\Message;
 use Utopia\Queue\Queue;
 
 /**
- * A broker outage must not cost the worker. `receive()` was called unguarded
+ * A broker outage must not cost the worker. `consume()` was called unguarded
  * from the consume loop, so anything it threw unwound out of consume() and ended
  * the process. Nothing retried at that level: the connection pool's internal
  * reconnect attempts happened to delay each failure by tens of seconds, which
@@ -40,7 +40,7 @@ final class ConsumerResilienceTest extends TestCase
 
             public function __construct(private readonly Redis $inner) {}
 
-            public function receive(Queue $queue, int $timeout): ?Message
+            public function consume(Queue $queue, int $timeout, int $n = 1): array
             {
                 if ($this->failures < 2) {
                     ++$this->failures;
@@ -48,7 +48,7 @@ final class ConsumerResilienceTest extends TestCase
                     throw new \RuntimeException('broker unreachable');
                 }
 
-                return $this->inner->receive($queue, $timeout);
+                return $this->inner->consume($queue, $timeout, $n);
             }
 
             public function commit(Queue $queue, Message $message): void
@@ -116,7 +116,7 @@ final class ConsumerResilienceTest extends TestCase
 
             public function drain(Queue $queue, callable $messageCallback, callable $errorCallback): void
             {
-                $message = $this->consumer->receive($queue, 0);
+                $message = $this->consumer->consume($queue, 0)[0] ?? null;
                 $this->queue = $queue;
                 $this->process($message, $messageCallback, fn(): null => null, $errorCallback);
             }

@@ -21,6 +21,20 @@ class InMemoryConnection implements Connection
     /** @var array<string, int> */
     private array $counters = [];
 
+    /** @var array<string, int> */
+    private array $expires = [];
+    private int $now = 0;
+
+    public function advance(int $seconds): void
+    {
+        $this->now += $seconds;
+        foreach ($this->expires as $key => $expiry) {
+            if ($expiry <= $this->now) {
+                $this->remove($key);
+            }
+        }
+    }
+
     public function rightPushArray(string $queue, array $payload): bool
     {
         $this->lists[$queue][] = $payload;
@@ -160,7 +174,7 @@ class InMemoryConnection implements Connection
 
     public function remove(string $key): bool
     {
-        unset($this->values[$key]);
+        unset($this->values[$key], $this->expires[$key]);
 
         return true;
     }
@@ -168,6 +182,10 @@ class InMemoryConnection implements Connection
     public function set(string $key, string $value, int $ttl = 0): bool
     {
         $this->values[$key] = $value;
+        unset($this->expires[$key]);
+        if ($ttl > 0) {
+            $this->expires[$key] = $this->now + $ttl;
+        }
 
         return true;
     }
@@ -178,9 +196,7 @@ class InMemoryConnection implements Connection
             return false;
         }
 
-        $this->values[$key] = $value;
-
-        return true;
+        return $this->set($key, $value, $ttl);
     }
 
     public function get(string $key): array|string|null
@@ -191,6 +207,10 @@ class InMemoryConnection implements Connection
     public function setArray(string $key, array $value, int $ttl = 0): bool
     {
         $this->values[$key] = $value;
+        unset($this->expires[$key]);
+        if ($ttl > 0) {
+            $this->expires[$key] = $this->now + $ttl;
+        }
 
         return true;
     }
