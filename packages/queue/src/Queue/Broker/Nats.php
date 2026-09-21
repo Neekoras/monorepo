@@ -868,18 +868,18 @@ class Nats implements Synchronous, Consumer, Bounded
         // Left behind, the entry has no owner and pins a JetStreamMessage for
         // the life of the worker, one per failed ack.
         try {
-            $this->acknowledgements ??= new \Utopia\Queue\Buffer(fn(array $requests, ?callable $resolved): array
-                => $this->command(function () use ($requests, $resolved): array {
+            $this->acknowledgements ??= new \Utopia\Queue\Buffer(fn(array $messages, ?callable $resolved): array
+                => $this->command(function () use ($messages, $resolved): array {
                     $results = [];
-                    $this->commandsConnection()->requests($requests, static function (int $index, \Utopia\NATS\Message|\Throwable $result) use (&$results, $resolved): void {
-                        $results[$index] = $result;
+                    $this->commandsJs()->ackBatch($messages, static function (int $index, ?\Throwable $error) use (&$results, $resolved): void {
+                        $results[$index] = $error ?? true;
                         if ($resolved !== null) {
-                            $resolved($index, $result);
+                            $resolved($index, $results[$index]);
                         }
-                    }, 5.0);
+                    });
                     return $results;
                 }));
-            $this->acknowledgements->request(['subject' => $jsMessage->message->replyTo, 'data' => '']);
+            $this->acknowledgements->request($jsMessage);
         } finally {
             unset($this->inFlight[$pid]);
         }
