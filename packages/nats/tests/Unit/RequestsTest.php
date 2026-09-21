@@ -48,6 +48,41 @@ final class RequestsTest extends TestCase
         $connection->close();
     }
 
+    #[DataProvider('reconnect')]
+    public function testClosingErrorDisconnectsBeforeThrowingCallback(bool $reconnect): void
+    {
+        $fake = new FakeTransport();
+        $failure = new ConnectionException('Application callback failed');
+        $connection = null;
+        $connection = Connection::connect(new ConnectionOptions(
+            allowReconnect: $reconnect,
+            onError: function () use (&$connection, $failure): never {
+                $this->assertFalse($connection->isConnected());
+                throw $failure;
+            },
+            transportFactory: fn(): FakeTransport => $fake,
+        ));
+        $fake->onWrite = static function (string $wire, FakeTransport $fake): void {
+            if (str_starts_with($wire, 'PUB ')) {
+                $fake->pushInbound("-ERR 'Stale Connection'\r\n");
+            }
+        };
+        $callbacks = 0;
+        try {
+            $connection->requestBatch([new Request('one'), new Request('two')], static function () use (&$callbacks): void {
+                $callbacks++;
+            });
+            $this->fail('Expected the callback exception');
+        } catch (\Throwable $error) {
+            $this->assertSame($failure, $error);
+        }
+        $this->assertFalse($connection->isConnected());
+        $this->assertSame(0, $callbacks);
+        $this->assertSame(1, substr_count($fake->written, 'PUB one '));
+        $this->assertSame(1, substr_count($fake->written, 'PUB two '));
+        $connection->close();
+    }
+
     public function testPipelinesRequestsAndRetainsOutOfOrderPartialReplies(): void
     {
         $fake = new FakeTransport();

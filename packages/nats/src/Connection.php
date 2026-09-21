@@ -817,15 +817,13 @@ final class Connection
         $message = \is_string($data) ? $data : 'Unknown server error';
         $error = self::mapServerError($message);
 
-        if ($this->options->onError instanceof \Closure) {
-            $this->notify($this->options->onError, new NatsException($message));
-        }
-
-        // The server has already closed the socket for these errors, but the
-        // status still reads "connected", so the next publish() would write into
-        // a dead socket and return success. Recycle the connection here instead.
+        // Closing errors must make the connection unusable even when onError throws.
         if (self::closesConnection($message)) {
             $this->recycleDeadConnection(!$this->collecting && self::reconnectsAfter($message));
+        }
+
+        if ($this->options->onError instanceof \Closure) {
+            $this->notify($this->options->onError, new NatsException($message));
         }
 
         throw $error;
