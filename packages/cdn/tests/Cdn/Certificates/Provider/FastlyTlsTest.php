@@ -6,6 +6,7 @@ namespace Utopia\Tests\Cdn\Certificates\Provider;
 
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Utopia\Cdn\Certificates\Challenge;
 use Utopia\Cdn\Certificates\Provider\FastlyTls;
 use Utopia\Cdn\Certificates\Status;
 use Utopia\Cdn\Exception\Certificate;
@@ -15,237 +16,6 @@ use Utopia\Tests\Cdn\TestClient;
 
 final class FastlyTlsTest extends TestCase
 {
-    public function testBlockedAuthorizationForwardsDnsRecordsAndInstructions(): void
-    {
-        $client = new TestClient([
-            new Response(200, body: new Stream(json_encode($this->blockedSubscription(), JSON_THROW_ON_ERROR))),
-        ]);
-
-        try {
-            new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null);
-            $this->fail('Expected an actionable certificate status.');
-        } catch (Certificate $error) {
-            $this->assertSame(Status::BLOCKED, $error->getStatus());
-            $this->assertSame([
-                ['type' => 'CNAME', 'name' => '_acme-challenge.example.com', 'values' => ['token.fastly-validations.com']],
-            ], $error->getDnsRecords());
-            $this->assertStringContainsString('DNS record is missing', $error->getMessage());
-            $this->assertStringContainsString('_acme-challenge.example.com', $error->getMessage());
-            $this->assertStringContainsString('token.fastly-validations.com', $error->getMessage());
-        }
-
-        $this->assertStringContainsString('include=tls_certificates%2Ctls_authorizations', $client->calls[0]['url']);
-    }
-
-    public function testFailedSubscriptionPreservesProviderInstructions(): void
-    {
-        $body = $this->blockedSubscription();
-        $body['data'][0]['attributes']['state'] = 'failed';
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        try {
-            new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null);
-            $this->fail('Expected an explicit certificate failure.');
-        } catch (Certificate $error) {
-            $this->assertSame(Status::FAILED, $error->getStatus());
-            $this->assertStringContainsString('DNS record is missing', $error->getMessage());
-            $this->assertCount(1, $error->getDnsRecords());
-        }
-    }
-
-    #[DataProvider('failureStates')]
-    public function testFailureWithoutAuthorizationDetails(string $state, string $message): void
-    {
-        $body = ['data' => [['id' => 'sub_1', 'attributes' => ['state' => $state]]]];
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        try {
-            new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null);
-            $this->fail('Expected a certificate failure without authorization metadata.');
-        } catch (Certificate $error) {
-            $this->assertSame($state, $error->getStatus());
-            $this->assertSame([], $error->getDnsRecords());
-            $this->assertSame($message, $error->getMessage());
-        }
-    }
-
-    /** @return iterable<string, array{string, string}> */
-    public static function failureStates(): iterable
-    {
-        yield 'blocked' => [Status::BLOCKED, 'Certificate issuance is blocked.'];
-        yield 'failed' => [Status::FAILED, 'Certificate issuance failed.'];
-    }
-
-    public function testAuthorizationChallengesAreAlternativeValidationOptions(): void
-    {
-        $body = $this->blockedSubscription();
-        $body['included'][0]['attributes']['challenges'][] = [
-            'type' => 'managed-http-cname',
-            'record_name' => 'example.com',
-            'record_type' => 'CNAME',
-            'values' => ['j.sni.global.fastly.net'],
-        ];
-        $body['included'][0]['attributes']['challenges'][] = [
-            'type' => 'managed-http-a',
-            'record_name' => 'example.com',
-            'record_type' => 'A',
-            'values' => ['151.101.0.0', '151.101.64.0'],
-        ];
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        try {
-            new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null);
-            $this->fail('Expected DNS verification options.');
-        } catch (Certificate $error) {
-            $this->assertSame([
-                ['type' => 'CNAME', 'name' => '_acme-challenge.example.com', 'values' => ['token.fastly-validations.com']],
-                ['type' => 'CNAME', 'name' => 'example.com', 'values' => ['j.sni.global.fastly.net']],
-                ['type' => 'A', 'name' => 'example.com', 'values' => ['151.101.0.0', '151.101.64.0']],
-            ], $error->getDnsRecords());
-            $this->assertStringContainsString('Choose the validation method required by the provider instructions for each authorization', $error->getMessage());
-            $this->assertStringContainsString('CNAME and A records at the same hostname are alternatives', $error->getMessage());
-        }
-    }
-
-    public function testUnrelatedAuthorizationDoesNotBlockSubscription(): void
-    {
-        $body = $this->blockedSubscription();
-        $body['data'][0]['relationships']['tls_authorizations']['data'][0]['id'] = 'another_auth';
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        $this->assertSame(Status::PENDING, new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null));
-    }
-
-    public function testIssuedSubscriptionIgnoresStaleBlockedAuthorization(): void
-    {
-        $body = $this->blockedSubscription();
-        $body['data'][0]['attributes']['state'] = 'issued';
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        $this->assertSame(Status::ISSUED, new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null));
-    }
-
-    public function testWarningsAloneDoNotFailPendingSubscription(): void
-    {
-        $body = $this->blockedSubscription();
-        $body['included'][0]['attributes']['state'] = 'pending';
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        $this->assertSame(Status::PENDING, new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null));
-    }
-
-    public function testBlockedAuthorizationWithoutChallengeStillForwardsInstructions(): void
-    {
-        $body = $this->blockedSubscription();
-        $body['included'][0]['attributes']['challenges'] = [];
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        try {
-            new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null);
-            $this->fail('Expected an actionable certificate status.');
-        } catch (Certificate $error) {
-            $this->assertSame(Status::BLOCKED, $error->getStatus());
-            $this->assertSame([], $error->getDnsRecords());
-            $this->assertStringContainsString('DNS record is missing', $error->getMessage());
-        }
-    }
-
-    public function testSharedSubscriptionIgnoresAnotherDomainsBlockedAuthorization(): void
-    {
-        $body = $this->blockedSubscription();
-        $body['data'][0]['relationships']['tls_domains']['data'][] = ['type' => 'tls_domain', 'id' => 'other.com'];
-        $body['included'][0]['attributes']['challenges'][0]['record_name'] = '_acme-challenge.other.com';
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        $this->assertSame(Status::PENDING, new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null));
-    }
-
-    public function testSharedSubscriptionForwardsOnlyRequestedDomainsChallenges(): void
-    {
-        $body = $this->blockedSubscription();
-        $body['data'][0]['relationships']['tls_domains']['data'][] = ['type' => 'tls_domain', 'id' => 'other.com'];
-        $body['data'][0]['relationships']['tls_authorizations']['data'][] = ['type' => 'tls_authorization', 'id' => 'auth_2'];
-        $body['included'][] = [
-            'id' => 'auth_2',
-            'type' => 'tls_authorization',
-            'attributes' => [
-                'state' => 'blocked',
-                'warnings' => [['instructions' => 'Other domain warning']],
-                'challenges' => [['type' => 'managed-dns', 'record_name' => '_acme-challenge.other.com', 'record_type' => 'CNAME', 'values' => ['other.fastly-validations.com']]],
-            ],
-        ];
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        try {
-            new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null);
-            $this->fail('Expected an actionable certificate status.');
-        } catch (Certificate $error) {
-            $this->assertCount(1, $error->getDnsRecords());
-            $this->assertStringNotContainsString('other', $error->getMessage());
-        }
-    }
-
-    public function testAuthorizationForAnotherSubscriptionDomainIsIgnored(): void
-    {
-        $body = $this->blockedSubscription();
-        $body['data'][0]['relationships']['tls_domains']['data'][0]['id'] = 'other.com';
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        $this->assertSame(Status::PENDING, new FastlyTls('token', 'config', client: $client)->getCertificateStatus('example.com', null));
-    }
-
-    public function testWildcardChallengeRecordsAreNormalizedAndDeduplicated(): void
-    {
-        $body = $this->blockedSubscription();
-        $body['data'][0]['relationships']['tls_domains']['data'][0]['id'] = '*.example.com';
-        $body['included'][0]['attributes']['challenges'][0]['record_name'] = '_ACME-CHALLENGE.EXAMPLE.COM.';
-        $body['included'][0]['attributes']['challenges'][0]['record_type'] = 'cname';
-        $body['included'][0]['attributes']['challenges'][0]['values'][] = 'token.fastly-validations.com';
-        $body['included'][0]['attributes']['challenges'][0]['values'][] = '';
-        $body['included'][0]['attributes']['challenges'][0]['values'][] = ['malformed'];
-        $body['included'][0]['attributes']['challenges'][] = $body['included'][0]['attributes']['challenges'][0];
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
-
-        try {
-            new FastlyTls('token', 'config', client: $client)->getCertificateStatus('*.example.com', null);
-            $this->fail('Expected an actionable certificate status.');
-        } catch (Certificate $error) {
-            $this->assertSame([
-                ['type' => 'CNAME', 'name' => '_acme-challenge.example.com', 'values' => ['token.fastly-validations.com']],
-            ], $error->getDnsRecords());
-        }
-    }
-
-    /** @return array<string, mixed> */
-    private function blockedSubscription(): array
-    {
-        return [
-            'data' => [[
-                'id' => 'sub_1',
-                'type' => 'tls_subscription',
-                'attributes' => ['state' => 'pending'],
-                'relationships' => [
-                    'tls_domains' => ['data' => [['type' => 'tls_domain', 'id' => 'example.com']]],
-                    'tls_authorizations' => ['data' => [['type' => 'tls_authorization', 'id' => 'auth_1']]],
-                ],
-            ]],
-            'included' => [[
-                'id' => 'auth_1',
-                'type' => 'tls_authorization',
-                'attributes' => [
-                    'state' => 'blocked',
-                    'warnings' => [['type' => 'dns', 'instructions' => 'DNS record is missing']],
-                    'challenges' => [[
-                        'type' => 'managed-dns',
-                        'record_name' => '_acme-challenge.example.com',
-                        'record_type' => 'CNAME',
-                        'values' => ['token.fastly-validations.com'],
-                    ]],
-                ],
-            ]],
-        ];
-    }
-
     public function testIssueCertificateCreatesSubscriptionWhenMissing(): void
     {
         $client = new TestClient([
@@ -295,7 +65,7 @@ final class FastlyTlsTest extends TestCase
     public function testDeleteCertificateRemovesSubscription(): void
     {
         $client = new TestClient([
-            new Response(200, body: new Stream('{"data":[{"id":"sub_123","attributes":{"state":"issued"},"relationships":{"tls_domains":{"data":[{"type":"tls_domain","id":"example.com"}]}}}]}')),
+            new Response(200, body: new Stream(json_encode($this->subscriptionForDomains(['example.com']), JSON_THROW_ON_ERROR))),
             new Response(204),
         ]);
 
@@ -307,46 +77,68 @@ final class FastlyTlsTest extends TestCase
         $this->assertSame('https://api.fastly.com/tls/subscriptions/sub_123?force=true', $client->calls[1]['url']);
     }
 
-    /** @param list<string> $domains */
-    #[DataProvider('otherDomains')]
+    /**
+     * `force=true` takes every domain on the subscription with it, so a
+     * subscription another hostname still uses is not ours to delete.
+     *
+     * @param list<string> $domains
+     */
+    #[DataProvider('subscriptionsOwnedByAnotherDomain')]
     public function testDeletePreservesSubscriptionsForOtherDomains(array $domains): void
     {
-        $body = $this->blockedSubscription();
-        $body['data'][0]['relationships']['tls_domains']['data'] = array_map(
-            static fn(string $domain): array => ['type' => 'tls_domain', 'id' => $domain],
-            $domains,
-        );
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
+        $client = new TestClient([
+            new Response(200, body: new Stream(json_encode($this->subscriptionForDomains($domains), JSON_THROW_ON_ERROR))),
+        ]);
 
         try {
-            new FastlyTls('token', 'config', client: $client)->deleteCertificate('example.com');
-            $this->fail('Expected cleanup to preserve other domains.');
+            new FastlyTls('token', 'tls-config-id', 'certainly', $client)->deleteCertificate('example.com');
+            $this->fail('Expected the shared subscription to be left alone.');
         } catch (\RuntimeException $error) {
             $this->assertStringContainsString('exclusive ownership', $error->getMessage());
         }
+
         $this->assertCount(1, $client->calls);
     }
 
     /** @return iterable<string, array{list<string>}> */
-    public static function otherDomains(): iterable
+    public static function subscriptionsOwnedByAnotherDomain(): iterable
     {
-        yield 'shared subscription' => [['example.com', 'other.com']];
-        yield 'different domain' => [['other.com']];
+        yield 'shared with another domain' => [['example.com', 'other.com']];
+        yield 'belongs to another domain' => [['other.com']];
     }
 
     public function testDeleteRequiresReadableSubscriptionDomains(): void
     {
-        $body = $this->blockedSubscription();
-        unset($body['data'][0]['relationships']['tls_domains']);
-        $client = new TestClient([new Response(200, body: new Stream(json_encode($body, JSON_THROW_ON_ERROR)))]);
+        $subscription = $this->subscriptionForDomains(['example.com']);
+        unset($subscription['data'][0]['relationships']['tls_domains']);
+        $client = new TestClient([
+            new Response(200, body: new Stream(json_encode($subscription, JSON_THROW_ON_ERROR))),
+        ]);
 
         try {
-            new FastlyTls('token', 'config', client: $client)->deleteCertificate('example.com');
-            $this->fail('Expected unreadable subscription ownership to stop cleanup.');
+            new FastlyTls('token', 'tls-config-id', 'certainly', $client)->deleteCertificate('example.com');
+            $this->fail('Expected unreadable ownership to stop the deletion.');
         } catch (\RuntimeException $error) {
             $this->assertStringContainsString('exclusive ownership', $error->getMessage());
         }
+
         $this->assertCount(1, $client->calls);
+    }
+
+    /**
+     * @param list<string> $domains
+     * @return array<string, mixed>
+     */
+    private function subscriptionForDomains(array $domains): array
+    {
+        return ['data' => [[
+            'id' => 'sub_123',
+            'attributes' => ['state' => 'issued'],
+            'relationships' => ['tls_domains' => ['data' => array_map(
+                static fn(string $domain): array => ['type' => 'tls_domain', 'id' => $domain],
+                $domains,
+            )]],
+        ]]];
     }
 
     public function testIssueCertificateReturnsRenewDateFromIncludedCertificate(): void
@@ -368,8 +160,11 @@ final class FastlyTlsTest extends TestCase
         $this->assertSame('2027-01-02 00:00:00.000', $provider->issueCertificate('cert', 'example.com', null));
     }
 
-    public function testRetriesFailedSubscription(): void
+    public function testRetriesFailedSubscriptionWithForce(): void
     {
+        // A subscription fails on a renewal while the certificate it issued
+        // earlier still serves, and Fastly refuses to edit a subscription with
+        // such an active domain unless the request carries force.
         $client = new TestClient([
             new Response(200, body: new Stream('{"data":[{"id":"sub_123","attributes":{"state":"failed"}}]}')),
             new Response(200, body: new Stream('{"data":{"id":"sub_123","attributes":{"state":"processing"}}}')),
@@ -377,6 +172,28 @@ final class FastlyTlsTest extends TestCase
         $provider = new FastlyTls('token', 'config', 'certainly', $client);
         $this->assertNull($provider->issueCertificate('cert', 'example.com', null));
         $this->assertSame('PATCH', $client->calls[1]['method']);
+        $this->assertSame('https://api.fastly.com/tls/subscriptions/sub_123?force=true', $client->calls[1]['url']);
+        $this->assertSame('retry', $client->calls[1]['body']['data']['attributes']['state']);
+    }
+
+    public function testRefusedRetrySurfacesFastlysReason(): void
+    {
+        $client = new TestClient([
+            new Response(200, body: new Stream('{"data":[{"id":"sub_123","attributes":{"state":"failed"}}]}')),
+            new Response(400, body: new Stream('{"errors":[{"title":"Bad Request","detail":"Subscription has active domains"}]}')),
+        ]);
+        $provider = new FastlyTls('token', 'config', 'certainly', $client);
+
+        try {
+            $provider->issueCertificate('cert', 'example.com', null);
+            $this->fail('Expected the refused retry to surface.');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('Failed to retry Fastly TLS subscription with status 400', $error->getMessage());
+            $this->assertStringContainsString('Subscription has active domains', $error->getMessage());
+        }
+
+        // Nothing else is attempted: the deployed certificate is left serving.
+        $this->assertCount(2, $client->calls);
     }
 
     public function testRejectsMalformedSuccessfulResponse(): void
@@ -385,5 +202,199 @@ final class FastlyTlsTest extends TestCase
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('valid JSON');
         $provider->getCertificateStatus('example.com', null);
+    }
+
+    #[DataProvider('waitingStates')]
+    public function testBlockedAuthorizationReportsTheDnsChallenge(string $state): void
+    {
+        $client = new TestClient([$this->json($this->subscription(state: $state))]);
+        $provider = new FastlyTls('token', 'tls-config-id', 'certainly', $client);
+
+        try {
+            $provider->getCertificateStatus('example.com', null);
+            $this->fail('A blocked authorization has to be reported, not waited on.');
+        } catch (Certificate $exception) {
+            $this->assertSame(Status::BLOCKED, $exception->getStatus());
+            $this->assertTrue($exception->isBlocked());
+            $this->assertEquals(
+                [new Challenge(FastlyTls::CHALLENGE_MANAGED_DNS, 'CNAME', '_acme-challenge.example.com', ['token.fastly-validations.com'])],
+                $exception->getChallenges(),
+            );
+            $this->assertSame([], $exception->getWarnings());
+            $this->assertStringContainsString(
+                'Create a CNAME record for _acme-challenge.example.com pointing to token.fastly-validations.com.',
+                $exception->getMessage(),
+            );
+        }
+
+        $this->assertStringContainsString('include=tls_certificates%2Ctls_authorizations', $client->calls[0]['url']);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function waitingStates(): iterable
+    {
+        yield 'pending' => ['pending'];
+        yield 'processing' => ['processing'];
+        yield 'renewing' => ['renewing'];
+    }
+
+    public function testBlockedAuthorizationReportsFastlyWarnings(): void
+    {
+        $warning = 'Conflicting record(s) found at _acme-challenge.example.com. Please remove the record(s) and add the following CNAME record: token.fastly-validations.com';
+        $client = new TestClient([$this->json($this->subscription(warnings: [['type' => 'dns', 'instructions' => $warning]]))]);
+
+        try {
+            new FastlyTls('token', 'tls-config-id', 'certainly', $client)->getCertificateStatus('example.com', null);
+            $this->fail('A blocked authorization has to be reported, not waited on.');
+        } catch (Certificate $exception) {
+            $this->assertSame(Status::BLOCKED, $exception->getStatus());
+            $this->assertSame([$warning], $exception->getWarnings());
+            $this->assertCount(1, $exception->getChallenges());
+            $this->assertStringContainsString($warning, $exception->getMessage());
+        }
+    }
+
+    public function testPendingAuthorizationIsStillWaitedOn(): void
+    {
+        $client = new TestClient([$this->json($this->subscription(authorizationState: 'pending'))]);
+
+        $this->assertSame(Status::PENDING, new FastlyTls('token', 'tls-config-id', 'certainly', $client)->getCertificateStatus('example.com', null));
+    }
+
+    public function testFailedSubscriptionReportsTheDnsChallenge(): void
+    {
+        $client = new TestClient([$this->json($this->subscription(state: 'failed'))]);
+
+        try {
+            new FastlyTls('token', 'tls-config-id', 'certainly', $client)->getCertificateStatus('example.com', null);
+            $this->fail('A failed subscription has to be reported.');
+        } catch (Certificate $exception) {
+            $this->assertSame(Status::FAILED, $exception->getStatus());
+            $this->assertFalse($exception->isBlocked());
+            $this->assertCount(1, $exception->getChallenges());
+            $this->assertStringContainsString('stopped trying', $exception->getMessage());
+            $this->assertStringContainsString('_acme-challenge.example.com', $exception->getMessage());
+        }
+    }
+
+    public function testFailedSubscriptionWithoutAuthorizationsIsStillReported(): void
+    {
+        $client = new TestClient([$this->json('{"data":[{"id":"sub_123","attributes":{"state":"failed"}}]}')]);
+
+        try {
+            new FastlyTls('token', 'tls-config-id', 'certainly', $client)->getCertificateStatus('example.com', null);
+            $this->fail('A failed subscription has to be reported.');
+        } catch (Certificate $exception) {
+            $this->assertSame(Status::FAILED, $exception->getStatus());
+            $this->assertSame([], $exception->getChallenges());
+            $this->assertSame([], $exception->getWarnings());
+            $this->assertSame('Fastly stopped trying to issue a certificate for example.com.', $exception->getMessage());
+        }
+    }
+
+    public function testIssuedSubscriptionIgnoresStaleAuthorization(): void
+    {
+        $client = new TestClient([$this->json($this->subscription(state: 'issued'))]);
+
+        $this->assertSame(Status::ISSUED, new FastlyTls('token', 'tls-config-id', 'certainly', $client)->getCertificateStatus('example.com', null));
+    }
+
+    public function testAuthorizationOfAnotherDomainIsIgnored(): void
+    {
+        $body = $this->subscription();
+        $body['included'][0]['relationships']['tls_domain']['data']['id'] = 'other.example.com';
+        $client = new TestClient([$this->json($body)]);
+
+        $this->assertSame(Status::PENDING, new FastlyTls('token', 'tls-config-id', 'certainly', $client)->getCertificateStatus('example.com', null));
+    }
+
+    public function testUnreferencedAuthorizationIsIgnored(): void
+    {
+        $body = $this->subscription();
+        $body['data'][0]['relationships']['tls_authorizations']['data'] = [['id' => 'auth_2', 'type' => 'tls_authorization']];
+        $client = new TestClient([$this->json($body)]);
+
+        $this->assertSame(Status::PENDING, new FastlyTls('token', 'tls-config-id', 'certainly', $client)->getCertificateStatus('example.com', null));
+    }
+
+    public function testMalformedChallengesAreSkipped(): void
+    {
+        $client = new TestClient([$this->json($this->subscription(challenges: [
+            ['type' => 'managed-dns', 'record_type' => 'CNAME', 'record_name' => '_acme-challenge.example.com'],
+            'not a challenge',
+            ['type' => 'managed-http-a', 'record_type' => 'a', 'record_name' => 'example.com', 'values' => ['151.101.0.0', 42, '']],
+        ]))]);
+
+        try {
+            new FastlyTls('token', 'tls-config-id', 'certainly', $client)->getCertificateStatus('example.com', null);
+            $this->fail('A blocked authorization has to be reported, not waited on.');
+        } catch (Certificate $exception) {
+            $this->assertSame(Status::BLOCKED, $exception->getStatus());
+            $this->assertEquals([new Challenge('managed-http-a', 'A', 'example.com', ['151.101.0.0'])], $exception->getChallenges());
+        }
+    }
+
+    public function testSeveralChallengesAreOfferedAsAlternatives(): void
+    {
+        $client = new TestClient([$this->json($this->subscription(challenges: [
+            ['type' => 'managed-dns', 'record_type' => 'CNAME', 'record_name' => '_acme-challenge.example.com', 'values' => ['token.fastly-validations.com']],
+            ['type' => 'managed-http-a', 'record_type' => 'A', 'record_name' => 'example.com', 'values' => ['151.101.0.0', '151.101.64.0']],
+        ]))]);
+
+        try {
+            new FastlyTls('token', 'tls-config-id', 'certainly', $client)->getCertificateStatus('example.com', null);
+            $this->fail('A blocked authorization has to be reported, not waited on.');
+        } catch (Certificate $exception) {
+            $this->assertCount(2, $exception->getChallenges());
+            $this->assertStringContainsString(
+                'Create one of these DNS records: CNAME _acme-challenge.example.com -> token.fastly-validations.com; A example.com -> 151.101.0.0 or 151.101.64.0.',
+                $exception->getMessage(),
+            );
+        }
+    }
+
+    /**
+     * A Fastly TLS subscription as `GET /tls/subscriptions?include=tls_certificates,tls_authorizations`
+     * returns it while the domain owner still has to add the `_acme-challenge` CNAME.
+     *
+     * @param list<array{type:string,instructions:string}> $warnings
+     * @param list<mixed>|null $challenges
+     * @return array<string, mixed>
+     */
+    private function subscription(string $state = 'pending', string $authorizationState = 'blocked', array $warnings = [], ?array $challenges = null): array
+    {
+        return [
+            'data' => [[
+                'id' => 'sub_123',
+                'type' => 'tls_subscription',
+                'attributes' => ['certificate_authority' => 'certainly', 'state' => $state, 'has_active_order' => true],
+                'relationships' => [
+                    'tls_authorizations' => ['data' => [['id' => 'auth_1', 'type' => 'tls_authorization']]],
+                    'tls_certificates' => ['data' => []],
+                    'tls_domains' => ['data' => [['id' => 'example.com', 'type' => 'tls_domain']]],
+                ],
+            ]],
+            'included' => [[
+                'id' => 'auth_1',
+                'type' => 'tls_authorization',
+                'attributes' => [
+                    'challenges' => $challenges ?? [[
+                        'type' => 'managed-dns',
+                        'record_type' => 'CNAME',
+                        'record_name' => '_acme-challenge.example.com',
+                        'values' => ['token.fastly-validations.com'],
+                    ]],
+                    'state' => $authorizationState,
+                    'warnings' => $warnings,
+                ],
+                'relationships' => ['tls_domain' => ['data' => ['id' => 'example.com', 'type' => 'tls_domain']]],
+            ]],
+        ];
+    }
+
+    /** @param array<string, mixed>|string $body */
+    private function json(array|string $body): Response
+    {
+        return new Response(200, body: new Stream(\is_string($body) ? $body : json_encode($body, JSON_THROW_ON_ERROR)));
     }
 }

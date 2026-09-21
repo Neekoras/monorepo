@@ -207,6 +207,23 @@ final class Connection
 
     public function request(string $subject, string $data = '', ?float $timeout = null, ?Headers $headers = null): Message
     {
+        try {
+            return $this->requestOnce($subject, $data, $timeout, $headers);
+        } catch (ProtocolException $error) {
+            // Only a stale connection: the server closed it for missed PINGs
+            // before this PUB was written, so nothing was accepted, and
+            // handleError() has already reconnected. Other closing errors may
+            // arrive after the server processed the request, so they surface.
+            if (!str_contains(strtolower($error->getMessage()), 'stale connection') || $this->status !== self::STATUS_CONNECTED) {
+                throw $error;
+            }
+
+            return $this->requestOnce($subject, $data, $timeout, $headers);
+        }
+    }
+
+    private function requestOnce(string $subject, string $data, ?float $timeout, ?Headers $headers): Message
+    {
         $this->ensureConnected();
 
         $timeout ??= $this->options->requestTimeout;
@@ -227,7 +244,12 @@ final class Connection
                 throw new TimeoutException("Request timed out after {$timeout}s");
             }
 
-            $this->processMessage($remaining);
+            try {
+                $this->processMessage($remaining);
+            } catch (\Throwable $error) {
+                unset($this->pendingRequests[$token]);
+                throw $error;
+            }
         }
 
         $msg = $this->pendingRequests[$token]['message'];
@@ -514,6 +536,11 @@ final class Connection
     public function getServerInfo(): ServerInfo
     {
         return $this->serverInfo;
+    }
+
+    public function getOptions(): ConnectionOptions
+    {
+        return $this->options;
     }
 
     public function getStatus(): string

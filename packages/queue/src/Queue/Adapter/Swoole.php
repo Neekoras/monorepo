@@ -5,7 +5,9 @@ namespace Utopia\Queue\Adapter;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Channel;
 use Swoole\Coroutine\WaitGroup;
+use Swoole\Event;
 use Swoole\Process;
+use Swoole\Timer;
 use Utopia\DI\Container;
 use Utopia\Queue\Adapter;
 use Utopia\Queue\Consumer;
@@ -28,6 +30,9 @@ class Swoole extends Adapter
     /** @var Process[] */
     protected array $workers = [];
 
+    /** @var array<int, int> Process ID to worker ID. */
+    protected array $workerIds = [];
+
     /** @var callable[] */
     protected array $onWorkerStart = [];
 
@@ -48,21 +53,35 @@ class Swoole extends Adapter
 
     public function start(): self
     {
-        for ($i = 0; $i < $this->workerNum; $i++) {
-            $this->spawnWorker($i);
-        }
+        $this->stopped = false;
+        // Dispatch signals without a persistent coroutine: Swoole cannot fork
+        // a replacement while any coroutine is running in the supervisor.
+        $timer = Timer::tick(1000, static fn(): null => null);
+        Process::signal(SIGTERM, fn(): \Utopia\Queue\Adapter\Swoole => $this->stop());
+        Process::signal(SIGINT, fn(): \Utopia\Queue\Adapter\Swoole => $this->stop());
+        Process::signal(SIGCHLD, static fn(): null => null);
 
-        Coroutine::set(['hook_flags' => SWOOLE_HOOK_ALL]);
-
-        Coroutine\run(function (): void {
-            Process::signal(SIGTERM, fn(): \Utopia\Queue\Adapter\Swoole => $this->stop());
-            Process::signal(SIGINT, fn(): \Utopia\Queue\Adapter\Swoole => $this->stop());
-            Process::signal(SIGCHLD, fn() => $this->reap());
-
-            while (\count($this->workers) > 0) {
-                Coroutine::sleep(1);
+        try {
+            for ($i = 0; $i < $this->workerNum; $i++) {
+                $this->spawnWorker($i);
             }
-        });
+
+            while ($this->workers !== []) {
+                Event::dispatch();
+                $this->reap();
+            }
+        } finally {
+            $this->stop();
+            while ($this->workers !== []) {
+                Event::dispatch();
+                $this->reap();
+            }
+            Timer::clear($timer);
+            Process::signal(SIGTERM, null);
+            Process::signal(SIGINT, null);
+            Process::signal(SIGCHLD, null);
+            Event::wait();
+        }
 
         return $this;
     }
@@ -70,6 +89,9 @@ class Swoole extends Adapter
     protected function spawnWorker(int $workerId): void
     {
         $process = new Process(function () use ($workerId): void {
+            // Only the supervisor owns sibling processes.
+            $this->workers = [];
+            $this->workerIds = [];
             Coroutine::set(['hook_flags' => SWOOLE_HOOK_ALL]);
 
             Coroutine\run(function () use ($workerId): void {
@@ -99,11 +121,15 @@ class Swoole extends Adapter
         }, false, 0, false);
 
         $pid = $process->start();
+        if ($pid === false) {
+            throw new \RuntimeException('Failed to start queue worker ' . $workerId);
+        }
         $this->workers[$pid] = $process;
+        $this->workerIds[$pid] = $workerId;
     }
 
     /**
-     * @param array<int, array{queue: Queue, maxCoroutines: int, consumer?: Consumer}> $queues
+     * @param array<int, array{queue: Queue, maxCoroutines: int, batch?: int, consumer?: Consumer}> $queues
      */
     #[\Override]
     public function consume(
@@ -134,7 +160,7 @@ class Swoole extends Adapter
                 }
 
                 try {
-                    $this->consumeBound($spec['maxCoroutines'], $messageCallback, $successCallback, $errorCallback);
+                    $this->consumeBound($spec['maxCoroutines'], $messageCallback, $successCallback, $errorCallback, $spec['batch'] ?? 1);
                 } finally {
                     $this->consumer = $previousConsumer;
                 }
@@ -157,6 +183,7 @@ class Swoole extends Adapter
                             $successCallback,
                             $errorCallback,
                             $spec['consumer'] ?? $this->consumer,
+                            $spec['batch'] ?? 1,
                         );
                     } finally {
                         $waitGroup->done();
@@ -201,6 +228,7 @@ class Swoole extends Adapter
         callable $messageCallback,
         callable $successCallback,
         callable $errorCallback,
+        int $batch = 1,
     ): void {
         $slots = new Channel($maxCoroutines);
         $waitGroup = new WaitGroup();
@@ -208,28 +236,70 @@ class Swoole extends Adapter
         while (!$this->isStopped()) {
             $slots->push(true);
 
-            $message = $this->nextMessage($errorCallback);
-
-            if (!$message instanceof Message) {
+            // The push blocks while every slot is busy, so a stop that landed
+            // during a handler is first seen here. Receiving now would claim
+            // a message the process was told not to take.
+            if ($this->isStopped()) {
                 $slots->pop();
-                continue;
+                break;
             }
 
-            $waitGroup->add();
+            $reserved = $this->reserve($slots, $batch);
+            $messages = $this->nextBatchFrom($errorCallback, $this->queue, $this->consumer, $reserved);
+            $this->releaseUnused($slots, $reserved - \count($messages));
 
-            Coroutine::create(function () use ($message, $messageCallback, $successCallback, $errorCallback, $slots, $waitGroup): void {
-                try {
-                    $this->process($message, $messageCallback, $successCallback, $errorCallback);
-                } catch (\Throwable $error) {
-                    // process() is total; net for a stray throw so it isn't lost
-                    error_log('Uncaught error while processing queue message: ' . $error->getMessage());
-                } finally {
-                    $this->releaseSlot($waitGroup, $slots);
-                }
-            });
+            foreach ($messages as $message) {
+                $waitGroup->add();
+
+                Coroutine::create(function () use ($message, $messageCallback, $successCallback, $errorCallback, $slots, $waitGroup): void {
+                    try {
+                        $this->process($message, $messageCallback, $successCallback, $errorCallback);
+                    } catch (\Throwable $error) {
+                        // process() is total; net for a stray throw so it isn't lost
+                        error_log('Uncaught error while processing queue message: ' . $error->getMessage());
+                    } finally {
+                        $this->releaseSlot($waitGroup, $slots);
+                    }
+                });
+            }
         }
 
         $waitGroup->wait();
+    }
+
+    /**
+     * Hold a slot for every message the next receive is allowed to claim.
+     *
+     * One is already held by the caller. The rest can be taken without blocking
+     * because this loop is the only coroutine that ever pushes -- handlers only
+     * pop -- so free capacity read here can be stale low, never stale high, and
+     * a handler finishing mid-count only means the next pass asks for more.
+     *
+     * This is what keeps the batch honest about the invariant the single
+     * receive already held: a message is never taken out of the broker without
+     * somewhere to run it.
+     */
+    private function reserve(Channel $slots, int $batch): int
+    {
+        if ($batch <= 1) {
+            return 1;
+        }
+
+        $want = min($batch, 1 + max(0, $slots->capacity - $slots->length()));
+
+        for ($i = 1; $i < $want; $i++) {
+            $slots->push(true);
+        }
+
+        return $want;
+    }
+
+    /** Give back reservations the broker had no messages for. */
+    private function releaseUnused(Channel $slots, int $count): void
+    {
+        for ($i = 0; $i < $count; $i++) {
+            $slots->pop();
+        }
     }
 
     /**
@@ -250,6 +320,7 @@ class Swoole extends Adapter
         callable $successCallback,
         callable $errorCallback,
         Consumer $consumer,
+        int $batch = 1,
     ): void {
         if ($consumer !== $this->consumer) {
             $this->consumers[] = $consumer;
@@ -261,25 +332,32 @@ class Swoole extends Adapter
         while (!$this->isStopped()) {
             $slots->push(true);
 
-            $message = $this->nextMessageFrom($errorCallback, $queue, $consumer);
-
-            if (!$message instanceof Message) {
+            // The push blocks while every slot is busy, so a stop that landed
+            // during a handler is first seen here. Receiving now would claim
+            // a message the process was told not to take.
+            if ($this->isStopped()) {
                 $slots->pop();
-                continue;
+                break;
             }
 
-            $waitGroup->add();
+            $reserved = $this->reserve($slots, $batch);
+            $messages = $this->nextBatchFrom($errorCallback, $queue, $consumer, $reserved);
+            $this->releaseUnused($slots, $reserved - \count($messages));
 
-            Coroutine::create(function () use ($message, $messageCallback, $successCallback, $errorCallback, $slots, $waitGroup, $queue, $consumer): void {
-                try {
-                    $this->processFrom($message, $messageCallback, $successCallback, $errorCallback, $queue, $consumer);
-                } catch (\Throwable $error) {
-                    // processFrom() is total; net for a stray throw so it isn't lost
-                    error_log('Uncaught error while processing queue message: ' . $error->getMessage());
-                } finally {
-                    $this->releaseSlot($waitGroup, $slots);
-                }
-            });
+            foreach ($messages as $message) {
+                $waitGroup->add();
+
+                Coroutine::create(function () use ($message, $messageCallback, $successCallback, $errorCallback, $slots, $waitGroup, $queue, $consumer): void {
+                    try {
+                        $this->processFrom($message, $messageCallback, $successCallback, $errorCallback, $queue, $consumer);
+                    } catch (\Throwable $error) {
+                        // processFrom() is total; net for a stray throw so it isn't lost
+                        error_log('Uncaught error while processing queue message: ' . $error->getMessage());
+                    } finally {
+                        $this->releaseSlot($waitGroup, $slots);
+                    }
+                });
+            }
         }
 
         $waitGroup->wait();
@@ -466,18 +544,25 @@ class Swoole extends Adapter
 
     protected function reap(): void
     {
+        $exited = [];
         while (($ret = Process::wait(false)) !== false) {
-            unset($this->workers[$ret['pid']]);
+            $pid = $ret['pid'];
+            if (isset($this->workerIds[$pid])) {
+                $exited[] = $this->workerIds[$pid];
+                unset($this->workers[$pid], $this->workerIds[$pid]);
+            }
+        }
+
+        if (! $this->stopped) {
+            foreach ($exited as $workerId) {
+                $this->spawnWorker($workerId);
+            }
         }
     }
 
     public function stop(): self
     {
-        // Flip the flag only — same as main. Closing consumers here races with
-        // in-flight commit/reject after the handler that called stop(), and is
-        // unnecessary to end the loop (the next receive returns and isStopped
-        // is checked). SIGTERM still closes every consumer so a blocking
-        // receive unblocks on worker shutdown.
+        // Let in-flight handlers finish before their consumers are closed.
         $this->stopped = true;
 
         foreach (array_keys($this->workers) as $pid) {

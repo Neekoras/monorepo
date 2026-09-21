@@ -126,6 +126,62 @@ $resources = ResourceIndicators::from(null, 'https://api.example.com/');
 
 `InvalidResourceException::ERROR_CODE` is `invalid_target`, matching RFC 8707.
 
+## OAuth2 rich authorization requests (RFC 9396)
+
+`AuthorizationDetails` reads a token's `authorization_details`: a JSON array of
+typed entries, each an object with a `type` and, per its type, further fields.
+`grants()` answers whether an entry of a given type lists a value in one of its
+array-valued fields — an RFC 9396 §2 common field (`locations`, `actions`,
+`datatypes`, `privileges`) or a field a type defines itself. `AuthorizationDetail`
+enumerates those common field names.
+
+The constructor accepts the raw value and keeps only list-shaped input: a value
+that is not a JSON array, or a field that is a JSON object rather than an array,
+contributes nothing, so a malformed claim cannot grant access. Value comparison
+is type-strict.
+
+RFC 9396 defines no wildcard. A profile that lets one identifier stand for every
+value passes that sentinel as `$wildcard` to opt a field into it; left out, only
+an exact value matches.
+
+```php
+<?php
+
+use Utopia\Auth\Enums\AuthorizationDetail;
+use Utopia\Auth\OAuth2\AuthorizationDetails;
+
+$details = new AuthorizationDetails([
+    ['type' => 'project', 'identifiers' => ['p1', '*'], 'actions' => ['read']],
+    ['type' => 'organization', 'identifiers' => ['t1']],
+]);
+
+$details->grants('project', 'p1', 'identifiers');                          // true (exact)
+$details->grants('project', 'anything', 'identifiers', '*');               // true (wildcard opted in)
+$details->grants('project', 'anything', 'identifiers');                    // false (no wildcard)
+$details->grants('project', 'read', AuthorizationDetail::Actions->value);  // true (RFC common field)
+$details->grants('organization', 't1', 'identifiers');                     // true
+```
+
+`restrict()` narrows a field of every entry to the values a resolver allows, so
+an issued token asserts only what the subject can reach now. The resolver gets
+an entry's `type` and the field's values and returns the allowed subset; `null`
+leaves an entry of a type it does not govern untouched, an empty result drops
+the entry. The result can only narrow the grant: a value the entry did not list
+is discarded, unless the entry lists `$wildcard`, in which case the result from
+the resolver is taken as its expansion, as with `grants()`. `toArray()` yields
+the entries for the `authorization_details` claim.
+
+```php
+<?php
+
+$issued = $granted->restrict('identifiers', fn (string $type, array $values): ?array => match ($type) {
+    'organization' => $memberships->intersect($values),
+    default => null,
+});
+
+$issued->toArray();
+```
+
 ## OAuth2 redirect URI matching (RFC 8252)
 
 `RedirectUris` wraps a client's registered redirect URIs and matches a

@@ -8,6 +8,9 @@ use Swoole\Coroutine\Channel;
 use Swoole\Coroutine\Lock;
 use Throwable;
 use Utopia\Cache\Adapter;
+use Utopia\Cache\Codec;
+use Utopia\Cache\Codec\Json;
+use Utopia\Cache\Feature\Batchable;
 use Utopia\Cache\Feature\Telemetry as TelemetryFeature;
 use Utopia\Telemetry\Adapter as Telemetry;
 use Utopia\Telemetry\Adapter\None as NoTelemetry;
@@ -22,8 +25,17 @@ use Utopia\Telemetry\UpDownCounter;
  * order of registrations exactly matches the order of bytes on the wire. A
  * single reader coroutine parses inbound frames and dispatches each one to
  * the next pending Channel, exploiting Redis's guarantee of in-order replies.
+ *
+ * The reader is spawned by the first caller that finds none running and
+ * retires once the connection has been idle for `idleGrace`. Both ends of that
+ * window matter. A coroutine parked in recv() is a reactor event, and a Swoole
+ * worker cannot exit while one remains, so a permanent reader turns every
+ * max_request recycle and reload into a max_wait_time timeout and a forced
+ * termination. A reader that retires the moment the queue drains is spawned
+ * again by the very next command, and at typical concurrency that is a
+ * coroutine per command: creating one costs more CPU than the command itself.
  */
-class Multiplexing extends Leasable implements Adapter, TelemetryFeature
+class Multiplexing extends Leasable implements Adapter, Batchable, TelemetryFeature
 {
     private ?ConnectionContext $connection = null;
 
@@ -54,6 +66,13 @@ class Multiplexing extends Leasable implements Adapter, TelemetryFeature
      *                                 server that is merely busy until enough
      *                                 time has passed. Default 5s.
      * @param  string|array<string>|null  $auth password or [username, password]
+     * @param  Codec  $codec how values are stored; Json is the wire format every release so far has written
+     * @param  float  $idleGrace how long the reader stays parked on an idle
+     *                           connection before retiring. Bounds both the
+     *                           coroutine spawn rate (at most one per grace
+     *                           per worker while traffic is steady) and how
+     *                           long a worker exit waits for the reader.
+     *                           Default 1s.
      */
     public function __construct(
         private readonly string $host,
@@ -63,7 +82,11 @@ class Multiplexing extends Leasable implements Adapter, TelemetryFeature
         private readonly string|array|null $auth = null,
         private readonly int $dbIndex = 0,
         private readonly float $livenessTimeout = 5.0,
+        Codec $codec = new Json(),
+        private readonly float $idleGrace = 1.0,
     ) {
+        parent::__construct($codec);
+
         if ($this->timeout <= 0) {
             throw new \InvalidArgumentException('timeout must be greater than 0');
         }
@@ -72,6 +95,9 @@ class Multiplexing extends Leasable implements Adapter, TelemetryFeature
         }
         if ($this->livenessTimeout < $this->readTimeout) {
             throw new \InvalidArgumentException('livenessTimeout must be greater than or equal to readTimeout');
+        }
+        if ($this->idleGrace <= 0) {
+            throw new \InvalidArgumentException('idleGrace must be greater than 0');
         }
         $this->sendLock = new Lock();
         $this->setTelemetry(new NoTelemetry());
@@ -129,10 +155,62 @@ class Multiplexing extends Leasable implements Adapter, TelemetryFeature
             return false;
         }
 
-        return Envelope::decode($value, $ttl, time());
+        return $this->envelope->decode($value, $ttl, time());
     }
 
-    public function save(string $key, array|string $data, string $hash = ''): bool|string|array
+    /**
+     * HMGET for an explicit field list, HGETALL when $fields is empty. Both come
+     * back as one RESP array reply from the multiplexed reader.
+     *
+     * @param  string[]  $fields
+     * @param  int  $ttl time in seconds
+     * @return array<string, mixed>
+     */
+    public function loadMany(string $key, array $fields, int $ttl): array
+    {
+        $now = time();
+        $pairs = [];
+
+        if ($fields === []) {
+            $flat = $this->command(['HGETALL', $key]);
+            if (! \is_array($flat)) {
+                return [];
+            }
+            // HGETALL returns a flat [field, value, field, value, …] reply.
+            $count = \count($flat);
+            for ($i = 0; $i + 1 < $count; $i += 2) {
+                $pairs[(string) $flat[$i]] = $flat[$i + 1];
+            }
+        } else {
+            $values = $this->command(['HMGET', $key, ...$fields]);
+            if (! \is_array($values)) {
+                return [];
+            }
+            // HMGET returns values positional to the requested fields (null when absent).
+            foreach (array_values($fields) as $i => $field) {
+                $pairs[$field] = $values[$i] ?? null;
+            }
+        }
+
+        $result = [];
+        foreach ($pairs as $field => $value) {
+            if (! \is_string($value)) {
+                continue;
+            }
+            if ($this->isReserved((string) $field)) {
+                continue;
+            }
+
+            $decoded = $this->envelope->decode($value, $ttl, $now);
+            if ($decoded !== false) {
+                $result[(string) $field] = $decoded;
+            }
+        }
+
+        return $result;
+    }
+
+    public function save(string $key, array|string $data, string $hash = '', int $ttl = 0): bool|string|array
     {
         if ($key === '' || $key === '0' || empty($data)) {
             return false;
@@ -146,10 +224,54 @@ class Multiplexing extends Leasable implements Adapter, TelemetryFeature
             return false;
         }
 
-        $value = Envelope::encode($data, time());
-        $this->command(['HSET', $key, $hash, $value]);
+        try {
+            $value = $this->envelope->encode($data, time());
+            $this->command(['HSET', $key, $hash, $value]);
 
-        return $data;
+            if ($ttl > 0) {
+                $this->command(['EXPIRE', $key, (string) $ttl]);
+            }
+
+            return $data;
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * One variadic HSET for every field => value pair of $data, then one EXPIRE.
+     *
+     * @param  array<string, mixed>  $data field => value
+     * @param  int  $ttl time in seconds
+     * @return array<string, mixed>|false
+     */
+    public function saveMany(string $key, array $data, int $ttl = 0): array|false
+    {
+        $args = ['HSET', $key];
+        foreach ($data as $field => $value) {
+            $field = (string) $field;
+            if ($this->isReserved($field)) {
+                continue;
+            }
+            $args[] = $field;
+            $args[] = $this->envelope->encode($value, time());
+        }
+
+        if (\count($args) <= 2) {
+            return false;
+        }
+
+        try {
+            $this->command($args);
+
+            if ($ttl > 0) {
+                $this->command(['EXPIRE', $key, (string) $ttl]);
+            }
+
+            return $data;
+        } catch (Throwable) {
+            return false;
+        }
     }
 
     public function touch(string $key, string $hash = ''): bool
@@ -167,7 +289,7 @@ class Multiplexing extends Leasable implements Adapter, TelemetryFeature
             return false;
         }
 
-        $payload = Envelope::touch($value, time());
+        $payload = $this->envelope->touch($value, time());
         if ($payload === false) {
             return false;
         }
@@ -288,10 +410,22 @@ class Multiplexing extends Leasable implements Adapter, TelemetryFeature
             $response = new Channel(1);
             $error = null;
 
+            if ($context->pending->isEmpty()) {
+                // Time spent idle with nobody waiting says nothing about
+                // liveness; the clock starts when this caller begins to wait.
+                $context->recordProgress();
+            }
             $context->pending->enqueue($response);
             $this->getPendingDepth()->add(1);
+            // Claimed under the send lock, so a reader deciding to retire at
+            // the same moment sees this slot and stays instead.
+            $spawn = ! $context->reading;
+            $context->reading = true;
             try {
                 $context->client->send(Client::encode($args));
+                if ($spawn) {
+                    $this->startReader($context);
+                }
             } catch (ConnectionException $sendError) {
                 $error = $sendError;
             }
@@ -393,12 +527,35 @@ class Multiplexing extends Leasable implements Adapter, TelemetryFeature
 
         /** @var SplQueue<Channel<mixed>> $pending */
         $pending = new SplQueue();
-        $context = new ConnectionContext($client, $pending);
-        $this->connection = $context;
+        $this->connection = new ConnectionContext($client, $pending);
+    }
 
+    private function startReader(ConnectionContext $context): void
+    {
         Coroutine::create(function () use ($context): void {
             $this->readerLoop($context);
         });
+    }
+
+    /**
+     * Whether a reader parked on an idle connection may return. Decided under
+     * the send lock, because the alternative is a caller that enqueued after
+     * the reader checked and, seeing the reader flag still set, never spawns a
+     * replacement: its reply would then have nobody to read it.
+     */
+    private function retire(ConnectionContext $context): bool
+    {
+        $locked = $this->lockSend();
+        try {
+            if (! $context->pending->isEmpty()) {
+                return false;
+            }
+            $context->reading = false;
+
+            return true;
+        } finally {
+            $this->unlockSend($locked);
+        }
     }
 
     private function shutdown(): void
@@ -517,7 +674,19 @@ class Multiplexing extends Leasable implements Adapter, TelemetryFeature
                 }
             }
 
-            $chunk = $context->client->recv(-1);
+            // With replies outstanding the reader has no deadline of its own;
+            // liveness is the callers' verdict (see awaitResponse). Idle, it
+            // waits out the grace so the next command finds it still here, and
+            // only then asks whether it may go.
+            $idle = $readBuffer === '' && $context->pending->isEmpty();
+            $chunk = $context->client->recv($idle ? $this->idleGrace : -1);
+            if ($chunk === false && $idle && $context->client->timedOut()) {
+                if ($this->retire($context)) {
+                    return;
+                }
+
+                continue;
+            }
             if (\is_string($chunk) && $chunk !== '') {
                 // Bytes arriving is progress even before they complete a frame,
                 // so a large reply streaming in slowly is not mistaken for a dead

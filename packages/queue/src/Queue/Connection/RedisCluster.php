@@ -11,7 +11,7 @@ class RedisCluster implements Connection
     protected const int CONNECT_MAX_BACKOFF_MS = 3_000;
     protected ?\RedisCluster $redis = null;
 
-    public function __construct(protected array $seeds, protected float $connectTimeout = -1, protected float $readTimeout = -1) {}
+    public function __construct(protected array $seeds, protected float $connectTimeout = -1, protected float $readTimeout = -1, protected ?string $user = null, protected ?string $password = null) {}
 
     public function rightPopLeftPushArray(string $queue, string $destination, int $timeout): array|false
     {
@@ -94,6 +94,24 @@ class RedisCluster implements Connection
         return $response[1];
     }
 
+    public function rightPopMany(string $queue, int $count, int $timeout): array
+    {
+        if ($count < 1) {
+            return [];
+        }
+
+        // BLMPOP over a single key, so the cluster routes it by that key like
+        // any other list command; the numkeys > 1 form is what would need every
+        // key in one slot, and this never uses it.
+        $response = $this->getRedis()->blmpop((float) $timeout, [$queue], 'RIGHT', $count);
+
+        if (!\is_array($response) || !\is_array($response[1] ?? null)) {
+            return [];
+        }
+
+        return array_values(array_filter($response[1], \is_string(...)));
+    }
+
     public function leftPopArray(string $queue, int $timeout): array|false
     {
         $response = $this->getRedis()->blPop([$queue], $timeout);
@@ -154,6 +172,11 @@ class RedisCluster implements Connection
         return $this->getRedis()->incr($key);
     }
 
+    public function incrementBy(string $key, int $by): int
+    {
+        return $this->getRedis()->incrBy($key, $by);
+    }
+
     public function decrement(string $key): int
     {
         return $this->getRedis()->decr($key);
@@ -201,7 +224,12 @@ class RedisCluster implements Connection
 
         for ($attempt = 1; $attempt <= self::CONNECT_MAX_ATTEMPTS; $attempt++) {
             try {
-                $this->redis = new \RedisCluster(null, $this->seeds, $connectTimeout, $readTimeout);
+                $auth = match (true) {
+                    $this->password === null || $this->password === '' => null,
+                    $this->user !== null && $this->user !== '' => [$this->user, $this->password],
+                    default => $this->password,
+                };
+                $this->redis = new \RedisCluster(null, $this->seeds, $connectTimeout, $readTimeout, false, $auth);
                 return $this->redis;
             } catch (\RedisClusterException $e) {
                 if ($attempt === self::CONNECT_MAX_ATTEMPTS) {

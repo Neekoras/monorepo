@@ -6,8 +6,12 @@ namespace Tests\E2E\Adapter;
 
 use PHPUnit\Framework\TestCase;
 use Utopia\NATS\Connection;
+use Utopia\NATS\JetStream\DiscardPolicy;
 use Utopia\NATS\JetStream\StorageType;
+use Utopia\Queue\Adapter\Swoole;
 use Utopia\Queue\Broker\Nats;
+use Utopia\Queue\Broker\Provisioning;
+use Utopia\Queue\Codec\Igbinary;
 use Utopia\Queue\Message;
 use Utopia\Queue\Queue;
 
@@ -108,6 +112,64 @@ final class NatsBrokerTest extends TestCase
         $this->assertInstanceOf(Message::class, $recovered);
         $this->assertSame('doomed', $recovered->getPayload()['task']);
         $this->broker->commit($this->queue, $recovered);
+    }
+
+    public function testATerminalMessageIsDeadLetteredOnTheFirstFailure(): void
+    {
+        $this->broker->publish($this->queue, ['task' => 'doomed']);
+
+        $message = $this->broker->receive($this->queue, 2);
+        $this->assertInstanceOf(Message::class, $message);
+
+        // maxDeliver is 3 here: without the verdict this reject schedules attempt
+        // two, and the message keeps its in-flight slot through every attempt.
+        $this->broker->reject($this->queue, $message->terminal());
+
+        $this->assertSame(1, $this->broker->getQueueSize($this->queue, true), 'message should be on the dead stream');
+        $this->assertSame(0, $this->broker->getQueueSize($this->queue), 'work queue should be empty');
+
+        // TERM, not NAK: nothing is redelivered on the ackWait deadline either.
+        sleep(3);
+        $this->assertNotInstanceOf(\Utopia\Queue\Message::class, $this->broker->receive($this->queue, 2));
+
+        // Still re-drivable: ending the attempt early must not lose the work.
+        $this->broker->retry($this->queue, 10);
+        $recovered = $this->broker->receive($this->queue, 2);
+        $this->assertInstanceOf(Message::class, $recovered);
+        $this->assertSame('doomed', $recovered->getPayload()['task']);
+        $this->broker->commit($this->queue, $recovered);
+    }
+
+    public function testATerminalMessageFreesItsInFlightSlotForTheNextOne(): void
+    {
+        // One slot, so the queue can only move if the rejected message gives it
+        // back. A NAK holds it until the backoff expires; a TERM returns it now.
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $broker = new Nats(
+            Connection::connect($url),
+            ackWait: 30.0,
+            maxDeliver: 5,
+            backoff: [30.0, 60.0],
+            maxAckPending: 1,
+        );
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        try {
+            $broker->publish($queue, ['task' => 'poison']);
+            $broker->publish($queue, ['task' => 'good']);
+
+            $poison = $broker->receive($queue, 2);
+            $this->assertInstanceOf(Message::class, $poison);
+            $this->assertSame('poison', $poison->getPayload()['task']);
+            $broker->reject($queue, $poison->terminal());
+
+            $good = $broker->receive($queue, 3);
+            $this->assertInstanceOf(Message::class, $good, 'the slot must come back before the backoff expires');
+            $this->assertSame('good', $good->getPayload()['task']);
+            $broker->commit($queue, $good);
+        } finally {
+            $broker->close();
+        }
     }
 
     public function testUncommittedMessageIsRedeliveredAfterAckWait(): void
@@ -216,6 +278,46 @@ final class NatsBrokerTest extends TestCase
         $this->assertContains('q.' . strtolower($name) . '.priority', $info->config->subjects);
     }
 
+    /**
+     * A consumer switching formats reads the header, not the bytes: it says
+     * which codec wrote the payload without anyone having to sniff it, and it
+     * has to be on both publish paths, since enqueueMany() builds its own
+     * message array rather than going through publish().
+     */
+    public function testPublishedMessagesCarryTheCodecsContentType(): void
+    {
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $js = Connection::connect($url)->jetStream();
+
+        $single = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+        $this->broker->publish($single, ['task' => 'a']);
+
+        $stored = $js->getLastMessage('Q_' . strtoupper($single->name), 'q.' . strtolower($single->name) . '.normal');
+        $this->assertSame('application/json', $stored->headers?->get('Content-Type'));
+        $this->assertSame('a', json_decode($stored->data, true)['payload']['task']);
+
+        $many = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+        $this->broker->enqueueMany($many, [['task' => 'b'], ['task' => 'c']]);
+
+        $stored = $js->getLastMessage('Q_' . strtoupper($many->name), 'q.' . strtolower($many->name) . '.normal');
+        $this->assertSame('application/json', $stored->headers?->get('Content-Type'));
+        // The batch writes one Headers per message; a shared one would carry the
+        // first message's Nats-Msg-Id onto every later message and collapse them.
+        $this->assertSame(2, $this->broker->getQueueSize($many));
+
+        if (!\function_exists('igbinary_serialize')) {
+            return;
+        }
+
+        $binary = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+        $broker = new Nats(Connection::connect($url), codec: new Igbinary());
+        $broker->publish($binary, ['task' => 'd']);
+
+        $stored = $js->getLastMessage('Q_' . strtoupper($binary->name), 'q.' . strtolower($binary->name) . '.normal');
+        $this->assertSame('application/vnd.php.igbinary', $stored->headers?->get('Content-Type'));
+        $broker->close();
+    }
+
     public function testCollidingQueueNamesFailLoud(): void
     {
         // Dropping the namespace means two names that sanitise to the same stream would
@@ -320,8 +422,9 @@ final class NatsBrokerTest extends TestCase
     public function testGetQueueSizeIsSafeDuringConcurrentReceive(): void
     {
         $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
-        // Closure factory: each broker owns its consume connection AND opens a distinct
-        // control connection — the isolation getQueueSize relies on under coroutines.
+        // Closure factory: the broker opens a receive connection for the consume loop
+        // and a lock-guarded commands connection, which is what carries the depth read
+        // safely while the loop is mid-fetch.
         $broker = new Nats(fn(): Connection => Connection::connect($url), ackWait: 2.0, maxDeliver: 3);
         $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
 
@@ -428,6 +531,124 @@ final class NatsBrokerTest extends TestCase
      * second one — a duplicate nothing could detect, on a queue that may be
      * billing someone.
      */
+    public function testReceiveBatchClaimsSeveralMessagesInOneCall(): void
+    {
+        for ($i = 0; $i < 20; $i++) {
+            $this->broker->publish($this->queue, ['task' => "job-{$i}"]);
+        }
+
+        $batch = $this->broker->receiveBatch($this->queue, 2, 8);
+
+        $this->assertCount(8, $batch);
+        $this->assertSame(
+            array_map(static fn(int $i): string => "job-{$i}", range(0, 7)),
+            array_map(static fn(Message $message): string => $message->getPayload()['task'], $batch),
+        );
+
+        // Each one is a delivery of its own, owed its own acknowledgment.
+        foreach ($batch as $message) {
+            $this->broker->commit($this->queue, $message);
+        }
+
+        $this->assertCount(12, $this->broker->receiveBatch($this->queue, 2, 32));
+    }
+
+    /**
+     * The trap this whole path is shaped around.
+     *
+     * JetStream's fetch(N, timeout) does not answer as soon as it has
+     * something: it collects until the batch fills or the deadline passes. A
+     * receive that asked for its whole batch up front would therefore make
+     * every message on a queue that is not busy wait the full receive timeout —
+     * batching would have made a sparse queue slower, by a lot. Measured at
+     * 1.9s against this same assertion before the fix.
+     */
+    public function testALoneMessageDoesNotWaitForTheBatchToFill(): void
+    {
+        $this->broker->publish($this->queue, ['task' => 'only-one']);
+
+        $started = microtime(true);
+        $batch = $this->broker->receiveBatch($this->queue, 2, 16);
+        $elapsed = microtime(true) - $started;
+
+        $this->assertCount(1, $batch);
+        $this->assertLessThan(
+            0.5,
+            $elapsed,
+            'asking for 16 and getting 1 must not cost the receive timeout',
+        );
+    }
+
+    public function testAnEmptyQueueCostsTheTimeoutOnceRatherThanPerMessage(): void
+    {
+        $started = microtime(true);
+        $batch = $this->broker->receiveBatch($this->queue, 1, 16);
+        $elapsed = microtime(true) - $started;
+
+        $this->assertSame([], $batch);
+        $this->assertLessThan(2.0, $elapsed, 'one timeout for the call, not one per message asked for');
+    }
+
+    public function testEnqueueManyStoresEveryPayloadInOrder(): void
+    {
+        $payloads = [];
+        for ($i = 0; $i < 40; $i++) {
+            $payloads[] = ['task' => "job-{$i}"];
+        }
+
+        $this->assertTrue($this->broker->enqueueMany($this->queue, $payloads));
+        $this->assertSame(40, $this->broker->getQueueSize($this->queue));
+
+        // The batch is written before any acknowledgment is read, so this also
+        // asserts the writes reached the stream in the order they were given.
+        for ($i = 0; $i < 40; $i++) {
+            $message = $this->broker->receive($this->queue, 2);
+            $this->assertInstanceOf(Message::class, $message);
+            $this->assertSame("job-{$i}", $message->getPayload()['task']);
+            $this->broker->commit($this->queue, $message);
+        }
+
+        $this->assertSame(0, $this->broker->getQueueSize($this->queue));
+    }
+
+    public function testEnqueueManyUnderStableIdsCollapsesTheRepublish(): void
+    {
+        $broker = $this->brokerWithStableIds();
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        $payloads = [
+            ['id' => 'invoice-1', 'task' => 'charge'],
+            ['id' => 'invoice-2', 'task' => 'charge'],
+        ];
+
+        $broker->enqueueMany($queue, $payloads);
+        $this->assertSame(2, $broker->getQueueSize($queue));
+        $this->assertSame(0, $broker->duplicates());
+
+        // The retry a caller makes after an ambiguous timeout on the batch.
+        $broker->enqueueMany($queue, $payloads);
+        $this->assertSame(2, $broker->getQueueSize($queue), 'a retried batch must not become four messages');
+        $this->assertSame(2, $broker->duplicates(), 'the collapsed publishes must be counted, not discarded');
+
+        $broker->close();
+    }
+
+    public function testEnqueueManyHonoursThePriorityFlag(): void
+    {
+        $this->broker->enqueueMany($this->queue, [['task' => 'normal']]);
+        $this->broker->enqueueMany($this->queue, [['task' => 'urgent']], priority: true);
+
+        $message = $this->broker->receive($this->queue, 2);
+        $this->assertInstanceOf(Message::class, $message);
+        $this->assertSame('urgent', $message->getPayload()['task']);
+    }
+
+    public function testEnqueueManyStoresNothingForAnEmptyBatch(): void
+    {
+        $this->assertTrue($this->broker->enqueueMany($this->queue, []));
+        $this->assertSame(0, $this->broker->getQueueSize($this->queue));
+    }
+
     public function testRetriedEnqueueUnderAStableIdStoresOneMessage(): void
     {
         $broker = $this->brokerWithStableIds();
@@ -595,8 +816,43 @@ final class NatsBrokerTest extends TestCase
 
         foreach ($subscriptions as $subscription) {
             $this->assertNotNull($subscription->queue, 'the advisory subscription must join a queue group');
-            $this->assertStringContainsString('$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES', $subscription->subject);
+            $this->assertStringContainsString('$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES', (string) $subscription->subject);
         }
+    }
+
+    public function testAnAckThatFailsDoesNotPinTheMessageInFlight(): void
+    {
+        // commit() acked and then dropped the message from the in-flight map, so
+        // an ack that threw left the entry behind -- and runPhases() does not
+        // reject() after a commit failure, so nothing else ever cleared it. One
+        // pinned JetStreamMessage per failed ack, for the life of the worker.
+        $this->broker->publish($this->queue, ['task' => 'a']);
+
+        $message = $this->broker->receive($this->queue, 2);
+        $this->assertInstanceOf(Message::class, $message);
+
+        $inFlight = new \ReflectionProperty(Nats::class, 'inFlight');
+        $this->assertArrayHasKey($message->getPid(), $inFlight->getValue($this->broker));
+
+        // Closing the connection under the ack is the cheapest stand-in for the
+        // transient failure this guards: ackSync() is a request-reply, so it
+        // raises rather than returning a verdict.
+        $connection = new \ReflectionProperty(Nats::class, 'connection');
+        $connection->getValue($this->broker)->close();
+
+        try {
+            $this->broker->commit($this->queue, $message);
+            $this->fail('the ack must fail on a closed connection');
+        } catch (\Throwable) {
+            // The throw is the point: runPhases() reports it rather than
+            // rejecting work that already happened.
+        }
+
+        $this->assertArrayNotHasKey(
+            $message->getPid(),
+            $inFlight->getValue($this->broker),
+            'a message whose ack failed must not stay in the in-flight map',
+        );
     }
 
     public function testReceiveExposesTheStreamSequence(): void
@@ -681,5 +937,320 @@ final class NatsBrokerTest extends TestCase
         $broker->commit($queue, $message);
         $this->assertSame(0, $broker->getQueueSize($queue));
         $broker->close();
+    }
+
+    /**
+     * The point of the two-connection split: an ack must not wait for a parked fetch.
+     *
+     * The consume loop holds the receive connection for the whole receive timeout, so
+     * on a single shared socket a handler acknowledging in that window either crashed
+     * the worker (before any lock) or queued behind the fetch for its full duration.
+     * Acks ride the commands connection instead, so this is a round trip rather than a
+     * wait: the threshold is well under the 3s fetch it runs against, and generous
+     * enough not to turn CI scheduling noise into a failure.
+     */
+    public function testAnAckDoesNotWaitForAParkedFetch(): void
+    {
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $broker = new Nats(fn(): Connection => Connection::connect($url), maxDeliver: 3);
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        $ackSeconds = null;
+        $fetchSeconds = null;
+        $depth = null;
+        $error = null;
+
+        // Every call on this broker stays inside the coroutine context, including the
+        // depth read: the commands connection is opened by the first acknowledgment, so
+        // reading it after Coroutine\run() has returned would touch a socket whose
+        // coroutine no longer exists.
+        \Swoole\Coroutine\run(function () use ($broker, $queue, &$ackSeconds, &$fetchSeconds, &$depth, &$error): void {
+            $broker->publish($queue, ['task' => 'first']);
+
+            // Take the only message, so the fetch below has nothing to return and
+            // parks for its whole timeout.
+            $message = $broker->receive($queue, 2);
+            if (!$message instanceof Message) {
+                $error ??= new \RuntimeException('the published message was not delivered');
+
+                return;
+            }
+
+            $wg = new \Swoole\Coroutine\WaitGroup();
+
+            $wg->add();
+            \Swoole\Coroutine::create(function () use ($broker, $queue, $wg, &$fetchSeconds, &$error): void {
+                $started = microtime(true);
+                try {
+                    $broker->receive($queue, 3);
+                } catch (\Throwable $e) {
+                    $error ??= $e;
+                }
+                $fetchSeconds = microtime(true) - $started;
+                $wg->done();
+            });
+
+            $wg->add();
+            \Swoole\Coroutine::create(function () use ($broker, $queue, $message, $wg, &$ackSeconds, &$error): void {
+                \Swoole\Coroutine::sleep(0.3); // let the fetch above park first
+
+                $started = microtime(true);
+                try {
+                    $broker->commit($queue, $message);
+                } catch (\Throwable $e) {
+                    $error ??= $e;
+                }
+                $ackSeconds = microtime(true) - $started;
+
+                $wg->done();
+            });
+
+            $wg->wait();
+
+            $depth = $broker->getQueueSize($queue);
+        });
+
+        $broker->close();
+
+        $this->assertNotInstanceOf(\Throwable::class, $error, 'the ack collided with the fetch: ' . ($error?->getMessage() ?? ''));
+
+        // Without this the test could pass for the wrong reason: an ack that happened to
+        // run before the fetch parked was never contended, so its latency proves nothing.
+        // The queue is empty, so a fetch that really parked returns only on its timeout.
+        $this->assertNotNull($fetchSeconds, 'the fetch never ran');
+        $this->assertGreaterThan(
+            2.0,
+            $fetchSeconds,
+            'the fetch returned early, so the ack was never raised against a parked one',
+        );
+
+        $this->assertNotNull($ackSeconds, 'the ack never ran');
+        $this->assertLessThan(
+            1.0,
+            $ackSeconds,
+            'the ack waited for the parked fetch, so it is still sharing the receive connection',
+        );
+        $this->assertSame(0, $depth, 'the ack must have landed');
+    }
+
+    /**
+     * The overlap that used to end the worker, driven through the real consume loop.
+     *
+     * Above one coroutine the loop is parked in a fetch on the connection while the
+     * handlers that are still running acknowledge earlier messages on that same
+     * socket, and Swoole refuses it outright -- "Socket#N has already been bound to
+     * another coroutine". One coroutine drained the batch; two died on the first
+     * message. The connection lock serialises the two, so the batch drains with the
+     * handlers genuinely overlapping.
+     */
+    public function testConcurrentHandlersDrainTheQueueOnOneConnection(): void
+    {
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $broker = new Nats(fn(): Connection => Connection::connect($url), maxDeliver: 3);
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        $total = 15;
+        $cap = 3;
+
+        $handled = 0;
+        $active = 0;
+        $overlap = 0;
+        $depth = null;
+        $failure = null;
+        $timedOut = false;
+
+        // Depth is read inside the coroutine for the same reason as the test above: the
+        // commands connection belongs to the coroutine that first acknowledged on it.
+        \Swoole\Coroutine\run(function () use ($broker, $queue, $total, $cap, &$handled, &$active, &$overlap, &$depth, &$failure, &$timedOut): void {
+            for ($n = 0; $n < $total; $n++) {
+                $broker->publish($queue, ['n' => $n]);
+            }
+
+            $adapter = new Swoole($broker, 1, $queue->namespace);
+
+            // The loop only stops itself once every message is handled, and neither a
+            // receive failure nor a handler failure ends it. The regression under test
+            // is a dead worker, and an unreachable server looks the same from in here,
+            // so both need a way out or this waits forever instead of reporting.
+            $finished = new \Swoole\Coroutine\Channel(1);
+            \Swoole\Coroutine::create(function () use ($adapter, $finished, &$timedOut): void {
+                if ($finished->pop(30.0) === false) {
+                    $timedOut = true;
+                    $adapter->stop();
+                }
+            });
+
+            $adapter->consume(
+                function () use ($adapter, $total, &$handled, &$active, &$overlap): void {
+                    $overlap = max($overlap, ++$active);
+
+                    // Stay in the handler long enough that the loop is back in a
+                    // fetch when this commits: that is the interleaving that used
+                    // to take the worker down.
+                    \Swoole\Coroutine::sleep(0.1);
+                    --$active;
+
+                    if (++$handled === $total) {
+                        $adapter->stop();
+                    }
+                },
+                fn(): null => null,
+                function (?Message $message, \Throwable $error) use ($adapter, &$failure): void {
+                    $failure ??= $error;
+                    $adapter->stop();
+                },
+                [
+                    ['queue' => $queue, 'maxCoroutines' => $cap],
+                ],
+            );
+
+            $finished->push(true);
+
+            $depth = $broker->getQueueSize($queue);
+        });
+
+        $broker->close();
+
+        $this->assertNotInstanceOf(\Throwable::class, $failure, 'the consume loop failed: ' . ($failure?->getMessage() ?? ''));
+        $this->assertFalse($timedOut, 'the consume loop had to be stopped by the watchdog');
+        $this->assertSame($total, $handled, 'every message must be handled');
+        $this->assertGreaterThan(1, $overlap, 'the handlers must have actually overlapped');
+        $this->assertLessThanOrEqual($cap, $overlap, 'concurrency stays bounded by maxCoroutines');
+        $this->assertSame(0, $depth, 'every message must be acknowledged');
+    }
+
+    public function testSizeKnobsLandOnTheWorkStream(): void
+    {
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $broker = new Nats(
+            Connection::connect($url),
+            maxMsgSize: 262_144,
+            maxMsgs: 1_000,
+            maxBytes: 1_048_576,
+            discard: DiscardPolicy::New,
+        );
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        $broker->publish($queue, ['task' => 'sized']);
+
+        $js = Connection::connect($url)->jetStream();
+        $work = $js->getStreamInfo('Q_' . strtoupper($queue->name))->config;
+        $this->assertSame(1_000, $work->maxMsgs);
+        $this->assertSame(1_048_576, $work->maxBytes);
+        $this->assertSame(262_144, $work->maxMsgSize);
+        $this->assertSame(DiscardPolicy::New, $work->discard);
+
+        // maxMsgSize is mirrored so an accepted message can always be dead-lettered;
+        // the capacity limits are the work stream's backpressure and stay there.
+        $dead = $js->getStreamInfo('Q_' . strtoupper($queue->name) . '_DEAD')->config;
+        $this->assertSame(262_144, $dead->maxMsgSize);
+        $this->assertSame(-1, $dead->maxMsgs);
+        $this->assertSame(-1, $dead->maxBytes);
+
+        $broker->close();
+    }
+
+    public function testInFlightKnobsLandOnBothWorkerConsumers(): void
+    {
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $broker = new Nats(
+            Connection::connect($url),
+            maxAckPending: 8,
+            maxWaiting: 16,
+            inactiveThreshold: 3_600.0,
+        );
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        $broker->publish($queue, ['task' => 'inflight']);
+
+        $js = Connection::connect($url)->jetStream();
+        $stream = 'Q_' . strtoupper($queue->name);
+        foreach (['worker', 'worker_priority'] as $durable) {
+            $config = $js->getConsumer($stream, $durable)->info(true)->config;
+            $this->assertSame(8, $config->maxAckPending, "{$durable} must carry maxAckPending");
+            $this->assertSame(16, $config->maxWaiting, "{$durable} must carry maxWaiting");
+            $this->assertEqualsWithDelta(3_600.0, $config->inactiveThreshold, PHP_FLOAT_EPSILON, "{$durable} must carry inactiveThreshold");
+        }
+
+        $broker->close();
+    }
+
+    public function testExplicitMaxAgeOverridesTheQueuesJobTtl(): void
+    {
+        // The jobTtl derivation is per-queue-object, so producer and consumer agree
+        // only by convention; an explicit maxAge is the value both sides read.
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $broker = new Nats(Connection::connect($url), maxAge: 60.0);
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8), 'utopia-queue', 3_600);
+
+        $broker->publish($queue, ['task' => 'ttl']);
+
+        $config = Connection::connect($url)->jetStream()
+            ->getStreamInfo('Q_' . strtoupper($queue->name))->config;
+        $this->assertEqualsWithDelta(60.0, $config->maxAge, PHP_FLOAT_EPSILON);
+
+        $broker->close();
+    }
+
+    public function testRequireRefusesAQueueNobodyHasProvisioned(): void
+    {
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $broker = new Nats(Connection::connect($url), provisioning: Provisioning::Require);
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        try {
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessageMatches('/is not provisioned/');
+            $broker->publish($queue, ['task' => 'orphan']);
+        } finally {
+            $broker->close();
+        }
+    }
+
+    public function testRequireLeavesStreamAndConsumerConfigUntouched(): void
+    {
+        // The defect this mode closes: a maintenance broker carrying different knobs
+        // rewrote the fleet's streams and consumers just by re-driving dead letters.
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $owner = new Nats(Connection::connect($url), ackWait: 2.0, maxDeliver: 2, replicas: 1, deadMaxAge: 604_800.0);
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        // Dead-letter one message, so retry() below has something to move.
+        $owner->publish($queue, ['task' => 'doomed']);
+        for ($i = 0; $i < 2; $i++) {
+            $message = $owner->receive($queue, 3);
+            $this->assertInstanceOf(Message::class, $message);
+            $owner->reject($queue, $message);
+        }
+        $this->assertSame(1, $owner->getQueueSize($queue, true), 'message should be dead-lettered');
+
+        $js = Connection::connect($url)->jetStream();
+        $stream = 'Q_' . strtoupper($queue->name);
+        $snapshot = static fn(): array => [
+            'work' => $js->getStreamInfo($stream)->config->toArray(),
+            'dead' => $js->getStreamInfo($stream . '_DEAD')->config->toArray(),
+            'normal' => $js->getConsumer($stream, 'worker')->info(true)->config->toArray(),
+            'priority' => $js->getConsumer($stream, 'worker_priority')->info(true)->config->toArray(),
+        ];
+        $before = $snapshot();
+
+        // Every knob differs from the owner's, which is what made this destructive.
+        $maintenance = new Nats(
+            Connection::connect($url),
+            ackWait: 45.0,
+            maxDeliver: 9,
+            replicas: 1,
+            deadMaxAge: 86_400.0,
+            maxAckPending: 3,
+            provisioning: Provisioning::Require,
+        );
+        $maintenance->retry($queue);
+
+        $this->assertSame($before, $snapshot(), 'a Require broker must not rewrite any of the queue\'s configuration');
+        $this->assertSame(0, $maintenance->getQueueSize($queue, true), 'the dead letter should have been re-driven');
+        $this->assertSame(1, $maintenance->getQueueSize($queue), 'the message should be back on the work queue');
+
+        $maintenance->close();
+        $owner->close();
     }
 }

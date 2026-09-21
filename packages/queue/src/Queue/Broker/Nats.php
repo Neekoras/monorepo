@@ -4,17 +4,26 @@ declare(strict_types=1);
 
 namespace Utopia\Queue\Broker;
 
+use Utopia\Lock\Mutex;
 use Utopia\NATS\Connection as NatsConnection;
 use Utopia\NATS\Exception\JetStreamException;
+use Utopia\NATS\Exception\TimeoutException;
+use Utopia\NATS\Headers;
 use Utopia\NATS\JetStream\AckPolicy;
 use Utopia\NATS\JetStream\Consumer as NatsConsumer;
 use Utopia\NATS\JetStream\ConsumerConfig;
+use Utopia\NATS\JetStream\DiscardPolicy;
 use Utopia\NATS\JetStream\JetStream;
 use Utopia\NATS\JetStream\JetStreamMessage;
+use Utopia\NATS\JetStream\PubAck;
 use Utopia\NATS\JetStream\RetentionPolicy;
 use Utopia\NATS\JetStream\StorageType;
 use Utopia\NATS\JetStream\StreamConfig;
+use Utopia\Queue\Codec;
+use Utopia\Queue\Codec\Json;
 use Utopia\Queue\Consumer;
+use Utopia\Queue\Consumer\Batched;
+use Utopia\Queue\Consumer\Bounded;
 use Utopia\Queue\Message;
 use Utopia\Queue\Publisher\Synchronous;
 use Utopia\Queue\Queue;
@@ -33,8 +42,38 @@ use Utopia\Queue\Queue;
  * per-account/cluster concern), so run one queue namespace per NATS account. Two
  * queues that map to the same stream — a duplicate name across namespaces, or names
  * that sanitize alike — are rejected loudly by ensure() rather than silently shared.
+ *
+ * One NATS connection is one socket behind one shared read pump, and driving it from
+ * two coroutines at once does not degrade — Swoole ends the worker on the first
+ * overlap:
+ *
+ *     Swoole\Error: Socket#5 has already been bound to another coroutine#2,
+ *     reading of the same socket in coroutine#3 at the same time is not allowed
+ *
+ * So the broker is wired the way Broker\Redis is: a connection dedicated to the
+ * blocking receive, and a second, lock-guarded connection carrying the commands.
+ *
+ *   receive connection  — fetch, provisioning, the dead-letter advisory, publishing.
+ *     Driven by the consume loop, behind {@see self::synchronize()}. The fetch parks
+ *     here for the whole receive timeout, and nothing on the hot path waits for it.
+ *   commands connection — commit, reject, extend, getQueueSize. Driven by the handler
+ *     and telemetry coroutines, behind {@see self::command()}. A JetStream ack is just
+ *     a message published to the delivery's reply subject, so it does not have to
+ *     leave on the connection that fetched it; rebinding it (see onCommands()) is what
+ *     moves the per-message ack path off the receive socket entirely.
+ *
+ * The two locks are never nested, so they cannot deadlock, and each connection has
+ * exactly one lock — a broker built from a live Connection serves both roles from one
+ * socket and therefore shares one lock, which is the whole reason $commandsLock is
+ * resolved from the source's shape rather than always constructed.
+ *
+ * Together this is what lets a NATS worker run job('…', N) above one, so the broker no
+ * longer carries Consumer\Exclusive. Publishing stays on the receive connection: a
+ * publisher-only broker has no consume loop to contend with, and a consumer does not
+ * publish. Its commands connection is opened lazily on the first ack, so a publisher
+ * never pays for a socket it will not use.
  */
-class Nats implements Synchronous, Consumer
+class Nats implements Synchronous, Consumer, Batched, Bounded
 {
     // Wire-level identifiers (stream/subject naming, durable consumers, advisories).
     private const string STREAM_PREFIX = 'Q_';
@@ -46,6 +85,7 @@ class Nats implements Synchronous, Consumer
     private const string CONSUMER_NORMAL = 'worker';
     private const string CONSUMER_PRIORITY = 'worker_priority';
     private const string CONSUMER_RETRY = 'retry';
+    private const string CONTENT_TYPE = 'Content-Type';
     private const string ADVISORY_MAX_DELIVERIES = '$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES';
 
     // Queue group for the advisory subscription, so one worker per queue acts
@@ -56,6 +96,18 @@ class Nats implements Synchronous, Consumer
     // which queue identity owns a stream (the cross-instance collision guard).
     private const int MAX_STREAM_NAME = 255;
     private const string METADATA_IDENTITY = 'utopia_queue_identity';
+
+    // Retry budget for first-time provisioning of a replicated stream. The window
+    // doubles per attempt because a fixed one re-synchronises the losers: every process
+    // that lost the first race waits the same interval and collides again. See ensure().
+    private const int PROVISION_ATTEMPTS = 5;
+    private const int PROVISION_BACKOFF_US = 500_000;
+
+    /**
+     * Wait forever to get onto the connection. A command must never be dropped
+     * because the socket is momentarily busy — matching Connection\Locking.
+     */
+    private const float ACQUIRE_TIMEOUT = -1;
 
     /** @var array<string, bool> queues whose streams/consumers have been provisioned */
     private array $provisioned = [];
@@ -75,26 +127,54 @@ class Nats implements Synchronous, Consumer
     private ?NatsConnection $connection = null;
     private ?JetStream $js = null;
 
-    // A second connection reserved for passive management reads (getQueueSize). Those
-    // run from the telemetry/health coroutine, NOT the consume coroutine, and a NATS
-    // socket cannot be read by two coroutines at once — Swoole aborts the process with
-    // "Socket#N has already been bound to another coroutine". Keeping these reads off the
-    // consume connection is the fix; see controlConnection().
-    private ?NatsConnection $controlConnection = null;
-    private ?JetStream $controlJs = null;
-
-    /** @var array<string, array<string, NatsConsumer>> control-connection consumer handles, [stream][durable] */
-    private array $controlConsumers = [];
+    // The commands connection: every per-message acknowledgment (commit/reject/extend)
+    // rides this socket instead of the one the consume loop is parked in. This is the
+    // shape Broker\Redis is wired in -- a blocking receive connection plus a
+    // lock-guarded commands connection -- and it is what keeps an ack from waiting on
+    // a fetch. See commandsConnection().
+    private ?NatsConnection $commandsConnection = null;
+    private ?JetStream $commandsJs = null;
 
     /**
-     * A NATS Connection is single-owner (one socket, one shared read pump), so it is
-     * NOT safe to share across concurrent coroutines. Pass a Closure factory rather
-     * than a live Connection when the consumer forks or reconnects per worker (each
-     * worker resolves its own connection), and run at most one message at a time per
-     * connection (e.g. `job('…', 1)`) or lease one connection
-     * per coroutine from a pool.
+     * Guards the receive connection: fetch, provisioning and publishing.
      *
-     * commit()/reject() correlate the JetStream acknowledgement to a message through an
+     * Deliberately a Mutex and not the Lock interface. The invariant is "one coroutine
+     * at a time on this process's socket", which is inherently in-process -- a
+     * distributed lock would guard nothing -- and the interface's acquire timeout is
+     * not honoured consistently across its implementations: Mutex reads a negative
+     * timeout as "wait forever" as the interface documents, while File and Distributed
+     * treat any non-positive timeout as one immediate attempt. Accepting either would
+     * turn contention into a Contention exception instead of serialising the socket,
+     * which is the inverse of the guarantee, so the type rules them out.
+     */
+    private readonly Mutex $lock;
+
+    /**
+     * Guards the commands connection.
+     *
+     * A broker built from a live Connection has one socket serving both roles, so it
+     * shares the receive lock: two locks over one socket would let two coroutines onto
+     * it, which is the crash this whole design exists to stop. Resolved once, at
+     * construction, because the source's shape is known there.
+     */
+    private readonly Mutex $commandsLock;
+
+    /** @var list<\Throwable> failures owed to $onError, handed over off the lock */
+    private array $deferred = [];
+
+    /** @var array<string, array<string, NatsConsumer>> commands-connection consumer handles, [stream][durable] */
+    private array $commandsConsumers = [];
+
+    /**
+     * A NATS Connection is one socket behind one shared read pump, so it cannot be
+     * driven by two coroutines at once. This broker serialises its own use of it
+     * behind $lock, which is what makes concurrent handlers (`job('…', N)`) safe on a
+     * single connection — the lock covers this broker only, so the connection still
+     * must not be shared with anything outside it. Pass a Closure factory rather than
+     * a live Connection when the consumer forks or reconnects per worker, so each
+     * worker resolves its own.
+     *
+     * commit()/reject() correlate the JetStream acknowledgment to a message through an
      * in-instance map keyed by pid, so a message must be committed/rejected on the SAME
      * instance that received it: use one consumer instance (Broker\Pool is for the
      * publisher side).
@@ -127,7 +207,43 @@ class Nats implements Synchronous, Consumer
      *        a failure it cannot raise, because it happens outside any caller's
      *        call — currently the dead-lettering of a message that exhausted
      *        maxDeliver while no handler held it. Omitted, those failures go
-     *        nowhere, which is how a lost dead letter becomes invisible.
+     *        nowhere, which is how a lost dead letter becomes invisible. Called on
+     *        the way out of receive(), after the broker has released its locks, so a
+     *        reporter is free to use this broker.
+     * @param float|null $maxAge Message TTL on the work stream, in seconds. Null
+     *        derives it from the queue's own jobTtl, which is the historical
+     *        behaviour — but a queue object is built separately on each side, so
+     *        producer and consumer only agree by convention. Set this to state the
+     *        TTL where both sides read the same value, and the derivation is bypassed.
+     * @param int|null $maxMsgSize Largest accepted message, in bytes. Applied to the
+     *        work AND dead streams: a message the work stream accepts must be storable
+     *        as a dead letter too, or dead-lettering fails on exactly the messages an
+     *        operator is trying to read. The server's own max_payload (1MB by default)
+     *        is a separate, lower ceiling that is cluster configuration.
+     * @param int $maxMsgs Most messages the work stream holds; -1 is unlimited.
+     * @param int $maxBytes Most bytes the work stream holds; -1 is unlimited. This is
+     *        how one queue is stopped from consuming a shared account's whole file store.
+     * @param DiscardPolicy $discard What a full work stream does: Old drops the oldest
+     *        stored message, New refuses the publish. New is backpressure — the producer
+     *        finds out — and it requires one of $maxMsgs/$maxBytes to mean anything.
+     * @param int|null $maxAckPending In-flight ceiling per worker consumer: how many
+     *        messages JetStream will hand out before it waits for an ack. The server
+     *        default (1000) lets messages sit with the ack clock running while nothing
+     *        is working them, which surfaces as redelivery of jobs that never started.
+     *        Set it above the worker's concurrency, with room to spare: the count
+     *        includes messages parked in $backoff, which are asleep rather than being
+     *        worked and still hold a slot each, so a ceiling sized at the handler count
+     *        is filled by exactly as many failures as there are handlers and the queue
+     *        stops being delivered into. The ceiling is per consumer, so replicas share
+     *        it — {@see \Utopia\Queue\Server::start()} refuses a coroutine cap at or above it.
+     * @param int|null $maxWaiting Pull requests a consumer may have parked at once.
+     * @param float|null $inactiveThreshold Idle time after which JetStream deletes a
+     *        durable consumer, in seconds. Null keeps it forever, which is what a
+     *        scale-to-zero fleet wants: a threshold shorter than a quiet period returns
+     *        the queue to cold provisioning on the next message.
+     * @param Provisioning $provisioning Whether this broker may create and rewrite the
+     *        queue's streams and worker consumers, or must use what is already there
+     *        and refuse otherwise. See {@see Provisioning}.
      */
     public function __construct(
         private readonly NatsConnection|\Closure $source,
@@ -140,7 +256,24 @@ class Nats implements Synchronous, Consumer
         private readonly float $duplicateWindow = 120.0,
         private readonly ?\Closure $messageId = null,
         private readonly ?\Closure $onError = null,
+        private readonly ?float $maxAge = null,
+        private readonly ?int $maxMsgSize = null,
+        private readonly int $maxMsgs = -1,
+        private readonly int $maxBytes = -1,
+        private readonly DiscardPolicy $discard = DiscardPolicy::Old,
+        private readonly ?int $maxAckPending = null,
+        private readonly ?int $maxWaiting = null,
+        private readonly ?float $inactiveThreshold = null,
+        private readonly Provisioning $provisioning = Provisioning::Ensure,
+        // How an envelope is written and read; see Codec\Compat before changing
+        // it on a stream that already holds messages.
+        private readonly Codec $codec = new Json(),
     ) {
+        $this->lock = new Mutex();
+
+        // One socket serving both roles means one lock; see $commandsLock.
+        $this->commandsLock = $this->source instanceof \Closure ? new Mutex() : $this->lock;
+
         if ($this->backoff !== null) {
             if ($this->backoff === [] || min($this->backoff) <= 0) {
                 throw new \InvalidArgumentException('backoff must be a non-empty list of positive delays (seconds)');
@@ -158,6 +291,70 @@ class Nats implements Synchronous, Consumer
         if ($this->duplicateWindow <= 0) {
             throw new \InvalidArgumentException('duplicateWindow must be a positive number of seconds');
         }
+        if ($this->maxAge !== null && $this->maxAge <= 0) {
+            throw new \InvalidArgumentException('maxAge must be a positive number of seconds, or null to derive it from the queue\'s jobTtl');
+        }
+        if ($this->maxMsgSize !== null && $this->maxMsgSize <= 0) {
+            throw new \InvalidArgumentException('maxMsgSize must be a positive number of bytes, or null for no limit');
+        }
+        foreach (['maxMsgs' => $this->maxMsgs, 'maxBytes' => $this->maxBytes] as $name => $limit) {
+            // JetStream reads -1 as unlimited and rejects 0 outright; anything below
+            // -1 is a typo that would otherwise reach the server as one of those two.
+            if ($limit !== -1 && $limit <= 0) {
+                throw new \InvalidArgumentException(\sprintf('%s must be a positive limit, or -1 for unlimited', $name));
+            }
+        }
+        if ($this->discard === DiscardPolicy::New && $this->maxMsgs === -1 && $this->maxBytes === -1) {
+            // Discard policy only takes effect on a stream that can be full, so this
+            // combination reads as backpressure and delivers none.
+            throw new \InvalidArgumentException('discard: New requires a maxMsgs or maxBytes limit — on an unlimited stream it never applies');
+        }
+        if ($this->maxAckPending !== null && $this->maxAckPending < 1) {
+            throw new \InvalidArgumentException('maxAckPending must be at least 1, or null for the server default');
+        }
+        if ($this->maxWaiting !== null && $this->maxWaiting < 1) {
+            throw new \InvalidArgumentException('maxWaiting must be at least 1, or null for the server default');
+        }
+        if ($this->inactiveThreshold !== null && $this->inactiveThreshold <= 0) {
+            throw new \InvalidArgumentException('inactiveThreshold must be a positive number of seconds, or null to keep durable consumers forever');
+        }
+    }
+
+    /**
+     * Run one operation while holding the connection lock, so only ever one
+     * coroutine is on the socket.
+     *
+     * This is the receive connection's lock — fetch, provisioning and publishing.
+     * Acknowledgments take {@see self::command()} instead, on their own connection.
+     *
+     * Not reentrant: the lock is a channel of one, so a synchronised method that
+     * called another would park forever waiting for itself. Every public entry point
+     * acquires one of the two locks, and the private helpers they reach never do.
+     *
+     * @template T
+     * @param callable(): T $command
+     * @return T
+     */
+    private function synchronize(callable $command): mixed
+    {
+        return $this->lock->withLock($command, self::ACQUIRE_TIMEOUT);
+    }
+
+    /**
+     * Run one operation on the commands connection, holding its own lock.
+     *
+     * Separate from {@see self::synchronize()} on purpose: the receive lock is held
+     * across a fetch that can park for the whole receive timeout, and an ack must not
+     * wait for it. The two locks are never nested -- no method holding one acquires the
+     * other -- so they cannot deadlock.
+     *
+     * @template T
+     * @param callable(): T $command
+     * @return T
+     */
+    private function command(callable $command): mixed
+    {
+        return $this->commandsLock->withLock($command, self::ACQUIRE_TIMEOUT);
     }
 
     private function connection(): NatsConnection
@@ -171,41 +368,60 @@ class Nats implements Synchronous, Consumer
     }
 
     /**
-     * The connection for passive management reads (getQueueSize), separate from the
-     * consume connection so a telemetry/health coroutine never reads the same socket
-     * the consume loop is blocked on. Requires the Closure factory to open a second
-     * connection; a broker built from a live Connection (publisher-only use, where no
-     * concurrent consume loop exists) falls back to the single connection.
+     * The connection every acknowledgment goes out on.
+     *
+     * A NATS ack is a message published to the delivery's reply subject, so nothing
+     * ties it to the connection that fetched the message -- which is what lets the
+     * whole per-message ack path move off the receive socket. Requires the Closure
+     * factory to open a second connection; a broker built from a live Connection
+     * (publisher-only use, where no consume loop competes) falls back to the single
+     * connection, and shares its lock accordingly.
      */
-    private function controlConnection(): NatsConnection
+    private function commandsConnection(): NatsConnection
     {
-        if ($this->controlConnection instanceof NatsConnection) {
-            return $this->controlConnection;
+        if ($this->commandsConnection instanceof NatsConnection) {
+            return $this->commandsConnection;
         }
 
-        return $this->controlConnection = $this->source instanceof \Closure
+        return $this->commandsConnection = $this->source instanceof \Closure
             ? ($this->source)()
             : $this->connection();
     }
 
-    private function controlJs(): JetStream
+    private function commandsJs(): JetStream
     {
-        return $this->controlJs ??= $this->controlConnection()->jetStream();
+        return $this->commandsJs ??= $this->commandsConnection()->jetStream();
     }
 
-    private function controlConsumer(string $stream, string $durable): NatsConsumer
+    /**
+     * The same delivery, bound to the commands connection so its ack leaves on that
+     * socket. Cheap -- the envelope is reused, only the connection differs.
+     */
+    private function onCommands(JetStreamMessage $jsMessage): JetStreamMessage
     {
-        return $this->controlConsumers[$stream][$durable] ??= $this->controlJs()->getConsumer($stream, $durable);
+        return new JetStreamMessage($this->commandsConnection(), $jsMessage->message);
+    }
+
+    private function commandsConsumer(string $stream, string $durable): NatsConsumer
+    {
+        return $this->commandsConsumers[$stream][$durable] ??= $this->commandsJs()->getConsumer($stream, $durable);
     }
 
     public function publish(Queue $queue, array $payload, bool $priority = false): bool
     {
-        $this->ensure($queue);
-
+        // Enveloped before the lock is taken. envelope() runs the caller's $messageId
+        // closure, and the lock is a channel of one acquired with no timeout, so a
+        // closure that reached back into the broker would wait for a lock its own call
+        // is holding and hang the worker for good. Nothing here needs the socket.
         $subject = $priority ? $this->prioritySubject($queue) : $this->workSubject($queue);
-        $this->publishEnvelope($subject, $this->envelope($queue, $payload));
+        $envelope = $this->envelope($queue, $payload);
 
-        return true;
+        return $this->synchronize(function () use ($queue, $subject, $envelope): bool {
+            $this->ensure($queue);
+            $this->publishEnvelope($subject, $envelope);
+
+            return true;
+        });
     }
 
     public function enqueueMany(Queue $queue, array $payloads, bool $priority = false): bool
@@ -214,16 +430,41 @@ class Nats implements Synchronous, Consumer
             return true;
         }
 
-        $this->ensure($queue);
-
-        // JetStream publishes one subject at a time, so the saving here is the
-        // stream check and the connection checkout rather than the round trips.
+        // Enveloped before the lock, for the reason publish() gives.
         $subject = $priority ? $this->prioritySubject($queue) : $this->workSubject($queue);
+
+        $messages = [];
         foreach ($payloads as $payload) {
-            $this->publishEnvelope($subject, $this->envelope($queue, $payload));
+            $envelope = $this->envelope($queue, $payload);
+            /** @var string $id */
+            $id = $envelope['pid'];
+
+            $messages[] = [
+                'subject' => $subject,
+                'data' => $this->codec->encode($envelope),
+                'headers' => $this->contentTypeHeader(),
+                'msgId' => $id,
+            ];
         }
 
-        return true;
+        return $this->synchronize(function () use ($queue, $messages): bool {
+            $this->ensure($queue);
+
+            // One round trip per window rather than one per payload: the whole batch is
+            // written before any acknowledgment is read. Each payload still carries its
+            // own message id, so deduplication works exactly as it does on the single
+            // enqueue, and a payload the server rejects still throws.
+            foreach ($this->js()->publishMany($messages) as $ack) {
+                // Not discarded, for the same reason publishEnvelope() counts it: a
+                // duplicate acknowledgment is the only signal that deduplication did
+                // anything, and a quiet success reads the same as nothing collapsing.
+                if ($ack->duplicate) {
+                    ++$this->duplicates;
+                }
+            }
+
+            return true;
+        });
     }
 
     /**
@@ -242,12 +483,28 @@ class Nats implements Synchronous, Consumer
     {
         /** @var string $id */
         $id = $envelope['pid'];
+        $data = $this->codec->encode($envelope);
 
-        $ack = $this->js()->publish(
-            $subject,
-            (string) json_encode($envelope),
-            msgId: $id,
-        );
+        try {
+            $ack = $this->publishOnce($subject, $data, $id);
+        } catch (TimeoutException $timeout) {
+            // A publish waits for the stream's PubAck, so a socket the server has
+            // already closed does not fail -- it goes quiet, and the caller wears
+            // the full request timeout for a message that never reached a stream.
+            // The client only recycles a connection when the server tells it one
+            // died; a socket reaped while nothing was reading it says nothing, and
+            // the first thing to notice is this timeout.
+            //
+            // Retrying is safe because the envelope carries its own pid as msgId
+            // and the work stream keeps a duplicate window (refused at construction
+            // if not positive), so a first publish that did land collapses the
+            // second rather than delivering it twice.
+            if (!$this->reconnect()) {
+                throw $timeout;
+            }
+
+            $ack = $this->publishOnce($subject, $data, $id);
+        }
 
         // Not discarded: a duplicate ack means the stream already held this id,
         // so the retry collapsed instead of double-delivering. That is the
@@ -259,11 +516,44 @@ class Nats implements Synchronous, Consumer
         }
     }
 
+    /** One attempt at the stream, waiting for its PubAck. */
+    private function publishOnce(string $subject, string $data, string $id): PubAck
+    {
+        return $this->js()->publish(
+            $subject,
+            $data,
+            headers: $this->contentTypeHeader(),
+            msgId: $id,
+        );
+    }
+
     /**
-     * Hand a failure to the caller's reporter, if it gave one.
+     * Advertise which codec wrote the payload.
      *
-     * Never throws: a reporting hook that fails must not escalate into the
-     * failure it was called to describe.
+     * A header rather than something in the envelope, so a consumer can read it
+     * without first decoding the bytes it describes -- including one in another
+     * language, and one reading the stream through a tool rather than this
+     * library. {@see Codec\Compat} still sniffs on the way in: messages
+     * published before this release carry no header at all, and the dead stream
+     * keeps them indefinitely.
+     *
+     * A fresh instance per message: JetStream::publish() writes Nats-Msg-Id into
+     * whatever Headers it is handed, so a shared one would carry another
+     * message's id.
+     */
+    private function contentTypeHeader(): Headers
+    {
+        return new Headers()->set(self::CONTENT_TYPE, $this->codec->contentType());
+    }
+
+    /**
+     * Owe a failure to the caller's reporter, if it gave one.
+     *
+     * Buffered rather than called here. The only caller is drainDeadLetters(), which
+     * runs under the receive lock, and the reporter is the caller's code: one that
+     * publishes a notification -- onto this very broker, plausibly -- would wait on a
+     * lock its own call stack is holding. {@see self::flushReports()} hands these over
+     * once receive() has let go.
      */
     private function report(\Throwable $error): void
     {
@@ -271,9 +561,33 @@ class Nats implements Synchronous, Consumer
             return;
         }
 
-        try {
-            ($this->onError)($error);
-        } catch (\Throwable) {
+        $this->deferred[] = $error;
+    }
+
+    /**
+     * Hand over everything report() owes, off the lock.
+     *
+     * Never throws: a reporting hook that fails must not escalate into the failure it
+     * was called to describe.
+     */
+    private function flushReports(): void
+    {
+        if ($this->deferred === [] || !$this->onError instanceof \Closure) {
+            $this->deferred = [];
+
+            return;
+        }
+
+        // Taken and cleared first, so a reporter that re-enters receive() cannot see
+        // the same failure twice.
+        $owed = $this->deferred;
+        $this->deferred = [];
+
+        foreach ($owed as $error) {
+            try {
+                ($this->onError)($error);
+            } catch (\Throwable) {
+            }
         }
     }
 
@@ -337,26 +651,111 @@ class Nats implements Synchronous, Consumer
 
     public function receive(Queue $queue, int $timeout): ?Message
     {
+        return $this->receiveBatch($queue, $timeout, 1)[0] ?? null;
+    }
+
+    public function receiveBatch(Queue $queue, int $timeout, int $max): array
+    {
+        try {
+            return $this->synchronize(fn(): array => $this->pull($queue, $timeout, max(1, $max)));
+        } finally {
+            // Off the lock, and on the way out however pull() ended.
+            $this->flushReports();
+        }
+    }
+
+    /**
+     * The body of receive(), on the connection lock.
+     *
+     * Holds it across the fetch, which is what an ack from a handler coroutine waits
+     * behind — see the class docblock for that bound and why it is safe.
+     */
+    private function pull(Queue $queue, int $timeout, int $max): array
+    {
         $this->ensure($queue);
         $key = $this->identity($queue);
         $this->drainDeadLetters($queue, $key);
 
         // Priority first (no_wait poll), then the normal queue for up to $timeout.
-        $jsMessage = $this->fetchOne($this->consumers[$key]['priority'], 0.25, true)
-            ?? $this->fetchOne($this->consumers[$key]['normal'], (float) $timeout, false);
+        $deliveries = $this->fetch($this->consumers[$key]['priority'], $max, 0.25, true);
 
-        if (!$jsMessage instanceof JetStreamMessage) {
-            return null;
+        // Waiting is only ever allowed with nothing in hand. Holding a message
+        // while blocking for company would add the whole receive timeout to the
+        // latency of a message already claimed.
+        if ($deliveries === []) {
+            // And it asks for exactly one. fetch($max, $timeout) does not return
+            // as soon as it has something: it collects until the batch fills or
+            // the deadline passes, so asking for a batch up front would make
+            // every message on a sparse queue $timeout late.
+            $deliveries = $this->fetch($this->consumers[$key]['normal'], 1, (float) $timeout, false);
         }
 
-        /** @var array{pid: string, queue: string, timestamp: int, payload: array<mixed>} $data */
-        $data = json_decode($jsMessage->getData(), true);
-        $this->inFlight[$data['pid']] = $jsMessage;
+        // Whatever else is already waiting, on a poll that cannot block.
+        if ($deliveries !== [] && \count($deliveries) < $max) {
+            $deliveries = array_merge($deliveries, $this->fetch($this->consumers[$key]['normal'], $max - \count($deliveries), 0.25, true));
+        }
 
-        return new Message($data)
-            // JetStream counts deliveries from 1; expose it as the Redis-style attempt count.
-            ->setAttempts(max(0, $jsMessage->metadata()->numDelivered - 1))
-            ->setSequence($jsMessage->metadata()->streamSequence);
+        $messages = [];
+
+        foreach ($deliveries as $jsMessage) {
+            try {
+                $data = $this->codec->decode($jsMessage->getData());
+            } catch (\Throwable) {
+                $data = null;
+            }
+
+            if (!\is_array($data) || !isset($data['pid'], $data['queue'], $data['timestamp'])) {
+                // Parked rather than thrown: in a batch a throw here would leave
+                // every message behind it unregistered and unacknowledged, each
+                // burning an attempt and a maxAckPending slot for a full ackWait.
+                $this->park($queue, $jsMessage);
+
+                continue;
+            }
+
+            /** @var array{pid: string, queue: string, timestamp: int, payload: array<mixed>} $data */
+            $this->inFlight[$data['pid']] = $jsMessage;
+
+            $messages[] = new Message($data)
+                // JetStream counts deliveries from 1; expose it as the Redis-style attempt count.
+                ->setAttempts(max(0, $jsMessage->metadata()->numDelivered - 1))
+                ->setSequence($jsMessage->metadata()->streamSequence);
+        }
+
+        return $messages;
+    }
+
+    /**
+     * Set aside a message no codec on this worker can read.
+     *
+     * Straight to the dead stream and terminated, rather than NAK'd: every
+     * redelivery would fail the same way, and unacknowledged it would hold a
+     * maxAckPending slot for a full ackWait each time round. The bytes are
+     * republished as they arrived, so whatever can read them still can.
+     *
+     * On the receive connection, because pull() is already holding its lock and
+     * the two locks are never nested. Terminated only after the republish
+     * returns: a failure there leaves the message unacknowledged, which costs a
+     * redelivery and ends on the dead stream anyway, where dropping the ack
+     * first would lose it outright.
+     */
+    private function park(Queue $queue, JetStreamMessage $jsMessage): void
+    {
+        try {
+            // The message's own Content-Type, not this codec's: the bytes go over
+            // as they arrived, and what could not be read here is precisely what
+            // this worker's codec does not write.
+            $headers = new Headers();
+            $contentType = $jsMessage->getHeaders()?->get(self::CONTENT_TYPE);
+            if ($contentType !== null) {
+                $headers->set(self::CONTENT_TYPE, $contentType);
+            }
+
+            $this->js()->publish($this->deadSubject($queue), $jsMessage->getData(), headers: $headers);
+            $jsMessage->term('payload could not be decoded');
+        } catch (\Throwable $error) {
+            $this->report($error);
+        }
     }
 
     /**
@@ -377,7 +776,7 @@ class Nats implements Synchronous, Consumer
         $jsMessage = $this->inFlight[$message->getPid()] ?? null;
 
         if ($jsMessage instanceof JetStreamMessage) {
-            $jsMessage->inProgress();
+            $this->command(fn() => $this->onCommands($jsMessage)->inProgress());
         }
     }
 
@@ -428,9 +827,9 @@ class Nats implements Synchronous, Consumer
 
         $this->connection = null;
         $this->js = null;
-        $this->controlConnection = null;
-        $this->controlJs = null;
-        $this->controlConsumers = [];
+        $this->commandsConnection = null;
+        $this->commandsJs = null;
+        $this->commandsConsumers = [];
         $this->consumers = [];
         $this->advisories = [];
         $this->provisioned = [];
@@ -443,8 +842,21 @@ class Nats implements Synchronous, Consumer
     {
         $pid = $message->getPid();
         $jsMessage = $this->inFlight[$pid] ?? null;
-        if ($jsMessage instanceof JetStreamMessage) {
-            $jsMessage->ackSync();
+        if (!$jsMessage instanceof JetStreamMessage) {
+            return;
+        }
+
+        // Dropped however the ack ends. The map records that this instance owes
+        // an ack for the message, not that one succeeded, and ackSync() is a
+        // request-reply that throws on a transient failure. Nothing else would
+        // clear the entry: reject() is the only other place that unsets, and
+        // Adapter::runPhases() deliberately does not reject after a commit
+        // failure -- the work is done, so a NAK there is a guaranteed duplicate.
+        // Left behind, the entry has no owner and pins a JetStreamMessage for
+        // the life of the worker, one per failed ack.
+        try {
+            $this->command(fn() => $this->onCommands($jsMessage)->ackSync());
+        } finally {
             unset($this->inFlight[$pid]);
         }
     }
@@ -458,16 +870,36 @@ class Nats implements Synchronous, Consumer
         }
         unset($this->inFlight[$pid]);
 
-        if ($jsMessage->metadata()->numDelivered >= $this->maxDeliver) {
-            // Exhausted: park on the dead stream and drop it from the work stream.
-            $this->js()->publish($this->deadSubject($queue), $jsMessage->getData());
-            $jsMessage->term('max deliveries exceeded');
+        $numDelivered = $jsMessage->metadata()->numDelivered;
 
-            return;
-        }
+        // Read before the closure: the verdict belongs to this delivery, and the
+        // message object is the handler's, not the broker's.
+        $terminal = $message->isTerminal();
 
-        // Redeliver later (AckWait/NAK); a crashed worker is reclaimed the same way.
-        $jsMessage->nak($this->backoffFor($jsMessage->metadata()->numDelivered));
+        $this->command(function () use ($queue, $jsMessage, $numDelivered, $terminal): void {
+            $onCommands = $this->onCommands($jsMessage);
+
+            if ($terminal || $numDelivered >= $this->maxDeliver) {
+                // Exhausted, or declared unrepeatable by the handler: park on the dead
+                // stream and drop it from the work stream.
+                //
+                // The terminal case is what keeps one bad payload from taking the queue
+                // down with it. A NAK holds a maxAckPending slot for the whole of its
+                // backoff -- the message is asleep, not being worked, and JetStream
+                // counts it in flight regardless -- so enough messages that fail the
+                // same way every time leave the consumer no slot to deliver into, and
+                // it stops handing out work it could have run. Terminating here returns
+                // the slot immediately and loses nothing: the payload is on the dead
+                // stream, where retry() can re-drive it once the fault is fixed.
+                $this->commandsJs()->publish($this->deadSubject($queue), $jsMessage->getData());
+                $onCommands->term($terminal ? 'permanent failure' : 'max deliveries exceeded');
+
+                return;
+            }
+
+            // Redeliver later (AckWait/NAK); a crashed worker is reclaimed the same way.
+            $onCommands->nak($this->backoffFor($numDelivered));
+        });
     }
 
     /**
@@ -498,29 +930,45 @@ class Nats implements Synchronous, Consumer
      * Broker\Redis::retry() (cloud calls it with them); they are not applied here.
      * In the JetStream model attempts are capped server-side by maxDeliver before a
      * message reaches the dead stream, so there is nothing left to gate on re-drive.
+     *
+     * Takes the connection lock for the whole sweep rather than per message: this is a
+     * maintenance call, made against a publisher or maintenance broker, not one whose
+     * consume loop is running — so there is no ack on the other side of it to starve.
+     *
+     * This is the call that motivates {@see Provisioning::Require}. ensure() below is
+     * the broker's own configuration reaching a queue it does not own: a maintenance
+     * task built with different knobs rewrites the work stream's replica count, the dead
+     * stream's TTL and the worker consumers' ack settings just by re-driving. Construct
+     * the broker with Provisioning::Require and ensure() adopts instead, so the sweep
+     * moves messages and changes nothing else.
      */
     public function retry(Queue $queue, ?int $limit = null, ?int $maxAttempts = null, ?int $newerThan = null): void
     {
-        $this->ensure($queue);
+        $this->synchronize(function () use ($queue, $limit): void {
+            $this->ensure($queue);
 
-        $consumer = $this->js()->createConsumer($this->deadStream($queue), new ConsumerConfig(
-            durableName: self::CONSUMER_RETRY,
-            ackPolicy: AckPolicy::Explicit,
-            ackWait: $this->ackWait,
-            filterSubject: $this->deadSubject($queue),
-        ));
+            // Created in both modes on purpose: this durable reads the dead stream and
+            // carries none of the settings a running fleet depends on, so requiring it
+            // to pre-exist would only mean refusing the first re-drive of every queue.
+            $consumer = $this->js()->createConsumer($this->deadStream($queue), new ConsumerConfig(
+                durableName: self::CONSUMER_RETRY,
+                ackPolicy: AckPolicy::Explicit,
+                ackWait: $this->ackWait,
+                filterSubject: $this->deadSubject($queue),
+            ));
 
-        $remaining = $limit ?? 500;
-        while ($remaining > 0) {
-            $jsMessage = $this->fetchOne($consumer, 1.0, false);
-            if (!$jsMessage instanceof JetStreamMessage) {
-                break;
+            $remaining = $limit ?? 500;
+            while ($remaining > 0) {
+                $jsMessage = $this->fetch($consumer, 1, 1.0, false)[0] ?? null;
+                if (!$jsMessage instanceof JetStreamMessage) {
+                    break;
+                }
+                // Re-drive onto the work queue, then remove it from the dead stream.
+                $this->js()->publish($this->workSubject($queue), $jsMessage->getData());
+                $jsMessage->ackSync();
+                $remaining--;
             }
-            // Re-drive onto the work queue, then remove it from the dead stream.
-            $this->js()->publish($this->workSubject($queue), $jsMessage->getData());
-            $jsMessage->ackSync();
-            $remaining--;
-        }
+        });
     }
 
     /**
@@ -534,29 +982,48 @@ class Nats implements Synchronous, Consumer
     }
 
     /**
-     * Queue depth, read on the control connection so it is safe to call from a
-     * telemetry/health coroutine while another coroutine is in receive() on this same
-     * broker. It is a passive observer: it does NOT provision (ensure()) or drain dead
-     * letters — the consume loop owns those — and reports 0 for a queue whose streams
-     * do not exist yet, matching Broker\Redis's empty-list semantics.
+     * Queue depth, read on the commands connection under its lock, so it is safe to
+     * call from a telemetry or health coroutine while another coroutine is in receive()
+     * on this same broker.
+     *
+     * This used to need a third connection of its own, because nothing serialised the
+     * socket and a depth read from the telemetry coroutine could land on top of the
+     * consume loop's fetch. The commands connection already carries traffic from
+     * arbitrary coroutines behind a lock, which is the same guarantee for one fewer
+     * socket -- and the guarantee is now enforced rather than documented.
+     *
+     * Still a passive observer: it does NOT provision (ensure()) or drain dead letters
+     * -- the consume loop owns those -- and reports 0 for a queue whose streams do not
+     * exist yet, matching Broker\Redis's empty-list semantics.
      */
     public function getQueueSize(Queue $queue, bool $failedJobs = false): int
     {
         $stream = $this->workStream($queue);
 
-        try {
-            if ($failedJobs) {
-                return $this->controlJs()->getStreamInfo($this->deadStream($queue))->state->messages;
-            }
+        return $this->command(function () use ($queue, $stream, $failedJobs): int {
+            try {
+                if ($failedJobs) {
+                    return $this->commandsJs()->getStreamInfo($this->deadStream($queue))->state->messages;
+                }
 
-            return $this->controlConsumer($stream, self::CONSUMER_NORMAL)->info(true)->numPending
-                + $this->controlConsumer($stream, self::CONSUMER_PRIORITY)->info(true)->numPending;
-        } catch (JetStreamException $e) {
-            if ($e->apiError?->code === 404) {
-                return 0; // stream/consumer not provisioned yet — nothing enqueued
+                return $this->commandsConsumer($stream, self::CONSUMER_NORMAL)->info(true)->numPending
+                    + $this->commandsConsumer($stream, self::CONSUMER_PRIORITY)->info(true)->numPending;
+            } catch (JetStreamException $e) {
+                if ($e->apiError?->code === 404) {
+                    return 0; // stream/consumer not provisioned yet — nothing enqueued
+                }
+                throw $e;
             }
-            throw $e;
-        }
+        });
+    }
+
+    /**
+     * The consumer's in-flight ceiling, so a worker can be refused a coroutine cap
+     * this queue cannot deliver into. See {@see Bounded}.
+     */
+    public function inFlightCeiling(): ?int
+    {
+        return $this->maxAckPending;
     }
 
     /**
@@ -567,19 +1034,26 @@ class Nats implements Synchronous, Consumer
      * in a publisher pool between publishes is reaped on a timer nobody is
      * watching, and the next publish writes into a dead socket.
      *
-     * Named tick() rather than maintain() on purpose: this reads the socket, so
-     * the caller must hold the broker exclusively. {@see Pool::maintain()} is
-     * what a running worker calls, because it sweeps only idle resources and so
-     * cannot collide with a consume loop. Do not call this on a broker whose
-     * receive loop is running.
+     * Named tick() rather than maintain() on purpose: this reads the socket, where
+     * {@see Pool::maintain()} sweeps only idle resources. Each connection is ticked
+     * under its own lock, so unlike the pre-split version this is safe to call while a
+     * consume loop is running -- the receive tick simply waits for the fetch in front
+     * of it.
      */
     public function tick(): void
     {
-        $this->connection?->tick();
+        if ($this->connection instanceof NatsConnection) {
+            // Bound to a local: the closure must tick the connection this check passed
+            // on, not whatever the property holds by the time the lock is granted.
+            $receive = $this->connection;
+            $this->synchronize(fn() => $receive->tick());
+        }
 
-        // Only when it is a distinct socket; a publisher-only broker reuses one.
-        if ($this->controlConnection instanceof NatsConnection && $this->controlConnection !== $this->connection) {
-            $this->controlConnection->tick();
+        // Only when it is a distinct socket; a publisher-only broker reuses one, and
+        // ticking it twice under two locks would be the one call that deadlocks.
+        if ($this->commandsConnection instanceof NatsConnection && $this->commandsConnection !== $this->connection) {
+            $commands = $this->commandsConnection;
+            $this->command(fn() => $commands->tick());
         }
     }
 
@@ -587,23 +1061,55 @@ class Nats implements Synchronous, Consumer
     {
         $this->connection?->close();
 
-        // Only when it is a distinct socket; a publisher-only broker reuses the one connection.
-        if ($this->controlConnection instanceof NatsConnection && $this->controlConnection !== $this->connection) {
-            $this->controlConnection->close();
+        // Only when it is a distinct socket; a publisher-only broker reuses one.
+        // Deliberately off both locks: shutdown must not depend on acquiring a lock a
+        // hung caller might still be holding.
+        if ($this->commandsConnection instanceof NatsConnection && $this->commandsConnection !== $this->connection) {
+            $this->commandsConnection->close();
         }
     }
 
-    /** Fetch a single message, or null on timeout / empty. */
-    private function fetchOne(NatsConsumer $consumer, float $timeout, bool $noWait): ?JetStreamMessage
+    /**
+     * Fetch up to $batch deliveries, as a list.
+     *
+     * @return list<JetStreamMessage>
+     */
+    private function fetch(NatsConsumer $consumer, int $batch, float $timeout, bool $noWait): array
     {
-        foreach ($consumer->fetch(1, $timeout, $noWait) as $message) {
-            return $message;
+        $messages = [];
+
+        foreach ($consumer->fetch($batch, $timeout, $noWait) as $message) {
+            $messages[] = $message;
         }
 
-        return null;
+        return $messages;
     }
 
-    /** Idempotently provision the work + dead streams and the durable consumers. */
+    /**
+     * Idempotently provision the work + dead streams and the durable consumers.
+     *
+     * Retried, because concurrent *first* provisioning of a replicated stream does not
+     * degrade gracefully. Measured against a 3-node JetStream cluster, creating a fresh
+     * R3 stream and its two durable consumers takes ~290ms from a single process and
+     * succeeds every time; two processes doing it at once both exceed the client's 5s
+     * request timeout and neither completes. It is a cliff rather than a slope -- eight
+     * concurrent cold starts landed 0-1 successes. The server logs show why: the
+     * competing CREATEs drive the stream and consumer RAFT groups into repeated leader
+     * elections, which continue for minutes after the callers have given up.
+     *
+     * The retry works because the state that makes an attempt expensive does not survive
+     * it. Once any one process wins, the stream and consumers exist, and JetStream
+     * answers a repeat CREATE for an identical config without another election -- eight
+     * concurrent processes against an existing stream provision in 19-34ms with no
+     * election at all. So a later attempt is not a rerun of the same race.
+     *
+     * This path is the first pod that ever touches a queue, not a scale-up: a KEDA 0->N
+     * expansion runs against a stream that already exists and is the cheap case above.
+     *
+     * Reading the current config first, to skip a no-op write, was tried and made this
+     * worse: the extra round trips spend the same 5s budget, taking 8 concurrent cold
+     * starts from 8/8 down to 7/8.
+     */
     private function ensure(Queue $queue): void
     {
         $key = $this->identity($queue);
@@ -611,9 +1117,39 @@ class Nats implements Synchronous, Consumer
             return;
         }
 
+        if ($this->provisioning === Provisioning::Require) {
+            $this->adopt($queue, $key);
+
+            return;
+        }
+
+        $attempt = 0;
+        while (true) {
+            try {
+                $this->provision($queue, $key);
+
+                return;
+            } catch (TimeoutException $e) {
+                if (++$attempt >= self::PROVISION_ATTEMPTS) {
+                    throw $e;
+                }
+
+                // Full jitter over an exponentially growing window, so processes that
+                // collided once are not released together to collide again.
+                usleep(random_int(0, self::PROVISION_BACKOFF_US << ($attempt - 1)));
+            }
+        }
+    }
+
+    /** One provisioning attempt. See ensure() for why this is retried. */
+    private function provision(Queue $queue, string $key): void
+    {
         $this->guardStreamName($queue, $key);
 
-        $maxAge = $queue->jobTtl > 0 ? (float) $queue->jobTtl : null;
+        // An explicit maxAge states the TTL where producer and consumer read the same
+        // value; the jobTtl derivation is per-queue-object, so the two sides agree only
+        // as long as both construct the Queue the same way.
+        $maxAge = $this->maxAge ?? ($queue->jobTtl > 0 ? (float) $queue->jobTtl : null);
 
         // JetStream refuses a stream whose duplicate window outlives its max
         // age, and it is right to: an id cannot be recognised as a duplicate of
@@ -629,9 +1165,13 @@ class Nats implements Synchronous, Consumer
             subjects: [$this->workSubject($queue), $this->prioritySubject($queue)],
             description: $key,
             retention: RetentionPolicy::WorkQueue,
+            maxMsgs: $this->maxMsgs,
+            maxBytes: $this->maxBytes,
+            maxMsgSize: $this->maxMsgSize,
             maxAge: $maxAge,
             storage: $this->storage,
             replicas: $this->replicas,
+            discard: $this->discard,
             // Without this the stream keeps no memory of message ids, so
             // Nats-Msg-Id is carried on the wire and then ignored, and a
             // retried publish is stored as a second message.
@@ -644,6 +1184,11 @@ class Nats implements Synchronous, Consumer
             subjects: [$this->deadSubject($queue)],
             description: $key,
             retention: RetentionPolicy::WorkQueue,
+            // Size limits are the work stream's backpressure and do not belong on a
+            // stream nobody publishes work to -- but maxMsgSize is mirrored: a message
+            // the work stream accepted has to be storable as a dead letter, or it is
+            // lost at exactly the point an operator would go looking for it.
+            maxMsgSize: $this->maxMsgSize,
             maxAge: $this->deadMaxAge,
             storage: $this->storage,
             replicas: $this->replicas,
@@ -657,6 +1202,9 @@ class Nats implements Synchronous, Consumer
                 ackWait: $this->ackWait,
                 maxDeliver: $this->maxDeliver,
                 filterSubject: $this->workSubject($queue),
+                maxWaiting: $this->maxWaiting,
+                maxAckPending: $this->maxAckPending,
+                inactiveThreshold: $this->inactiveThreshold,
                 backoff: $this->backoff,
             )),
             'priority' => $this->js()->createConsumer($this->workStream($queue), new ConsumerConfig(
@@ -665,6 +1213,9 @@ class Nats implements Synchronous, Consumer
                 ackWait: $this->ackWait,
                 maxDeliver: $this->maxDeliver,
                 filterSubject: $this->prioritySubject($queue),
+                maxWaiting: $this->maxWaiting,
+                maxAckPending: $this->maxAckPending,
+                inactiveThreshold: $this->inactiveThreshold,
                 backoff: $this->backoff,
             )),
         ];
@@ -687,6 +1238,67 @@ class Nats implements Synchronous, Consumer
         );
 
         $this->provisioned[$key] = true;
+    }
+
+    /**
+     * Take up a queue that is already provisioned, without sending any configuration.
+     *
+     * The counterpart to provision() under {@see Provisioning::Require}: the streams and
+     * the two worker consumers must exist, and this broker's own settings are never
+     * written to them. That is the whole guarantee — a maintenance process built with a
+     * different ackWait, replica count or dead-letter TTL can use the queue without
+     * restyling it underneath the fleet that owns it.
+     *
+     * Refusing is the point of the absent case. A queue that has never been provisioned
+     * has no configuration to inherit, and creating one here from a process that does not
+     * own the queue is exactly the side effect this mode exists to remove.
+     */
+    private function adopt(Queue $queue, string $key): void
+    {
+        // Read-only: the length limit and the cross-queue ownership check both hold
+        // here, and neither sends configuration.
+        $this->guardStreamName($queue, $key);
+
+        foreach ([$this->workStream($queue), $this->deadStream($queue)] as $stream) {
+            try {
+                $this->js()->getStreamInfo($stream);
+            } catch (JetStreamException $e) {
+                if ($e->apiError?->code === 404) {
+                    throw new \RuntimeException("NATS stream \"{$stream}\" is not provisioned; queue \"{$queue->name}\" must be created by its own producer or consumer before this broker can use it.", $e->getCode(), $e);
+                }
+                throw $e;
+            }
+        }
+
+        $this->consumers[$key] = [
+            'normal' => $this->adoptConsumer($queue, self::CONSUMER_NORMAL),
+            'priority' => $this->adoptConsumer($queue, self::CONSUMER_PRIORITY),
+        ];
+
+        // Same advisory subscription provision() takes: a core subscription carries no
+        // configuration, and a broker consuming a pre-provisioned queue still owes its
+        // exhausted messages a dead letter.
+        $this->advisories[$key] = $this->connection()->subscribe(
+            self::ADVISORY_MAX_DELIVERIES . ".{$this->workStream($queue)}.*",
+            queue: self::ADVISORY_GROUP,
+        );
+
+        $this->provisioned[$key] = true;
+    }
+
+    /** Resolve an existing durable consumer, refusing rather than creating it. */
+    private function adoptConsumer(Queue $queue, string $durable): NatsConsumer
+    {
+        $stream = $this->workStream($queue);
+
+        try {
+            return $this->js()->getConsumer($stream, $durable);
+        } catch (JetStreamException $e) {
+            if ($e->apiError?->code === 404) {
+                throw new \RuntimeException("NATS consumer \"{$durable}\" on stream \"{$stream}\" is not provisioned; queue \"{$queue->name}\" must be created by its own producer or consumer before this broker can use it.", $e->getCode(), $e);
+            }
+            throw $e;
+        }
     }
 
     /**

@@ -51,6 +51,8 @@ class Client implements Adapter
 
     private const string SETTING_SSL_VERIFY_PEER = 'ssl_verify_peer';
 
+    private const string SETTING_SSL_HOST_NAME = 'ssl_host_name';
+
     private const string SETTING_SSL_CAFILE = 'ssl_cafile';
 
     private const string SETTING_SSL_CERT_FILE = 'ssl_cert_file';
@@ -67,9 +69,19 @@ class Client implements Adapter
 
     private bool $followRedirects = false;
 
+    /**
+     * Buffered requests reuse one client and streamed requests another: a
+     * write callback, once set on a Swoole client, stays with it, and setting
+     * it to null does not take it off. A client that has streamed would hand
+     * every later response body to the stale sink and buffer nothing.
+     */
     private ?SwooleClient $connection = null;
 
     private string $connectionKey = '';
+
+    private ?SwooleClient $streamConnection = null;
+
+    private string $streamConnectionKey = '';
 
     /**
      * @param array<string, mixed> $settings
@@ -82,6 +94,7 @@ class Client implements Adapter
         $this->settings += [
             self::SETTING_CONNECT_TIMEOUT => self::DEFAULT_CONNECT_TIMEOUT,
             self::SETTING_TIMEOUT => self::DEFAULT_TIMEOUT,
+            self::SETTING_SSL_VERIFY_PEER => true,
         ];
 
         $this->responseBuilder = new ResponseBuilder($responseFactory, $streamFactory);
@@ -89,9 +102,8 @@ class Client implements Adapter
 
     public function __clone(): void
     {
-        // Clones get their own connection; Swoole closes the dropped one on GC.
-        $this->connection = null;
-        $this->connectionKey = '';
+        // Clones get their own connections; Swoole closes the dropped ones on GC.
+        $this->forgetConnection();
     }
 
     public function withTimeout(float $seconds): static
@@ -233,8 +245,20 @@ class Client implements Adapter
         } finally {
             if (!$this->reuseConnections) {
                 $this->forgetConnection();
+            } elseif ($sink !== null) {
+                $this->releaseSink();
             }
         }
+    }
+
+    /**
+     * A write callback cannot be taken off a Swoole client, so replace the one
+     * holding $sink with a no-op. Whatever the sink captured is released, and
+     * the next stream on this connection installs its own callback anyway.
+     */
+    private function releaseSink(): void
+    {
+        $this->streamConnection?->set(['write_func' => static function (): void {}]);
     }
 
     /**
@@ -259,18 +283,24 @@ class Client implements Adapter
         // delivers it undecoded — so a stream must ask for identity instead.
         $streaming = $sink !== null;
 
-        $client = $this->connect($request);
+        $client = $this->connect($request, $streaming);
 
         $settings = $this->settings + [self::SETTING_HTTP2 => false];
 
         // Authoritative over any keep_alive passed in $settings.
         $settings[self::SETTING_KEEP_ALIVE] = $this->reuseConnections;
 
-        $suppressedBody = null;
+        if ($uri->getScheme() === 'https') {
+            // SNI alone does not verify hostnames; verify against this hop's URI host.
+            $settings[self::SETTING_SSL_HOST_NAME] = $uri->getHost();
 
-        // Always set write_func so a prior streamed request on a reused
-        // client cannot keep delivering chunks into a stale sink.
-        $settings['write_func'] = null;
+            // Reject IP literals: Swoole's X509_check_host can mistake numeric DNS SANs for IP identities.
+            if ($settings[self::SETTING_SSL_VERIFY_PEER] && filter_var(trim($uri->getHost(), '[]'), FILTER_VALIDATE_IP) !== false) {
+                throw new TlsException($request, 'Verified HTTPS requests to IP literals are not supported by the Swoole adapter; use a DNS hostname or the cURL adapter.');
+            }
+        }
+
+        $suppressedBody = null;
 
         if ($sink !== null) {
             if ($suppressRedirectBody) {
@@ -292,6 +322,10 @@ class Client implements Adapter
 
                 $sink($chunk);
             };
+        } else {
+            // $settings passes native settings through, and a caller-supplied
+            // write_func would leave every buffered body empty.
+            $settings['write_func'] = null;
         }
 
         try {
@@ -467,25 +501,28 @@ class Client implements Adapter
      *
      * @throws ClientExceptionInterface
      */
-    private function connect(RequestInterface $request): SwooleClient
+    private function connect(RequestInterface $request, bool $streaming): SwooleClient
     {
         $uri = $request->getUri();
         $secure = $uri->getScheme() === 'https';
         $key = $uri->getHost() . ':' . $this->port($request) . ':' . ($secure ? 's' : 'p');
 
-        if ($this->connection instanceof SwooleClient && $this->connectionKey === $key) {
-            $socket = $this->connection->socket ?? null;
+        $connection = $streaming ? $this->streamConnection : $this->connection;
+        $connectionKey = $streaming ? $this->streamConnectionKey : $this->connectionKey;
+
+        if ($connection instanceof SwooleClient && $connectionKey === $key) {
+            $socket = $connection->socket ?? null;
             if ($secure && $socket instanceof Coroutine\Socket) {
                 // SSL_peek can fail with errno=0 after an abrupt TLS EOF. Swoole's
                 // liveness check treats that as alive. Close before sending any body;
                 // a healthy idle socket instead reports a would-block error.
                 $peek = $socket->peek(1);
                 if ($peek === '' || ($peek === false && $socket->errCode === 0)) {
-                    $this->connection->close();
+                    $connection->close();
                 }
             }
 
-            return $this->connection;
+            return $connection;
         }
 
         try {
@@ -494,8 +531,13 @@ class Client implements Adapter
             throw new AdapterInitializationException($request, $throwable->getMessage(), (int) $throwable->getCode(), $throwable);
         }
 
-        $this->connection = $client;
-        $this->connectionKey = $key;
+        if ($streaming) {
+            $this->streamConnection = $client;
+            $this->streamConnectionKey = $key;
+        } else {
+            $this->connection = $client;
+            $this->connectionKey = $key;
+        }
 
         return $client;
     }
@@ -504,6 +546,8 @@ class Client implements Adapter
     {
         $this->connection = null;
         $this->connectionKey = '';
+        $this->streamConnection = null;
+        $this->streamConnectionKey = '';
     }
 
     private function port(RequestInterface $request): int

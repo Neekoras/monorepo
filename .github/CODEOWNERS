@@ -19,11 +19,9 @@
 /packages/domains/      @ChiragAgg5k @eldadfux @lohanidamodar
 /packages/fastly/       @loks0n
 /packages/http/         @lohanidamodar @eldadfux @Meldiron
-/packages/lock/         @abnegate
 /packages/nats/         @loks0n @levivannoort
 /packages/platform/     @lohanidamodar @shimonewman
 /packages/pools/        @eldadfux @ArnabChatterjee20k @abnegate
-/packages/psr7/         @loks0n
 /packages/queue/        @lohanidamodar @ChiragAgg5k @abnegate
 /packages/replication/  @loks0n
 /packages/servers/      @eldadfux @ChiragAgg5k

@@ -56,21 +56,19 @@ graph TD
     cdn --> client
     cli --> servers
     client --> pools
-    client --> psr7
     client --> span
     config --> validators
     console --> validators
     dns --> telemetry
     dns --> validators
     dns --> domains
+    domains --> client
     domains --> validators
     domains --> cache
     fastly --> client
-    fastly --> psr7
     http --> di
     http --> servers
     http --> compression
-    http --> psr7
     http --> telemetry
     http --> validators
     http --> system
@@ -84,7 +82,6 @@ graph TD
     platform --> servers
     pools --> telemetry
     queue --> di
-    queue --> lock
     queue --> servers
     queue --> pools
     queue --> telemetry
@@ -93,15 +90,14 @@ graph TD
     servers --> di
     servers --> validators
     span --> client
-    span --> psr7
     storage --> telemetry
     storage --> validators
     storage --> client
-    storage --> psr7
     vcs --> cache
     auth
     image
     nats
+    openapi
     replication
     reputation
     user-agent
