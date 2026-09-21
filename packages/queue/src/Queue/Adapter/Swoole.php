@@ -103,7 +103,7 @@ class Swoole extends Adapter
             Coroutine\run(function () use ($workerId): void {
                 Process::signal(SIGTERM, function (): void {
                     // Flip the flag and let the loop drain. Closing the consumer
-                    // here landed mid-job: at maxCoroutines=1 the loop is parked
+                    // here landed mid-job: at coroutines=1 the loop is parked
                     // while a handler runs, so the socket went away underneath
                     // it. The handler then finished, commit() threw on a closed
                     // connection, execution fell through to reject() which threw
@@ -135,7 +135,7 @@ class Swoole extends Adapter
     }
 
     /**
-     * @param array<int, array{queue: Queue, maxCoroutines: int, batch?: int, consumer?: Consumer}> $queues
+     * @param array<int, array{queue: Queue, coroutines: int, prefetch?: int, consumer?: Consumer}> $queues
      */
     #[\Override]
     public function consume(
@@ -154,7 +154,7 @@ class Swoole extends Adapter
 
         try {
             // Independent loop per queue so each cap is isolated (a databases loop
-            // at maxCoroutines=1 cannot share a pool with functions=8).
+            // at coroutines=1 cannot share a pool with functions=8).
             $waitGroup = new WaitGroup();
 
             foreach ($queues as $spec) {
@@ -163,12 +163,12 @@ class Swoole extends Adapter
                     try {
                         $this->run(
                             $spec['queue'],
-                            $spec['maxCoroutines'],
+                            $spec['coroutines'],
                             $messageCallback,
                             $successCallback,
                             $errorCallback,
                             $spec['consumer'] ?? $this->consumer,
-                            $spec['batch'] ?? 1,
+                            $spec['prefetch'] ?? $spec['coroutines'],
                         );
                     } finally {
                         $waitGroup->done();
@@ -204,19 +204,22 @@ class Swoole extends Adapter
     #[\Override]
     protected function run(
         Queue $queue,
-        int $maxCoroutines,
+        int $coroutines,
         callable $messageCallback,
         callable $successCallback,
         callable $errorCallback,
         Consumer $consumer,
-        int $batch = 1,
+        ?int $prefetch = null,
     ): void {
         if ($consumer !== $this->consumer) {
             $this->consumers[] = $consumer;
         }
-        $capacity = max($batch, $maxCoroutines);
-        $coroutines = new Channel($maxCoroutines);
-        $available = new Channel($capacity);
+        $prefetch ??= $coroutines;
+        if ($coroutines < 1 || $prefetch < $coroutines) {
+            throw new \InvalidArgumentException('Prefetch must be at least the positive number of coroutines');
+        }
+        $running = new Channel($coroutines);
+        $available = new Channel($prefetch);
         $waitGroup = new WaitGroup();
         $finished = new Channel(1);
         /** @var \ArrayObject<int, Message> $deliveries */
@@ -255,20 +258,20 @@ class Swoole extends Adapter
         }
         try {
             while (!$this->isStopped()) {
-                while ($capacity - \count($deliveries) < min($batch, max(1, intdiv($capacity, 2))) && !$this->isStopped()) {
+                while ($prefetch - \count($deliveries) < max(1, intdiv($prefetch, 2)) && !$this->isStopped()) {
                     $available->pop(0.1);
                 }
                 if ($this->isStopped()) {
                     break;
                 }
-                $messages = $this->nextBatchFrom($errorCallback, $queue, $consumer, min($batch, $capacity - \count($deliveries)));
+                $messages = $this->nextBatchFrom($errorCallback, $queue, $consumer, $prefetch - \count($deliveries));
                 foreach ($messages as $message) {
                     $deliveries[spl_object_id($message)] = $message;
                 }
                 foreach ($messages as $index => $message) {
-                    $coroutines->push(true);
+                    $running->push(true);
                     if ($this->isStopped()) {
-                        $coroutines->pop();
+                        $running->pop();
                         $waiting = \array_slice($messages, $index);
                         try {
                             if (\is_callable([$consumer, 'release'])) {
@@ -288,14 +291,14 @@ class Swoole extends Adapter
                         break;
                     }
                     $waitGroup->add();
-                    Coroutine::create(function () use ($message, $queue, $consumer, $messageCallback, $successCallback, $errorCallback, $coroutines, $available, $waitGroup, &$deliveries): void {
+                    Coroutine::create(function () use ($message, $queue, $consumer, $messageCallback, $successCallback, $errorCallback, $running, $available, $waitGroup, &$deliveries): void {
                         try {
-                            $this->processFrom($message, function (Message $message) use ($messageCallback, $coroutines): void {
+                            $this->processFrom($message, function (Message $message) use ($messageCallback, $running): void {
                                 try {
                                     $messageCallback($message);
                                 } finally {
                                     // Confirmation may remain in flight while the next handler starts.
-                                    $coroutines->pop();
+                                    $running->pop();
                                 }
                             }, $successCallback, $errorCallback, $queue, $consumer);
                         } catch (\Throwable $error) {

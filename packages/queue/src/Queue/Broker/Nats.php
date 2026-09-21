@@ -848,7 +848,7 @@ class Nats implements Synchronous, Consumer, Bounded
         return true;
     }
 
-    private ?\Utopia\Queue\Buffer $acknowledgements = null;
+    private ?\Utopia\Queue\Internal\Buffer $acknowledgements = null;
 
     public function commit(Queue $queue, Message $message): void
     {
@@ -867,17 +867,13 @@ class Nats implements Synchronous, Consumer, Bounded
         // Left behind, the entry has no owner and pins a JetStreamMessage for
         // the life of the worker, one per failed ack.
         try {
-            $this->acknowledgements ??= new \Utopia\Queue\Buffer(fn(array $messages, ?callable $resolved): array
-                => $this->command(function () use ($messages, $resolved): array {
-                    $results = [];
-                    $this->commandsJs()->ackBatch($messages, static function (int $index, ?\Throwable $error) use (&$results, $resolved): void {
-                        $results[$index] = $error ?? true;
-                        if ($resolved !== null) {
-                            $resolved($index, $results[$index]);
-                        }
+            $this->acknowledgements ??= new \Utopia\Queue\Internal\Buffer(function (array $messages, callable $resolved): void {
+                $this->command(function () use ($messages, $resolved): void {
+                    $this->commandsJs()->ackBatch($messages, static function (int $index, ?\Throwable $error) use ($resolved): void {
+                        $resolved($index, $error ?? true);
                     });
-                    return $results;
-                }));
+                });
+            });
             $this->acknowledgements->request($jsMessage);
         } finally {
             unset($this->inFlight[$pid]);

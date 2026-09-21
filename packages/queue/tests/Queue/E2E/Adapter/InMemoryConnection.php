@@ -59,12 +59,12 @@ class InMemoryConnection implements Connection
                 }
                 $this->remove($keys[0]);
                 $this->remove($keys[6]);
-                if ($args[2] === 2) {
+                if ($args[2] === 'release') {
                     $raw = $this->get($keys[1]);
                     if (\is_string($raw)) {
                         $this->rightPush($keys[5], $raw);
                     } $this->remove($keys[1]);
-                } elseif ($args[2] === 1) {
+                } elseif ($args[2] === 'commit') {
                     $this->remove($keys[1]);
                 } else {
                     $this->leftPush($keys[5], $args[1]);
@@ -73,7 +73,7 @@ class InMemoryConnection implements Connection
                     }
                 }
                 $this->decrement($keys[3]);
-                if ($args[2] !== 2) {
+                if ($args[2] !== 'release') {
                     $this->increment($keys[4]);
                 }
                 $results[] = 1;

@@ -1189,7 +1189,7 @@ final class NatsBrokerTest extends TestCase
                     $adapter->stop();
                 },
                 [
-                    ['queue' => $queue, 'maxCoroutines' => $cap],
+                    ['queue' => $queue, 'coroutines' => $cap],
                 ],
             );
 
@@ -1204,7 +1204,7 @@ final class NatsBrokerTest extends TestCase
         $this->assertFalse($timedOut, 'the consume loop had to be stopped by the watchdog');
         $this->assertSame($total, $handled, 'every message must be handled');
         $this->assertGreaterThan(1, $overlap, 'the handlers must have actually overlapped');
-        $this->assertLessThanOrEqual($cap, $overlap, 'concurrency stays bounded by maxCoroutines');
+        $this->assertLessThanOrEqual($cap, $overlap, 'concurrency stays bounded by coroutines');
         $this->assertSame(0, $depth, 'every message must be acknowledged');
     }
 

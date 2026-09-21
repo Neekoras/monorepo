@@ -26,7 +26,7 @@ class Redis implements Synchronous, Consumer
     private const int REAP_LIMIT = 1_000;
 
     private bool $closed = false;
-    /** @var array<string, \Utopia\Queue\Buffer> */
+    /** @var array<string, \Utopia\Queue\Internal\Buffer> */
     private array $settlements = [];
 
     /**
@@ -177,26 +177,29 @@ class Redis implements Synchronous, Consumer
 
     public function commit(Queue $queue, Message $message): void
     {
-        $this->settle($queue, $message, true);
+        $this->settle($queue, $message, 'commit');
     }
 
     public function reject(Queue $queue, Message $message): void
     {
-        $this->settle($queue, $message, false);
+        $this->settle($queue, $message, 'reject');
     }
 
-    private function settle(Queue $queue, Message $message, ?bool $success): void
+    /** @param 'commit'|'reject'|'release' $operation */
+    private function settle(Queue $queue, Message $message, string $operation): void
     {
         $pid = $message->getPid();
-        $outcome = $success ? 'success' : 'failed';
-        $list = $success === null ? 'queue' : ($message->isTerminal() ? 'dead' : 'failed');
-        $this->settlements[$queue->namespace] ??= new \Utopia\Queue\Buffer(function (array $requests, ?callable $resolved): array {
+        $outcome = $operation === 'commit' ? 'success' : 'failed';
+        $list = $operation === 'release' ? 'queue' : ($message->isTerminal() ? 'dead' : 'failed');
+        $this->settlements[$queue->namespace] ??= new \Utopia\Queue\Internal\Buffer(function (array $requests, callable $resolved): void {
             $keys = $args = [];
             foreach ($requests as [$requestKeys, $requestArgs]) {
                 array_push($keys, ...$requestKeys);
                 array_push($args, ...$requestArgs);
             }
-            return array_map(static fn($result): mixed => $result === false ? new \RedisException('Queue settlement failed') : $result, $this->script($this->commands, 'settle', $keys, $args));
+            foreach ($this->script($this->commands, 'settle', $keys, $args) as $index => $result) {
+                $resolved($index, $result === false ? new \RedisException('Queue settlement failed') : $result);
+            }
         });
         $result = $this->settlements[$queue->namespace]->request([[
             "{$queue->namespace}.claims.{$queue->name}.{$pid}",
@@ -206,7 +209,7 @@ class Redis implements Synchronous, Consumer
             "{$queue->namespace}.stats.{$queue->name}.{$outcome}",
             "{$queue->namespace}.{$list}.{$queue->name}",
             "{$queue->namespace}.owners.{$queue->name}.{$pid}",
-        ], [$message->getReceipt() ?? '', $pid, $success === null ? 2 : ($success ? 1 : 0), $queue->jobTtl]]);
+        ], [$message->getReceipt() ?? '', $pid, $operation, $queue->jobTtl]]);
         if ($result !== 1) {
             throw new \RuntimeException('Queue delivery is no longer owned by this consumer');
         }
@@ -216,7 +219,7 @@ class Redis implements Synchronous, Consumer
     public function release(Queue $queue, Message ...$messages): void
     {
         foreach (array_reverse($messages) as $message) {
-            $this->settle($queue, $message, null);
+            $this->settle($queue, $message, 'release');
         }
     }
 

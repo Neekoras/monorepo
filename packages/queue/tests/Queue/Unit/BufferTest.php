@@ -6,7 +6,7 @@ namespace Tests\Unit;
 
 use PHPUnit\Framework\TestCase;
 use Swoole\Coroutine;
-use Utopia\Queue\Buffer;
+use Utopia\Queue\Internal\Buffer;
 
 final class BufferTest extends TestCase
 {
@@ -14,10 +14,12 @@ final class BufferTest extends TestCase
     {
         $groups = $results = [];
         Coroutine\run(function () use (&$groups, &$results): void {
-            $buffer = new Buffer(function (array $requests, ?callable $resolved) use (&$groups): array {
+            $buffer = new Buffer(function (array $requests, callable $resolved) use (&$groups): void {
                 $groups[] = \count($requests);
                 Coroutine::sleep(0.01);
-                return array_map(fn($n) => $n === 3 ? new \RuntimeException('uncertain') : $n, $requests);
+                foreach ($requests as $index => $n) {
+                    $resolved($index, $n === 3 ? new \RuntimeException('uncertain') : $n);
+                }
             });
             foreach (range(1, 100) as $n) {
                 Coroutine::create(function () use ($buffer, $n, &$results): void {
@@ -40,4 +42,43 @@ final class BufferTest extends TestCase
         $this->assertSame('uncertain', $results[3]);
         $this->assertSame(100, $results[100]);
     }
+
+    public function testConfirmedResultsSurviveLaterTransportFailure(): void
+    {
+        $results = [];
+        $firstReturnedBeforeFailure = false;
+        Coroutine\run(function () use (&$results, &$firstReturnedBeforeFailure): void {
+            $buffer = new Buffer(function (array $requests, callable $resolved) use (&$results, &$firstReturnedBeforeFailure): void {
+                Coroutine::sleep(0.001);
+                foreach ($requests as $index => $request) {
+                    if ($request === 3) {
+                        $firstReturnedBeforeFailure = ($results[2] ?? null) === 2;
+                        throw new \RuntimeException('connection lost');
+                    }
+                    $resolved($index, $request);
+                    Coroutine::sleep(0.001);
+                }
+            });
+            foreach (range(1, 4) as $request) {
+                Coroutine::create(function () use ($buffer, $request, &$results): void {
+                    try {
+                        $results[$request] = $buffer->request($request);
+                    } catch (\RuntimeException $error) {
+                        $results[$request] = $error->getMessage();
+                    }
+                });
+            }
+        });
+        ksort($results);
+        $this->assertTrue($firstReturnedBeforeFailure);
+        $this->assertSame([1 => 1, 2 => 2, 3 => 'connection lost', 4 => 'connection lost'], $results);
+    }
+
+    public function testMissingResultFailsSynchronousRequest(): void
+    {
+        $buffer = new Buffer(static function (array $requests, callable $resolved): void {});
+        $this->expectExceptionMessage('Missing transport result');
+        $buffer->request('unconfirmed');
+    }
+
 }

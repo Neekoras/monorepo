@@ -348,7 +348,7 @@ final class RedisReservationTest extends TestCase
                 static function ($message, \Throwable $error) use (&$errors): void {
                     $errors[] = $error->getMessage();
                 },
-                [['queue' => $this->queue, 'maxCoroutines' => 1]],
+                [['queue' => $this->queue, 'coroutines' => 1]],
             );
         });
         $this->assertSame([], $errors);

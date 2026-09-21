@@ -25,7 +25,7 @@ final class PrefetchTest extends TestCase
     }
 
     #[DataProvider('brokers')]
-    public function testBatchOfOneHundredWithOneCoroutine(string $name): void
+    public function testPrefetchOfOneHundredWithOneCoroutine(string $name): void
     {
         $errors = [];
         $done = $active = $peak = 0;
@@ -50,7 +50,7 @@ final class PrefetchTest extends TestCase
             }, function ($message, $error) use (&$errors, $adapter): void {
                 $errors[] = $error->getMessage();
                 $adapter->stop();
-            }, [['queue' => $queue, 'maxCoroutines' => 1, 'batch' => 100]]);
+            }, [['queue' => $queue, 'coroutines' => 1, 'prefetch' => 100]]);
             $this->assertSame([], $broker->receive($queue, 0, 100), 'prefetched messages were renewed and acknowledged, not redelivered');
             $broker->close();
         });
@@ -79,7 +79,7 @@ final class PrefetchTest extends TestCase
                 static function ($message, $error): never {
                     throw $error;
                 },
-                [['queue' => $queue, 'maxCoroutines' => 1, 'batch' => 100]],
+                [['queue' => $queue, 'coroutines' => 1, 'prefetch' => 100]],
             );
             \Swoole\Coroutine::sleep(0.05);
             $remaining = $broker->receive($queue, 1, 100);

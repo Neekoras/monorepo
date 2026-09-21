@@ -6,9 +6,9 @@ Research: [canonical clients and Redis-list implementations](prior-art.md).
 
 ## Objective and contract
 
-Batch size controls prefetch; coroutines control concurrent handlers. Batch 100 with one coroutine must work. Reduce network round trips without acknowledging unfinished work or changing NATS's explicit, server-confirmed acknowledgements.
+`job('stats-usage', coroutines: 1, prefetch: 100)` separates concurrent handlers from the total unacknowledged limit. Prefetch defaults to coroutines and cannot be lower. Batch size describes one broker operation. Reduce network round trips without acknowledging unfinished work or changing NATS's explicit, server-confirmed acknowledgements.
 
-- Bound waiting, running, and completed-but-unconfirmed deliveries together by `max(batch, coroutines)`.
+- Bound waiting, running, and completed-but-unconfirmed deliveries together by `prefetch`.
 - Return available messages promptly on sparse queues; never wait to fill a batch.
 - Keep independent outcomes for successes, failures, malformed messages, and uncertain confirmations. An acknowledgement error must not reject work whose handler succeeded.
 - Retain at-least-once delivery. A crash after a side effect but before confirmation can produce duplicates; this is not an exactly-once contract.
@@ -43,29 +43,31 @@ Keep JetStream responsible for pending deliveries, retry accounting, and recover
 
 Consolidate the two receive loops. Refill a bounded delivery buffer independently of processing coroutines, and renew all outstanding deliveries from one queue-level loop. A coroutine can begin the next handler while an earlier completion awaits confirmation. Each message retains its own context and success hook; success hooks follow their own confirmation and may run after a later handler has started.
 
-Keep `receive`, `commit`, and `reject` contracts per message. `extend` accepts multiple messages. Optional `release` returns prefetched work that never entered a handler on graceful stop. Existing third-party consumers with single-message renewal still receive individual renewal calls; consumers without release support rely on their broker's recovery.
+Keep `receive`, `commit` (acknowledgement), and `reject` (retry/dead-letter policy) contracts per message. Internal Redis operations use explicit `commit`, `reject`, and `release` names rather than optional success flags or numeric outcomes. `extend` accepts multiple messages. Optional `release` returns prefetched work that never entered a handler on graceful stop, without incrementing attempts. Existing third-party consumers with single-message renewal still receive individual renewal calls; consumers without release support rely on their broker's recovery. No new renewal capability is required in queue 5; retain single-message detection for existing third-party implementations.
+
+The shared buffer lives under `Internal` and delivers each result through one required incremental callback, with no aggregate result API. Redis groups by namespace; NATS groups acknowledgements on its command connection. Raw Redis reservation and finalization remain private, and receipts stay opaque on `Message`.
 
 The process supervisor bounds shutdown with a configurable deadline, 30 seconds by default. Forced termination leaves unfinished deliveries recoverable. Pooled consumers retain their existing lease serialization; dedicated broker connections provide completion batching.
 
 ## Validation and remaining gates
 
-Completed local checks include queue and NATS unit suites, the existing NATS broker suite, and real Redis/Redis Cluster/Dragonfly checks. Tests cover batch 100 with one coroutine, renewal of waiting messages past the NATS deadline, independent outcomes, stale ownership, process death after a blocking Redis move, ambiguous completion replies, script-cache loss, unsafe Cluster placement, returning work that never started, and bounded supervisor shutdown.
+Completed local checks include queue and NATS unit suites, the existing NATS broker suite, and real Redis/Redis Cluster/Dragonfly checks. Tests cover prefetch 100 with one coroutine, renewal of waiting messages past the NATS deadline, independent outcomes, stale ownership, process death after a blocking Redis move, ambiguous completion replies, script-cache loss, unsafe Cluster placement, returning work that never started, and bounded supervisor shutdown.
 
-Compare batch 1, 8, 32, and 100 at fixed coroutine count, payloads, persistence, and confirmation guarantees. Record both wall time and client/server CPU, actual batch fill, requests, bytes, memory, retries, and queue latency. Local no-op measurements establish transport behavior, not a production batch recommendation. Exercise large historical processing lists and representative stats-usage handlers before a canary.
+Compare prefetch 1, 8, 32, and 100 with one coroutine, payloads, persistence, and confirmation guarantees. Record both wall time and client/server CPU, actual batch fill, requests, bytes, memory, retries, and queue latency. Local no-op measurements establish transport behavior, not a production batch recommendation. Exercise large historical processing lists and representative stats-usage handlers before a canary.
 
 For stats-usage, validate buffered ClickHouse writes versus acknowledgement timing. Handler return can precede durable persistence. Check usage totals under forced failures and record any pre-existing durability issue separately; throughput cannot establish correctness.
 
 ## Release and rollout order
 
 1. NATS transport support is released as [1.4.0](https://github.com/utopia-php/nats/releases/tag/1.4.0); the queue requires `^1.4`.
-2. Merge and release queue as a new major version: custom Redis connections must implement `execute`, and Cluster requires shared key placement. Release Platform with the queue-major allowance.
-3. Prepare Appwrite's package/lock updates, then Cloud's package/lock updates and removal of the batch-versus-coroutines clamp. Keep restrictions for adapters that cannot consume batches. Cloud must not enable this behavior against queue 4.
+2. Merge and release queue as a new major version: custom Redis connections must implement `execute`, and Cluster requires shared key placement. Release Platform requiring queue 5 and its updated job configuration.
+3. Prepare Appwrite's package/lock updates, then Cloud's package/lock updates. Rename job configuration keys from `maxCoroutines`/`batch` to `coroutines`/`prefetch`, including named calls. Keep deployment environment names unchanged; map their values to `prefetch: max($batch, $coroutines)` to preserve the previous effective limit, or omit prefetch to use coroutines. Remove the old upper clamp. Keep restrictions for adapters that cannot consume batches. Cloud must not enable this behavior against queue 4.
 4. Test both Redis and NATS integrations in staging; current NATS-backed staging traffic cannot validate the Redis path.
-5. Open a stats-usage deployment canary with one coroutine, comparing batch 1, 8, 32, and 100 under comparable load. No production default changes before the correctness and efficiency gates pass.
+5. Open a stats-usage deployment canary with one coroutine, comparing prefetch 1, 8, 32, and 100 under comparable load. No production default changes before the correctness and efficiency gates pass.
 6. Expand only after queue progress, CPU efficiency, latency, and usage accounting checks pass.
 
 Queue 5 removes the `priority` argument from `publish`, `enqueueMany`, and `enqueue`, and removes priority ordering. Redis keeps the same list and existing payloads. NATS keeps `q.<name>.normal` and the `worker` durable, so existing normal messages remain consumable. Before upgrading a queue that used priority, stop priority producers and drain `worker_priority` with old workers, including pending and unacknowledged deliveries. New workers do not consume `q.<name>.priority`. An empty legacy consumer may remain; this change does not delete consumers or queued messages automatically. Do not run old priority producers alongside new workers.
 
-Before rollback, stop receiving, drain outstanding deliveries and their ownership records, and recover expired reservation lists while a new consumer's maintenance path remains available. Verify the reservation registry is empty before retiring the last capable consumer. Old consumers can read the unchanged ready payloads but cannot recover new reservations. Reducing the batch to one alone is not a rollback procedure.
+Before rollback, stop receiving, drain outstanding deliveries and their ownership records, and recover expired reservation lists while a new consumer's maintenance path remains available. Verify the reservation registry is empty before retiring the last capable consumer. Old consumers can read the unchanged ready payloads but cannot recover new reservations. Reducing prefetch to one alone is not a rollback procedure.
 
 Record implementation, benchmark, and deployment findings on the tracking issue. No production settings change as part of implementation.

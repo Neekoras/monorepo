@@ -107,7 +107,7 @@ final class KubernetesJobAdapterTest extends TestCase
                 fn(): null => null,
                 fn(): null => null,
                 [
-                    ['queue' => $queue, 'maxCoroutines' => 1],
+                    ['queue' => $queue, 'coroutines' => 1],
                 ],
             );
         });
@@ -134,7 +134,7 @@ final class KubernetesJobAdapterTest extends TestCase
                 fn(): null => null,
                 fn(): null => null,
                 [
-                    ['queue' => $queue, 'maxCoroutines' => 1],
+                    ['queue' => $queue, 'coroutines' => 1],
                 ],
             );
         });

@@ -91,7 +91,7 @@ final class ConsumerResilienceTest extends TestCase
                     $reportedMessages[] = $message;
                 },
                 [
-                    ['queue' => $queue, 'maxCoroutines' => 1],
+                    ['queue' => $queue, 'coroutines' => 1],
                 ],
             );
         });

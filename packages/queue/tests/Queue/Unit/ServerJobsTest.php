@@ -73,19 +73,19 @@ final class ServerJobsTest extends TestCase
             [
                 [
                     'queue' => new Queue('database_db_main'),
-                    'maxCoroutines' => 1,
+                    'coroutines' => 1,
                 ],
                 [
                     'queue' => new Queue('v1-functions'),
-                    'maxCoroutines' => 8,
+                    'coroutines' => 8,
                 ],
             ],
         );
 
         $this->assertSame(
             [
-                ['queue' => 'database_db_main', 'maxCoroutines' => 1, 'batch' => 1],
-                ['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1],
+                ['queue' => 'database_db_main', 'coroutines' => 1, 'prefetch' => 1],
+                ['queue' => 'v1-functions', 'coroutines' => 8, 'prefetch' => 8],
             ],
             $adapter->consumed,
         );
@@ -101,7 +101,7 @@ final class ServerJobsTest extends TestCase
 
         $this->assertSame(
             [
-                ['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1],
+                ['queue' => 'v1-functions', 'coroutines' => 8, 'prefetch' => 8],
             ],
             $adapter->consumed,
         );
@@ -118,8 +118,8 @@ final class ServerJobsTest extends TestCase
 
         $this->assertSame(
             [
-                ['queue' => 'database_db_main', 'maxCoroutines' => 1, 'batch' => 1],
-                ['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1],
+                ['queue' => 'database_db_main', 'coroutines' => 1, 'prefetch' => 1],
+                ['queue' => 'v1-functions', 'coroutines' => 8, 'prefetch' => 8],
             ],
             $adapter->consumed,
         );
@@ -172,7 +172,7 @@ final class ServerJobsTest extends TestCase
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 1, 'batch' => 1]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-functions', 'coroutines' => 1, 'prefetch' => 1]], $adapter->consumed);
     }
 
     /**
@@ -197,7 +197,7 @@ final class ServerJobsTest extends TestCase
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-functions', 'coroutines' => 8, 'prefetch' => 8]], $adapter->consumed);
     }
 
     /**
@@ -234,7 +234,7 @@ final class ServerJobsTest extends TestCase
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-functions', 'coroutines' => 8, 'prefetch' => 8]], $adapter->consumed);
     }
 
     /**
@@ -249,7 +249,7 @@ final class ServerJobsTest extends TestCase
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-functions', 'coroutines' => 8, 'prefetch' => 8]], $adapter->consumed);
     }
 
     /**
@@ -265,38 +265,53 @@ final class ServerJobsTest extends TestCase
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-functions', 'maxCoroutines' => 8, 'batch' => 1]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-functions', 'coroutines' => 8, 'prefetch' => 8]], $adapter->consumed);
     }
 
-    public function testStartCarriesTheBatchToTheConsumeLoop(): void
+    public function testStartCarriesPrefetchToTheConsumeLoop(): void
     {
         $adapter = new RecordingAdapter();
         $server = new Server($adapter);
-        $server->job('v1-stats-usage', 16, 8);
+        $server->job('v1-stats-usage', coroutines: 8, prefetch: 16);
 
         $server->start();
 
-        $this->assertSame([['queue' => 'v1-stats-usage', 'maxCoroutines' => 16, 'batch' => 8]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-stats-usage', 'coroutines' => 8, 'prefetch' => 16]], $adapter->consumed);
     }
 
-    public function testBatchCanExceedCoroutines(): void
+    public function testPrefetchCanExceedCoroutines(): void
     {
         $adapter = new RecordingAdapter();
         $server = new Server($adapter);
         $server->job('v1-stats-usage', 1, 100);
         $server->start();
-        $this->assertSame([['queue' => 'v1-stats-usage', 'maxCoroutines' => 1, 'batch' => 100]], $adapter->consumed);
+        $this->assertSame([['queue' => 'v1-stats-usage', 'coroutines' => 1, 'prefetch' => 100]], $adapter->consumed);
     }
 
-    public function testBatchDefaultsToOneAndIsFloored(): void
+    public function testPrefetchDefaultsToCoroutines(): void
     {
         $server = new Server(new RecordingAdapter());
         $server->job('a');
-        $server->job('b', 4, 0);
+        $server->job('b', coroutines: 4);
 
-        $this->assertSame(1, $server->batch('a'));
-        $this->assertSame(1, $server->batch('b'), 'a batch below one is a batch of one, like the coroutine cap');
+        $this->assertSame(1, $server->prefetch('a'));
+        $this->assertSame(4, $server->prefetch('b'));
     }
+
+    public function testPrefetchBelowCoroutinesIsRejectedBeforeRegisteringJob(): void
+    {
+        $server = new Server(new RecordingAdapter());
+        foreach ([0, 1, 3] as $prefetch) {
+            try {
+                $server->job('invalid', coroutines: 4, prefetch: $prefetch);
+                $this->fail('Prefetch below concurrency must be rejected');
+            } catch (\InvalidArgumentException $error) {
+                $this->assertStringContainsString('Prefetch', $error->getMessage());
+                $this->assertSame([], $server->jobs());
+            }
+        }
+    }
+
 }
 
 final class FakeConsumer implements Consumer
@@ -351,7 +366,7 @@ final class ExclusiveFakeConsumer implements Consumer, Exclusive
 final class RecordingAdapter extends Adapter
 {
     /**
-     * @var list<array{queue: string, maxCoroutines: int}>
+     * @var list<array{queue: string, coroutines: int}>
      */
     public array $consumed = [];
 
@@ -413,17 +428,17 @@ final class RecordingAdapter extends Adapter
     #[\Override]
     protected function run(
         Queue $queue,
-        int $maxCoroutines,
+        int $coroutines,
         callable $messageCallback,
         callable $successCallback,
         callable $errorCallback,
         Consumer $consumer,
-        int $batch = 1,
+        ?int $prefetch = null,
     ): void {
         $this->consumed[] = [
             'queue' => $queue->name,
-            'maxCoroutines' => $maxCoroutines,
-            'batch' => $batch,
+            'coroutines' => $coroutines,
+            'prefetch' => $prefetch,
         ];
     }
 }
