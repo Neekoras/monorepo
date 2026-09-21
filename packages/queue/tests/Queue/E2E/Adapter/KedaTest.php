@@ -94,7 +94,7 @@ final class KedaTest extends TestCase
         }
 
         $this->assertSame(0, $this->queueLength(), 'KEDA-spawned workers should drain the queue');
-        // consume() pops from the main list before handling, so a drained main
+        // receive() pops from the main list before handling, so a drained main
         // queue alone doesn't prove success — assert nothing landed in .failed.*.
         $this->assertSame(0, $this->failedLength(), 'no messages should have failed');
         $this->assertGreaterThanOrEqual(1, $this->jobCount(), 'KEDA should have spawned at least one worker Job');

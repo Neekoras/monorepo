@@ -35,7 +35,7 @@ final class BatchedReceiveTest extends TestCase
             $broker->publish($queue, ['n' => $n]);
         }
 
-        $batch = $broker->consume($queue, 0, 4);
+        $batch = $broker->receive($queue, 0, 4);
 
         $this->assertCount(4, $batch);
         $this->assertSame([1, 2, 3, 4], array_map(static fn(Message $m): int => $m->getPayload()['n'], $batch), 'a batch is FIFO, like the single receive');
@@ -50,20 +50,20 @@ final class BatchedReceiveTest extends TestCase
 
         $broker->publish($queue, ['n' => 1]);
 
-        $this->assertCount(1, $broker->consume($queue, 0, 16));
+        $this->assertCount(1, $broker->receive($queue, 0, 16));
     }
 
     public function testAnEmptyQueueYieldsAnEmptyBatch(): void
     {
         $broker = $this->broker(new InMemoryConnection());
 
-        $this->assertSame([], $broker->consume($this->queue(), 0, 8));
+        $this->assertSame([], $broker->receive($this->queue(), 0, 8));
     }
 
     /**
      * Omitting the count claims exactly one message.
      */
-    public function testConsumeDefaultsToOne(): void
+    public function testReceiveDefaultsToOne(): void
     {
         $connection = new InMemoryConnection();
         $broker = $this->broker($connection);
@@ -72,7 +72,7 @@ final class BatchedReceiveTest extends TestCase
         $broker->publish($queue, ['n' => 1]);
         $broker->publish($queue, ['n' => 2]);
 
-        $batch = $broker->consume($queue, 0);
+        $batch = $broker->receive($queue, 0);
         $this->assertCount(1, $batch);
         $message = $batch[0];
 
@@ -91,7 +91,7 @@ final class BatchedReceiveTest extends TestCase
             $broker->publish($queue, ['n' => $n]);
         }
 
-        $batch = $broker->consume($queue, 0, 5);
+        $batch = $broker->receive($queue, 0, 5);
 
         $broker->reject($queue, array_shift($batch));
         foreach ($batch as $message) {
@@ -101,21 +101,21 @@ final class BatchedReceiveTest extends TestCase
 
         $this->assertSame(1, $broker->getQueueSize($queue, failedJobs: true));
         $this->assertSame(0, $broker->reap($queue, olderThan: 0));
-        $this->assertSame([], $broker->consume($queue, 0, 5));
+        $this->assertSame([], $broker->receive($queue, 0, 5));
     }
 
-    public function testNonPositiveCountsConsumeOneAndClosedConsumersReturnNothing(): void
+    public function testNonPositiveCountsReceiveOneAndClosedConsumersReturnNothing(): void
     {
         $broker = $this->broker(new InMemoryConnection());
         $queue = $this->queue();
         foreach ([0, -1] as $n) {
             $broker->publish($queue, ['n' => $n]);
-            $this->assertCount(1, $broker->consume($queue, 0, n: $n));
+            $this->assertCount(1, $broker->receive($queue, 0, n: $n));
         }
-        $this->assertSame([], $broker->consume($queue, 0));
+        $this->assertSame([], $broker->receive($queue, 0));
         $broker->publish($queue, ['n' => 1]);
         $broker->close();
-        $this->assertSame([], $broker->consume($queue, 0));
+        $this->assertSame([], $broker->receive($queue, 0));
         $this->assertSame(1, $broker->getQueueSize($queue));
     }
 
@@ -129,10 +129,10 @@ final class BatchedReceiveTest extends TestCase
             $broker->publish($queue, ['n' => $n]);
         }
 
-        $this->assertCount(1, $consumer->consume($queue, 0));
-        $this->assertCount(3, $consumer->consume($queue, 0, n: 3));
-        $this->assertSame([], $consumer->consume($queue, 0));
-        $this->assertSame([], new \Utopia\Queue\Broker\Pool()->consume($queue, 0));
+        $this->assertCount(1, $consumer->receive($queue, 0));
+        $this->assertCount(3, $consumer->receive($queue, 0, n: 3));
+        $this->assertSame([], $consumer->receive($queue, 0));
+        $this->assertSame([], new \Utopia\Queue\Broker\Pool()->receive($queue, 0));
     }
 
     /**
@@ -151,7 +151,7 @@ final class BatchedReceiveTest extends TestCase
         }
 
         try {
-            $broker->consume($queue, 0, 4);
+            $broker->receive($queue, 0, 4);
             $this->fail('the claim failure must reach the caller');
         } catch (\RuntimeException) {
         }
@@ -159,7 +159,7 @@ final class BatchedReceiveTest extends TestCase
         $this->assertSame(4, $broker->getQueueSize($queue), 'nothing is lost');
 
         $connection->failClaim = false;
-        $batch = $broker->consume($queue, 0, 4);
+        $batch = $broker->receive($queue, 0, 4);
 
         $this->assertSame(
             [1, 2, 3, 4],
@@ -182,7 +182,7 @@ final class BatchedReceiveTest extends TestCase
         $connection->leftPush(self::NAMESPACE . '.queue.' . self::QUEUE, '{"truncated"');
         $broker->publish($queue, ['n' => 3]);
 
-        $batch = $broker->consume($queue, 0, 8);
+        $batch = $broker->receive($queue, 0, 8);
 
         $this->assertSame([1, 3], array_map(static fn(Message $m): int => $m->getPayload()['n'], $batch));
         $this->assertSame(1, $connection->listSize(self::NAMESPACE . '.poison.' . self::QUEUE));

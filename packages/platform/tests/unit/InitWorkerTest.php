@@ -89,16 +89,10 @@ final class InitWorkerTest extends TestCase
 
 final class FakeConsumer implements Consumer
 {
-    /** @return list<Message> */
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    // Initialization never receives; never is compatible with both queue contracts.
+    public function receive(Queue $queue, int $timeout, int $n = 1): never
     {
-        return [];
-    }
-
-    // Keep the fake compatible with released queue versions in registry tests.
-    public function receive(Queue $queue, int $timeout): null
-    {
-        return null;
+        throw new \LogicException('Worker initialization must not receive messages');
     }
 
     public function commit(Queue $queue, Message $message): void {}

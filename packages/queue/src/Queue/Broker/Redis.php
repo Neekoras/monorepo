@@ -88,7 +88,7 @@ class Redis implements Synchronous, Consumer
         return $this;
     }
 
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         if ($this->isClosed()) {
             return [];
@@ -345,7 +345,7 @@ class Redis implements Synchronous, Consumer
         $this->closed = true;
     }
 
-    /** @phpstan-impure close() flips this from another coroutine mid-consume(). */
+    /** @phpstan-impure close() flips this from another coroutine mid-receive(). */
     private function isClosed(): bool
     {
         return $this->closed;
@@ -481,7 +481,7 @@ class Redis implements Synchronous, Consumer
     }
 
     /**
-     * Requeue claims whose worker died between consume() and commit/reject —
+     * Requeue claims whose worker died between receive() and commit/reject —
      * their messages sit on the processing list, invisible to consumers and to
      * retry(), until this reclaims them.
      *

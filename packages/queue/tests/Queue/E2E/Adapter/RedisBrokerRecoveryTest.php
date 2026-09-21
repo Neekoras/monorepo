@@ -57,7 +57,7 @@ final class RedisBrokerRecoveryTest extends TestCase
     public function testReapRequeuesAStrandedClaim(): void
     {
         $this->broker->publish($this->queue, ['n' => 1]);
-        $claimed = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->assertSame(1, $this->processingSize(), 'the claim is on the processing list');
         $this->connection->advance(91);
@@ -68,7 +68,7 @@ final class RedisBrokerRecoveryTest extends TestCase
         $this->assertSame(0, $this->processingSize(), 'the stranded claim is reclaimed');
         $this->assertSame(1, $this->broker->getQueueSize($this->queue), 'the message is back on the queue');
 
-        $retried = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $retried = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $retried);
         $this->assertSame(['n' => 1], $retried->getPayload(), 'the payload survives the requeue');
         $this->assertSame(1, $retried->getAttempts(), 'the requeue is counted');
@@ -77,7 +77,7 @@ final class RedisBrokerRecoveryTest extends TestCase
     public function testReapLeavesClaimsYoungerThanTheCutoff(): void
     {
         $this->broker->publish($this->queue, ['n' => 1]);
-        $this->broker->consume($this->queue, 0);
+        $this->broker->receive($this->queue, 0);
 
         $requeued = $this->broker->reap($this->queue, olderThan: 3600);
 
@@ -88,7 +88,7 @@ final class RedisBrokerRecoveryTest extends TestCase
     public function testReapDropsClaimsWhosePayloadExpired(): void
     {
         $this->broker->publish($this->queue, ['n' => 1]);
-        $claimed = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->connection->remove('tests.jobs.recovery.' . $claimed->getPid());
 
@@ -103,13 +103,13 @@ final class RedisBrokerRecoveryTest extends TestCase
     {
         $this->broker->publish($this->queue, ['n' => 1]);
 
-        $claimed = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertSame(0, $claimed->getAttempts());
         $this->connection->advance(91);
 
         foreach ([1, 2] as $attempt) {
             $this->broker->reap($this->queue, olderThan: 0);
-            $claimed = $this->broker->consume($this->queue, 0)[0] ?? null;
+            $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
             $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
             $this->assertSame($attempt, $claimed->getAttempts());
             $this->connection->advance(91);
@@ -126,7 +126,7 @@ final class RedisBrokerRecoveryTest extends TestCase
     public function testRetryRequeuesARejectedMessageWithItsAttemptCount(): void
     {
         $this->broker->publish($this->queue, ['n' => 1]);
-        $claimed = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->broker->reject($this->queue, $claimed);
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
@@ -136,7 +136,7 @@ final class RedisBrokerRecoveryTest extends TestCase
         $this->broker->retry($this->queue);
 
         $this->assertSame(0, $this->broker->getQueueSize($this->queue, failedJobs: true));
-        $retried = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $retried = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $retried);
         $this->assertSame(['n' => 1], $retried->getPayload());
         $this->assertSame(1, $retried->getAttempts());
@@ -145,7 +145,7 @@ final class RedisBrokerRecoveryTest extends TestCase
     public function testRetryParksExhaustedMessagesOnTheDeadQueue(): void
     {
         $this->broker->publish($this->queue, ['n' => 1]);
-        $claimed = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $claimed->setAttempts(3);
         $this->connection->set('tests.jobs.recovery.' . $claimed->getPid(), new Json()->encode($claimed->asArray()));
@@ -163,8 +163,8 @@ final class RedisBrokerRecoveryTest extends TestCase
     {
         $this->broker->publish($this->queue, ['n' => 1]);
         $this->broker->publish($this->queue, ['n' => 2]);
-        $first = $this->broker->consume($this->queue, 0)[0] ?? null;
-        $second = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $first = $this->broker->receive($this->queue, 0)[0] ?? null;
+        $second = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $first);
         $this->broker->reject($this->queue, $first);
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $second);
@@ -182,7 +182,7 @@ final class RedisBrokerRecoveryTest extends TestCase
     public function testRetryParksEntriesOlderThanTheAgeGate(): void
     {
         $this->broker->publish($this->queue, ['n' => 1]);
-        $claimed = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->broker->reject($this->queue, $claimed);
         $this->backdate($claimed->getPid(), 3600);
@@ -197,7 +197,7 @@ final class RedisBrokerRecoveryTest extends TestCase
     public function testReapParksClaimsOlderThanTheAgeGate(): void
     {
         $this->broker->publish($this->queue, ['n' => 1]);
-        $claimed = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->backdate($claimed->getPid(), 3600);
         $this->connection->advance(91);
@@ -215,7 +215,7 @@ final class RedisBrokerRecoveryTest extends TestCase
         // before the cutoff, claimed by a live worker still running it. The
         // timestamp alone reads it as stranded; the claim key says otherwise.
         $this->broker->publish($this->queue, ['n' => 1]);
-        $claimed = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->backdate($claimed->getPid(), 3600);
 
@@ -231,7 +231,7 @@ final class RedisBrokerRecoveryTest extends TestCase
         // The adapter beats extend() while a handler runs; a beat after the key
         // lapsed (a long GC pause, a slow beat) must put the protection back.
         $this->broker->publish($this->queue, ['n' => 1]);
-        $claimed = $this->broker->consume($this->queue, 0)[0] ?? null;
+        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->backdate($claimed->getPid(), 3600);
         $this->connection->advance(91);
@@ -248,7 +248,7 @@ final class RedisBrokerRecoveryTest extends TestCase
         // a missing claim key alone marks the worker dead.
         $broker = new Redis($this->connection, $this->connection, reapAfter: 0);
         $broker->publish($this->queue, ['n' => 1]);
-        $claimed = $broker->consume($this->queue, 0)[0] ?? null;
+        $claimed = $broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->connection->advance(91);
 
@@ -262,32 +262,32 @@ final class RedisBrokerRecoveryTest extends TestCase
     {
         $broker = new Redis($this->connection, $this->connection, reapAfter: 0);
         $broker->publish($this->queue, ['n' => 1]);
-        $broker->consume($this->queue, 0);
+        $broker->receive($this->queue, 0);
         $this->connection->advance(50);
         $broker->maintain();
 
         // The worker's claim expires while the fleet's sweep lock is held.
         $this->connection->advance(41);
         $broker->maintain();
-        $this->assertSame([], $broker->consume($this->queue, 0));
+        $this->assertSame([], $broker->receive($this->queue, 0));
 
         $this->connection->advance(20);
         $broker->maintain();
-        $this->assertCount(1, $broker->consume($this->queue, 0));
+        $this->assertCount(1, $broker->receive($this->queue, 0));
     }
 
     public function testMaintainSweepsNothingBeforeTheFirstConsume(): void
     {
         $this->broker->publish($this->queue, ['n' => 1]);
-        $this->broker->consume($this->queue, 0);
+        $this->broker->receive($this->queue, 0);
         $this->connection->advance(91);
         $fresh = new Redis($this->connection, $this->connection, reapAfter: 0);
 
         $fresh->maintain();
 
-        $this->assertSame([], $fresh->consume($this->queue, 0));
+        $this->assertSame([], $fresh->receive($this->queue, 0));
         $fresh->maintain();
-        $this->assertCount(1, $fresh->consume($this->queue, 0));
+        $this->assertCount(1, $fresh->receive($this->queue, 0));
     }
 
     public function testBoundedReapRecoversOldestClaimsFirst(): void
@@ -295,11 +295,11 @@ final class RedisBrokerRecoveryTest extends TestCase
         foreach (range(1, 6) as $n) {
             $this->broker->publish($this->queue, ['n' => $n]);
         }
-        $this->broker->consume($this->queue, 0, 6);
+        $this->broker->receive($this->queue, 0, 6);
         $this->connection->advance(91);
 
         $this->assertSame(2, $this->broker->reap($this->queue, olderThan: 0, limit: 2, scan: 4));
-        $recovered = $this->broker->consume($this->queue, 0, 6);
+        $recovered = $this->broker->receive($this->queue, 0, 6);
         $this->assertSame([1, 2], array_map(static fn(\Utopia\Queue\Message $m) => $m->getPayload()['n'], $recovered));
     }
 
@@ -309,14 +309,14 @@ final class RedisBrokerRecoveryTest extends TestCase
         $queues = [new Queue('c', 'a.b'), new Queue('b.c', 'a')];
         foreach ($queues as $queue) {
             $broker->publish($queue, ['queue' => $queue->name]);
-            $broker->consume($queue, 0);
+            $broker->receive($queue, 0);
         }
         $this->connection->advance(91);
 
         $broker->maintain();
 
         foreach ($queues as $queue) {
-            $messages = $broker->consume($queue, 0);
+            $messages = $broker->receive($queue, 0);
             $this->assertCount(1, $messages);
             $this->assertSame(['queue' => $queue->name], $messages[0]->getPayload());
         }

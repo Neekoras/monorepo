@@ -21,7 +21,7 @@ final class ContextConsumer implements Consumer
     public function __construct(private array $messages) {}
 
     #[\Override]
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         unset($queue, $timeout);
 

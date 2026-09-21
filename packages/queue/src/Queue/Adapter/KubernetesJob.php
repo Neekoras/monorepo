@@ -89,7 +89,7 @@ class KubernetesJob extends Adapter
 
     /**
      * Flips the stop flag only. Closing the consumer here would break the
-     * in-flight commit/reject; the blocking consume() unblocks within
+     * in-flight commit/reject; the blocking receive() unblocks within
      * RECEIVE_TIMEOUT, and the server's workerStop callback closes the
      * consumer once the drain returns.
      */
@@ -102,7 +102,7 @@ class KubernetesJob extends Adapter
 
     /**
      * Drain each queue until empty, then return. Processes messages until a
-     * consume() times out or stop() is called, so the Job completes rather
+     * receive() times out or stop() is called, so the Job completes rather
      * than blocking forever like the long-running adapters.
      *
      * @param array<int, array{queue: Queue, maxCoroutines: int, consumer?: Consumer}> $queues
@@ -166,7 +166,7 @@ class KubernetesJob extends Adapter
         $consumer ??= $this->consumer;
 
         while (!$this->isStopped()) {
-            $message = $consumer->consume($queue, static::RECEIVE_TIMEOUT)[0] ?? null;
+            $message = $consumer->receive($queue, static::RECEIVE_TIMEOUT)[0] ?? null;
 
             if (!$message instanceof Message) {
                 break;

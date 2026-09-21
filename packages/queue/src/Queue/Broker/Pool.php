@@ -45,7 +45,7 @@ readonly class Pool implements Synchronous, Consumer, Bounded
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
 
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         return $this->delegate($this->consumer, __FUNCTION__, \func_get_args()) ?? [];
     }
@@ -75,7 +75,7 @@ readonly class Pool implements Synchronous, Consumer, Bounded
      * hold a broker with no notion of extension (Redis), and this class is the
      * consumer for those too.
      *
-     * Correct while the pool leases the same broker to a message's consume()
+     * Correct while the pool leases the same broker to a message's receive()
      * and its extend() -- true at size 1, which is the documented wiring, and
      * the same assumption commit() and reject() already make. At a larger size
      * a lease can land on a broker that never held this message, whose in-flight

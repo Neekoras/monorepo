@@ -137,7 +137,7 @@ final class MaintenanceAdapter extends Adapter
 
 abstract class MaintenanceConsumer implements Consumer
 {
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         return [];
     }

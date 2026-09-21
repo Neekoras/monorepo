@@ -27,9 +27,9 @@
  *                  only processes can.
  *
  * The children are started staggered but measured together. Every consumer provisions
- * on its first consume(), and starting several at once turns that into a storm --
+ * on its first receive(), and starting several at once turns that into a storm --
  * measured at four processes against an already-warm single-replica stream, a child
- * intermittently spent ~124s inside its first consume() while its siblings drained in
+ * intermittently spent ~124s inside its first receive() while its siblings drained in
  * 1.3s. So each child provisions on its own, reports ready, and blocks; the parent
  * publishes the backlog and releases them together.
  *
@@ -125,9 +125,9 @@ final class Timed implements Consumer
 
     public function __construct(private readonly Consumer $inner) {}
 
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
-        return $this->inner->consume($queue, $timeout, $n);
+        return $this->inner->receive($queue, $timeout, $n);
     }
 
     public function commit(Queue $queue, Message $message): void
@@ -247,7 +247,7 @@ function consume(array $args): array
         // Provision on this process's own connections, before the gate opens, so the
         // measured window contains draining and nothing else.
         try {
-            $client->consume($queue, 1);
+            $client->receive($queue, 1);
         } catch (Throwable $e) {
             $error = 'provision: ' . $e->getMessage();
 
@@ -336,7 +336,7 @@ function measure(string $name, array $args): array
     // own tally, and leave its own behind for the next one.
     $client->publish($queue, ['warmup' => true, 'filler' => $filler]);
     $leftover = 0;
-    while (($stale = ($client->consume($queue, 1)[0] ?? null)) instanceof \Utopia\Queue\Message) {
+    while (($stale = ($client->receive($queue, 1)[0] ?? null)) instanceof \Utopia\Queue\Message) {
         $client->commit($queue, $stale);
         if (++$leftover > $total * 10) {
             return $fail('queue would not drain before the run');

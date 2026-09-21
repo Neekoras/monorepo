@@ -52,7 +52,7 @@ Kubernetes Jobs — which is why it's the recommended path.
 
 ## Crash recovery
 
-`consume()` claims a message by atomically popping it from the main queue into
+`receive()` claims a message by atomically popping it from the main queue into
 the broker's processing list before the worker handles it. If a worker pod is
 hard-killed (OOM, node eviction) after the claim but before `commit`/`reject`,
 that message is stranded in the processing list — it's no longer in the main

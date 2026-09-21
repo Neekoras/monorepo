@@ -207,7 +207,7 @@ class Nats implements Synchronous, Consumer, Bounded
      *        call — currently the dead-lettering of a message that exhausted
      *        maxDeliver while no handler held it. Omitted, those failures go
      *        nowhere, which is how a lost dead letter becomes invisible. Called on
-     *        the way out of consume(), after the broker has released its locks, so a
+     *        the way out of receive(), after the broker has released its locks, so a
      *        reporter is free to use this broker.
      * @param float|null $maxAge Message TTL on the work stream, in seconds. Null
      *        derives it from the queue's own jobTtl, which is the historical
@@ -552,7 +552,7 @@ class Nats implements Synchronous, Consumer, Bounded
      * runs under the receive lock, and the reporter is the caller's code: one that
      * publishes a notification -- onto this very broker, plausibly -- would wait on a
      * lock its own call stack is holding. {@see self::flushReports()} hands these over
-     * once consume() has let go.
+     * once receive() has let go.
      */
     private function report(\Throwable $error): void
     {
@@ -577,7 +577,7 @@ class Nats implements Synchronous, Consumer, Bounded
             return;
         }
 
-        // Taken and cleared first, so a reporter that re-enters consume() cannot see
+        // Taken and cleared first, so a reporter that re-enters receive() cannot see
         // the same failure twice.
         $owed = $this->deferred;
         $this->deferred = [];
@@ -648,7 +648,7 @@ class Nats implements Synchronous, Consumer, Bounded
         return $id;
     }
 
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         try {
             return $this->synchronize(fn(): array => $this->pull($queue, $timeout, max(1, $n)));
@@ -659,7 +659,7 @@ class Nats implements Synchronous, Consumer, Bounded
     }
 
     /**
-     * The body of consume(), on the connection lock.
+     * The body of receive(), on the connection lock.
      *
      * Holds it across the fetch, which is what an ack from a handler coroutine waits
      * behind — see the class docblock for that bound and why it is safe.
@@ -977,7 +977,7 @@ class Nats implements Synchronous, Consumer, Bounded
 
     /**
      * Queue depth, read on the commands connection under its lock, so it is safe to
-     * call from a telemetry or health coroutine while another coroutine is in consume()
+     * call from a telemetry or health coroutine while another coroutine is in receive()
      * on this same broker.
      *
      * This used to need a third connection of its own, because nothing serialised the
@@ -1216,7 +1216,7 @@ class Nats implements Synchronous, Consumer, Bounded
 
         // Best-effort terminal dead-lettering for the crash-loop case: a worker that
         // dies (never reject()s) is redelivered by AckWait until maxDeliver, after which
-        // JetStream stops delivering and emits this advisory. We drain it in consume()
+        // JetStream stops delivering and emits this advisory. We drain it in receive()
         // and move the stuck message to the dead stream. Caveat: core
         // advisories are ephemeral, so a message that exhausts while no broker is
         // subscribed stays as pending backlog (still visible) rather than dead-lettered.

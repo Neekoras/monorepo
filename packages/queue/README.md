@@ -196,7 +196,7 @@ Clamping on the marker rather than on a transport name or a version also means t
 
 ### Batched receive
 
-A `consume()` costs at least one round trip, and on a queue whose handler is cheap that round trip *is* the work. `job('…', $coroutines, batch: N)` lets one receive claim up to N messages:
+A `receive()` costs at least one round trip, and on a queue whose handler is cheap that round trip *is* the work. `job('…', $coroutines, batch: N)` lets one receive claim up to N messages:
 
 ```php
 $server
@@ -210,9 +210,9 @@ The batch is bounded by free handler slots, and `Server::start()` refuses a batc
 
 Each message keeps its own acknowledgment — there is no batch commit — so one poison message in a batch of sixteen is rejected on its own and the other fifteen are unaffected.
 
-Consumers expose `consume(Queue $queue, int $timeout, int $n = 1): array`. The result is always a list of up to `$n` claimed messages, or an empty list on timeout. Each returned message needs its own `commit()` or `reject()`. Counts below one use one.
+Consumers expose `receive(Queue $queue, int $timeout, int $n = 1): array`. The result is always a list of up to `$n` claimed messages, or an empty list on timeout. Each returned message needs its own `commit()` or `reject()`. Counts below one use one.
 
-This replaces both `receive()` and `receiveBatch()` and removes `Consumer\Batched`. To migrate a single-message caller, use `$consumer->consume($queue, $timeout)[0] ?? null`; batch callers use `$consumer->consume($queue, $timeout, $n)`. Custom consumers must implement the same list-returning contract.
+This folds `receiveBatch()` into `receive()` and removes `Consumer\Batched`. To migrate a single-message caller, use `$consumer->receive($queue, $timeout)[0] ?? null`; batch callers use `$consumer->receive($queue, $timeout, $n)`. Custom consumers must implement the same list-returning contract.
 
 `Broker\Redis` shares processing-list and counter writes across the batch. Each message still gets its own payload and heartbeat keys. `Broker\Nats` fetches available messages without waiting for the batch to fill.
 

@@ -313,7 +313,7 @@ final class ServerJobsTest extends TestCase
 
 final class FakeConsumer implements Consumer
 {
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         return [];
     }
@@ -334,7 +334,7 @@ final readonly class BoundedFakeConsumer implements Consumer, Bounded
         return $this->ceiling;
     }
 
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         return [];
     }
@@ -348,7 +348,7 @@ final readonly class BoundedFakeConsumer implements Consumer, Bounded
 
 final class ExclusiveFakeConsumer implements Consumer, Exclusive
 {
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         return [];
     }

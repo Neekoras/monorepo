@@ -14,7 +14,7 @@ interface Consumer
      *
      * @return list<Message> Empty on timeout.
      */
-    public function consume(Queue $queue, int $timeout, int $n = 1): array;
+    public function receive(Queue $queue, int $timeout, int $n = 1): array;
 
     /** Acknowledge a processed message. */
     public function commit(Queue $queue, Message $message): void;

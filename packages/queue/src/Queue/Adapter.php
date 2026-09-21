@@ -289,7 +289,7 @@ abstract class Adapter
     protected function nextBatchFrom(callable $errorCallback, Queue $queue, Consumer $consumer, int $max): array
     {
         try {
-            return $consumer->consume($queue, static::RECEIVE_TIMEOUT, $max);
+            return $consumer->receive($queue, static::RECEIVE_TIMEOUT, $max);
         } catch (\Throwable $error) {
             try {
                 $errorCallback(null, $error);

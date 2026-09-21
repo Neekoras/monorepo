@@ -29,7 +29,7 @@ final class PooledAckExtensionTest extends TestCase
     private function pooled(Consumer $broker): Pool
     {
         // Size 1, matching the documented wiring: the same broker answers a
-        // message's consume() and its extend(), which is what makes the
+        // message's receive() and its extend(), which is what makes the
         // in-flight lookup behind extend() find anything.
         $pool = new UtopiaPool(new Stack(), 'test', 1, fn(): Consumer => $broker, timeout: 0.0);
 
@@ -131,7 +131,7 @@ final class PooledAckExtensionTest extends TestCase
 
 class PlainBroker implements Consumer
 {
-    public function consume(Queue $queue, int $timeout, int $n = 1): array
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         return [];
     }
