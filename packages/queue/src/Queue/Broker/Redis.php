@@ -16,32 +16,19 @@ class Redis implements Synchronous, Consumer
     private const int RECONNECT_BACKOFF_MS = 100;
     private const int RECONNECT_MAX_BACKOFF_MS = 5_000;
 
-    /**
-     * How long a claim stays live without a heartbeat.
-     *
-     * A worker running a handler extends its claims on a third of this (see
-     * {@see self::extendInterval()}), so two consecutive beats can be lost --
-     * to a scheduling delay, or a hiccup on the socket -- before the claim
-     * expires and reap() is allowed to treat the worker as dead.
-     */
+    /** Claim lifetime; handlers refresh it every third of this interval. */
     private const int CLAIM_TTL = 90;
 
-    /**
-     * The reap lock's TTL, and therefore how often the fleet sweeps: whoever
-     * wins the lock reaps, everyone else finds it held and moves on, and the
-     * next sweep happens when the lock expires. Never released early, because
-     * the expiry *is* the schedule.
-     */
+    /** Lock expiry schedules the next fleet sweep; never release it early. */
     private const int REAP_INTERVAL = 60;
 
-    /** Claims one maintenance sweep may requeue, so a sweep outlives no lock. */
+    /** Maximum claims requeued per sweep; bounds work, not elapsed time. */
     private const int REAP_LIMIT = 1_000;
 
     private bool $closed = false;
 
     /**
-     * Queues this broker has received from, keyed by namespace/name pairs -- the sweep
-     * in {@see self::maintain()} can only reap what it has seen served.
+     * Queues attempted by this broker, keyed by namespace/name pairs.
      *
      * @var array<string, Queue>
      */
@@ -66,11 +53,8 @@ class Redis implements Synchronous, Consumer
         // far has put on the list. See Codec\Compat before changing it on a
         // queue that already holds messages.
         private readonly Codec $codec = new Json(),
-        // How old a claim without a live heartbeat must be, by its *publish*
-        // timestamp, before the maintenance sweep requeues it. The heartbeat is
-        // what protects live jobs; this is the net under claims made by workers
-        // that do not heartbeat (older builds, non-coroutine adapters), so
-        // tighten it only once the whole fleet writes claim keys.
+        // Minimum publish age for recovery without a live heartbeat.
+        // Keep conservative until all workers and adapters heartbeat.
         private readonly int $reapAfter = 90_000,
     ) {}
 
@@ -203,10 +187,8 @@ class Redis implements Synchronous, Consumer
                 $pid = $message->getPid();
                 $this->receive->set("{$queue->namespace}.jobs.{$queue->name}.{$pid}", $unclaimed[$pid], $queue->jobTtl);
 
-                // The heartbeat's first beat, and it must land before the pid is
-                // on the processing list: a reaper walking that list between the
-                // push and a later key write would read a live claim as dead.
-                // If the claim fails after this, the key expires on its own.
+                // Write the heartbeat before exposing the claim to the reaper.
+                // A failed claim leaves a key that expires on its own.
                 $this->receive->set("{$queue->namespace}.claims.{$queue->name}.{$pid}", (string) time(), self::CLAIM_TTL);
             }
 
@@ -288,47 +270,21 @@ class Redis implements Synchronous, Consumer
     }
 
     /**
-     * Keep this message's claim alive while its handler runs.
-     *
-     * The same contract JetStream's in-progress ack gives {@see Nats::extend()}:
-     * the adapter beats this on {@see self::extendInterval()} for as long as the
-     * handler takes, and a claim that stops being extended -- the pod died, or
-     * was SIGKILLed mid-job -- expires after {@see self::CLAIM_TTL} and becomes
-     * reap()'s to requeue. Without it, reap() can only tell dead from slow by
-     * the publish timestamp, which knows nothing about when work started.
-     *
-     * Recreating the key for a message that already committed is harmless: the
-     * pid is off the processing list, so nothing consults the key again and it
-     * expires on its own.
+     * Refresh the claim while its handler runs. A late beat after commit is
+     * harmless: the pid is no longer on the processing list and the key expires.
      */
     public function extend(Queue $queue, Message $message): void
     {
         $this->commands->set("{$queue->namespace}.claims.{$queue->name}.{$message->getPid()}", (string) time(), self::CLAIM_TTL);
     }
 
-    /**
-     * How often {@see self::extend()} should be called while a handler runs: a
-     * third of the claim's TTL, so two consecutive beats can be lost before the
-     * claim expires under a live handler.
-     */
+    /** Refresh often enough to tolerate two missed beats. */
     public function extendInterval(): float
     {
         return self::CLAIM_TTL / 3;
     }
 
-    /**
-     * The idle-time sweep: requeue claims stranded by dead workers.
-     *
-     * The adapter's maintenance loop calls this on its own interval; the reap
-     * lock is what turns that many-pod clock into one sweep per queue per
-     * {@see self::REAP_INTERVAL}, fleet-wide -- whoever wins the lock sweeps,
-     * everyone else finds it held and moves on. Only queues this broker has
-     * received from are swept, because those are the only ones it knows exist.
-     *
-     * This is what finally *calls* reap(): the recovery has existed for years
-     * while nothing scheduled it, and a claim stranded by an OOM kill stayed on
-     * the processing list forever.
-     */
+    /** Recover stranded claims from served queues, once per fleet interval. */
     public function maintain(): void
     {
         foreach ($this->served as $queue) {
@@ -487,18 +443,9 @@ class Redis implements Synchronous, Consumer
     }
 
     /**
-     * Requeue claims whose worker died between receive() and commit/reject —
-     * their messages sit on the processing list, invisible to consumers and to
-     * retry(), until this reclaims them.
-     *
-     * A claim being worked on is protected twice over: its worker heartbeats a
-     * claim key for as long as the handler runs (see {@see self::extend()}), and
-     * $olderThan guards claims made by workers that do not heartbeat -- older
-     * builds, and adapters without a scheduler to beat on. Judge staleness from
-     * the heartbeat where there is one; where there is not, pass an $olderThan
-     * comfortably above the longest possible handler runtime (for Kubernetes
-     * Jobs, the Job's activeDeadlineSeconds) so an in-flight message can never
-     * be requeued into a duplicate run.
+     * Recover claims left between receive() and commit/reject(). Live heartbeats
+     * protect running handlers; the publish-age gate protects workers without
+     * heartbeats. Keep $olderThan above their longest possible runtime.
      *
      * @param int $olderThan Seconds since enqueue before a heartbeat-less claim
      *        counts as stale
@@ -507,38 +454,34 @@ class Redis implements Synchronous, Consumer
      *        on the dead queue; null reaps unbounded.
      * @param int|null $newerThan Only claims enqueued within this many seconds
      *        are requeued; older ones are parked on the dead queue.
-     * @param int|null $scan Read only this many claims from the stale end of the
-     *        processing list, instead of the whole list. Bounds what one sweep
-     *        costs on a list holding years of stranded claims. Bounded sweeps
-     *        share a cursor so retained live claims cannot block newer claims.
+     * @param int|null $scan Maximum claims examined; bounded sweeps share progress.
      * @return int The number of claims requeued
      */
     public function reap(Queue $queue, int $olderThan = 90000, ?int $limit = null, ?int $maxAttempts = null, ?int $newerThan = null, ?int $scan = null): int
     {
-        $processingList = "{$queue->namespace}.processing.{$queue->name}";
+        $processing = "{$queue->namespace}.processing.{$queue->name}";
         $now = time();
         $cutoff = $now - $olderThan;
         $requeued = 0;
 
-        $size = $this->commands->listSize($processingList);
+        $size = $this->commands->listSize($processing);
         if ($size === 0) {
             return 0;
         }
 
-        // Count from the tail: new claims arrive at the head. Share progress
-        // across brokers because a different pod may win each maintenance lock.
-        $cursorKey = "{$queue->namespace}.reap-cursor.{$queue->name}";
-        $cursor = $scan === null ? [] : explode(':', (string) $this->commands->get($cursorKey));
-        $offset = (int) ($cursor[0] ?? 0);
+        // Share progress across sweep winners. Retained entries count from the
+        // tail; remaining entries bound the cycle so arrivals cannot delay wrapping.
+        $key = "{$queue->namespace}.reap-cursor.{$queue->name}";
+        $cursor = $scan === null ? [] : explode(':', (string) $this->commands->get($key));
+        $retained = (int) ($cursor[0] ?? 0);
         $remaining = (int) ($cursor[1] ?? 0);
-        if ($offset < 0 || $offset >= $size || $remaining <= 0) {
-            $offset = 0;
+        if ($retained < 0 || $retained >= $size || $remaining <= 0) {
+            $retained = 0;
             $remaining = $size;
         }
-        // Finish the cycle's original window even if new claims keep arriving.
-        $remaining = min($remaining, $size - $offset);
+        $remaining = min($remaining, $size - $retained);
         $length = $scan === null ? $size : min(max(1, $scan), $remaining);
-        $claims = $this->commands->listRange($processingList, $length, max(0, $size - $offset - $length));
+        $claims = $this->commands->listRange($processing, $length, max(0, $size - $retained - $length));
 
         foreach (array_reverse($claims) as $pid) {
             if ($limit !== null && $requeued >= $limit) {
@@ -547,45 +490,37 @@ class Redis implements Synchronous, Consumer
 
             $remaining--;
             if (!\is_string($pid)) {
-                $offset++;
+                $retained++;
                 continue;
             }
 
             // The payload expired: the claim is unrecoverable, drop it.
             $job = $this->getJob($queue, $pid);
             if ($job === false) {
-                $this->commands->listRemove($processingList, $pid);
+                $this->commands->listRemove($processing, $pid);
                 continue;
             }
 
-            if ($job->getTimestamp() > $cutoff) {
-                $offset++;
-                continue;
-            }
-
-            // A live worker heartbeats its claims (see extend()), so a claim key
-            // still standing means a slow handler, not a dead pod -- even on a
-            // job published long before the cutoff, which is exactly the claim
-            // the timestamp alone would wrongly requeue out from under it.
-            if (\is_string($this->commands->get("{$queue->namespace}.claims.{$queue->name}.{$pid}"))) {
-                $offset++;
+            if ($job->getTimestamp() > $cutoff
+                || \is_string($this->commands->get("{$queue->namespace}.claims.{$queue->name}.{$pid}"))) {
+                $retained++;
                 continue;
             }
 
             if (($maxAttempts !== null && $job->getAttempts() >= $maxAttempts)
                 || ($newerThan !== null && $job->getTimestamp() < $now - $newerThan)) {
-                $this->commands->listRemove($processingList, $pid);
+                $this->commands->listRemove($processing, $pid);
                 $this->commands->leftPush("{$queue->namespace}.dead.{$queue->name}", $pid);
                 continue;
             }
 
             $this->requeue($queue, $job);
-            $this->commands->listRemove($processingList, $pid);
+            $this->commands->listRemove($processing, $pid);
             $requeued++;
         }
 
         if ($scan !== null) {
-            $this->commands->set($cursorKey, "{$offset}:{$remaining}");
+            $this->commands->set($key, "{$retained}:{$remaining}");
         }
 
         return $requeued;
