@@ -9,6 +9,7 @@ use Utopia\NATS\Connection;
 use Utopia\NATS\Exception\NatsException;
 use Utopia\NATS\Headers;
 use Utopia\NATS\Message;
+use Utopia\NATS\Request;
 
 final class RequestsTest extends TestCase
 {
@@ -26,10 +27,10 @@ final class RequestsTest extends TestCase
             });
             $connection->flush();
             $results = [];
-            $connection->requests([
-                ['subject' => $subject, 'data' => 'first', 'headers' => $headers],
-                ['subject' => $subject . '.missing'],
-                ['subject' => $subject, 'data' => 'third'],
+            $connection->requestBatch([
+                new Request(subject: $subject, data: 'first', headers: $headers),
+                new Request(subject: $subject . '.missing'),
+                new Request(subject: $subject, data: 'third'),
             ], static function (int $index, Message|\Throwable $result) use (&$results): void {
                 $results[$index] = $result;
             });

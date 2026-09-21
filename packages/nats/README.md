@@ -359,15 +359,15 @@ $conn = Connection::connect(new ConnectionOptions(
 NATS_URL=nats://host:4222 ./vendor/bin/phpunit --testsuite integration
 ```
 
-## Concurrent requests
+## Batched requests
 
-`Connection::requests()` sends independent requests together and delivers each outcome to `reply` as it arrives. The callback receives the original input index and either a `Message` or a `Throwable`. One missing reply does not delay successful replies or discard their outcomes.
+`Connection::requestBatch()` sends independent requests together and delivers each outcome to `reply` as it arrives. The callback receives the original input index and either a `Message` or a `Throwable`. One missing reply does not delay successful replies or discard their outcomes.
 
 ```php
-$connection->requests(
+$connection->requestBatch(
     requests: [
-        ['subject' => 'service.first', 'data' => 'one'],
-        ['subject' => 'service.second', 'data' => 'two', 'headers' => $headers],
+        new Request(subject: 'service.first', data: 'one'),
+        new Request(subject: 'service.second', data: 'two', headers: $headers),
     ],
     reply: function (int $index, Message|Throwable $result): void {
         // Handle this request's reply or failure.
@@ -376,11 +376,19 @@ $connection->requests(
 );
 ```
 
-The method returns `void`; collect results in the callback if you need an array. Completion order can differ from input order. The timeout is one response deadline for the whole group, starting after the write, rather than a separate wait per reply. Callback execution counts toward that deadline. Empty input performs no I/O. Invalid input throws before any request is published; request headers and payload limits follow `request()`.
+`Request` has read-only typed fields; both `request()` and `requestBatch()` use its subject validation and the same request lifecycle. The method returns `void`; collect results in the callback if you need an array. Completion order can differ from input order. The timeout is one response deadline for the whole group, starting after the write, rather than a separate wait per reply. Callback execution counts toward that deadline. Empty input performs no I/O. Invalid input throws before any request is published; request headers and payload limits follow `request()`.
 
 If the callback throws, collection stops immediately, pending state is cleaned up, and the exception propagates. Requests already sent are not cancelled or replayed. Later replies can still arrive. Use one owner for reading the connection; nested reads from the callback throw `LogicException`.
 
-This differs from `requestMany()`, which sends one request and gathers several responses. Ambiguous writes are not replayed on reconnect. A queue can use this operation for individual confirmed acknowledgements without switching to cumulative `AckAll`.
+This differs from `requestMany()`, which sends one request and gathers several responses. Ambiguous writes are not replayed on reconnect. Use `JetStream::ackBatch()` to confirm a selected list of `JetStreamMessage` instances. JetStream constructs each acknowledgement; its callback receives the original index and `null` on server confirmation or a `Throwable` on failure. Messages outside the list are not acknowledged. This does not use cumulative `AckAll`.
+
+```php
+$jetStream->ackBatch($messages, function (int $index, ?Throwable $error): void {
+    // Null means this message's acknowledgement was confirmed.
+});
+```
+
+Single `request()` calls retain one retry for an explicit stale-connection rejection. Batch requests do not retry. Neither path replays an ambiguous write.
 
 ## License
 

@@ -14,10 +14,40 @@ use Utopia\NATS\Exception\NatsException;
 use Utopia\NATS\Exception\TimeoutException;
 use Utopia\NATS\Headers;
 use Utopia\NATS\Message;
+use Utopia\NATS\Request;
 use Utopia\NATS\Tests\Unit\Support\FakeTransport;
 
 final class RequestsTest extends TestCase
 {
+    public static function reconnect(): iterable
+    {
+        yield [false];
+        yield [true];
+    }
+
+    #[DataProvider('reconnect')]
+    public function testFailedPongFailsEveryPendingRequestAndDisconnects(bool $reconnect): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(allowReconnect: $reconnect, transportFactory: fn(): FakeTransport => $fake));
+        $fake->onWrite = static function (string $wire, FakeTransport $fake): void {
+            if (str_starts_with($wire, 'PUB ')) {
+                $fake->pushInbound("PING\r\n");
+            } elseif ($wire === "PONG\r\n") {
+                throw new ConnectionException('PONG write failed');
+            }
+        };
+        $results = [];
+        $connection->requestBatch([new Request(subject: 'one'), new Request(subject: 'two')], static function (int $index, Message|\Throwable $result) use (&$results): void {
+            $results[$index] = $result;
+        });
+        $this->assertCount(2, $results);
+        $this->assertInstanceOf(ConnectionException::class, $results[0]);
+        $this->assertSame($results[0], $results[1]);
+        $this->assertFalse($connection->isConnected());
+        $connection->close();
+    }
+
     public function testPipelinesRequestsAndRetainsOutOfOrderPartialReplies(): void
     {
         $fake = new FakeTransport();
@@ -36,8 +66,8 @@ final class RequestsTest extends TestCase
             }
         };
         $results = [];
-        $connection->requests([
-            ['subject' => 'work.1'], ['subject' => 'work.2'], ['subject' => 'work.3'],
+        $connection->requestBatch([
+            new Request(subject: 'work.1'), new Request(subject: 'work.2'), new Request(subject: 'work.3'),
         ], static function (int $index, Message|\Throwable $result) use (&$results): void {
             $results[$index] = $result;
         }, 0.01);
@@ -47,6 +77,52 @@ final class RequestsTest extends TestCase
         $this->assertSame('3', $results[2]->data);
         $this->assertSame([2, 0, 1], array_keys($results), 'successful replies arrive before the missing reply times out');
         $this->assertSame('1', $connection->request('work.1')->data);
+        $connection->close();
+    }
+
+    public function testSubscriptionCallbackExceptionIsNotATransportFailure(): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
+        $failure = new ConnectionException('Application callback failed');
+        $connection->subscribe('events', static fn() => throw $failure);
+        $fake->onWrite = static function (string $wire, FakeTransport $fake): void {
+            if (str_starts_with($wire, 'PUB ')) {
+                $fake->pushInbound("MSG events 1 1\r\nx\r\n");
+            }
+        };
+        $called = false;
+        try {
+            $connection->requestBatch([new Request('work')], static function () use (&$called): void {
+                $called = true;
+            });
+            self::fail('Application exception must propagate');
+        } catch (ConnectionException $error) {
+            $this->assertSame($failure, $error);
+        }
+        $this->assertFalse($called);
+        $this->assertTrue($connection->isConnected());
+        $connection->close();
+    }
+
+    public function testSingleAndBatchRequestsShareSubjectValidation(): void
+    {
+        $fake = new FakeTransport();
+        $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
+        $before = $fake->written;
+        $refused = 0;
+        foreach (['', 'bad subject', 'work.*', 'work..x'] as $subject) {
+            foreach ([fn(): \Utopia\NATS\Request => new Request($subject), fn(): \Utopia\NATS\Message => $connection->request($subject)] as $create) {
+                try {
+                    $create();
+                    self::fail('Invalid subject must be refused');
+                } catch (\InvalidArgumentException) {
+                    $refused++;
+                }
+            }
+        }
+        $this->assertSame(8, $refused);
+        $this->assertSame($before, $fake->written);
         $connection->close();
     }
 
@@ -62,7 +138,7 @@ final class RequestsTest extends TestCase
             }
         };
         $results = [];
-        $connection->requests([['subject' => 'first'], ['subject' => 'second']], static function (int $index, Message|\Throwable $result) use (&$results): void {
+        $connection->requestBatch([new Request(subject: 'first'), new Request(subject: 'second')], static function (int $index, Message|\Throwable $result) use (&$results): void {
             $results[$index] = $result;
         });
         $this->assertSame(1, $writes);
@@ -81,7 +157,7 @@ final class RequestsTest extends TestCase
         // Even transport-shaped callback errors must not become request failures.
         $failure = new ConnectionException('Callback failed');
         try {
-            $connection->requests(array_fill(0, 4, ['subject' => 'work']), static function (int $index, Message|\Throwable $result) use (&$seen, $failure): never {
+            $connection->requestBatch(array_fill(0, 4, new Request(subject: 'work')), static function (int $index, Message|\Throwable $result) use (&$seen, $failure): never {
                 $seen[$index] = $result;
                 throw $failure;
             });
@@ -113,9 +189,9 @@ final class RequestsTest extends TestCase
         $headers = new Headers();
         $headers->set('Trace', 'example');
         $results = [];
-        $connection->requests([
-            ['subject' => 'work', 'data' => 'payload', 'headers' => $headers],
-            ['subject' => 'missing'],
+        $connection->requestBatch([
+            new Request(subject: 'work', data: 'payload', headers: $headers),
+            new Request(subject: 'missing'),
         ], static function (int $index, Message|\Throwable $result) use (&$results): void {
             $results[$index] = $result;
         });
@@ -128,16 +204,11 @@ final class RequestsTest extends TestCase
 
     public static function invalid(): iterable
     {
-        yield 'subject' => [[['subject' => 'bad subject']], 1.0];
-        yield 'wildcard' => [[['subject' => 'work.*']], 1.0];
-        yield 'empty token' => [[['subject' => 'work..x']], 1.0];
-        yield 'missing subject' => [[['data' => 'x']], 1.0];
-        yield 'data' => [[['subject' => 'work', 'data' => null]], 1.0];
-        yield 'headers' => [[['subject' => 'work', 'headers' => []]], 1.0];
-        yield 'not a list' => [['key' => ['subject' => 'work']], 1.0];
-        yield 'timeout' => [[['subject' => 'work']], 0.0];
-        yield 'infinite timeout' => [[['subject' => 'work']], INF];
-        yield 'invalid later request' => [[['subject' => 'work'], ['subject' => '']], 1.0];
+        yield 'array instead of Request' => [[['subject' => 'work']], 1.0];
+        yield 'not a list' => [['key' => new Request('work')], 1.0];
+        yield 'timeout' => [[new Request('work')], 0.0];
+        yield 'infinite timeout' => [[new Request('work')], INF];
+        yield 'invalid later request' => [[new Request('work'), null], 1.0];
     }
 
     #[DataProvider('invalid')]
@@ -148,7 +219,7 @@ final class RequestsTest extends TestCase
         $before = $fake->written;
         $called = false;
         try {
-            $connection->requests($requests, static function () use (&$called): void {
+            $connection->requestBatch($requests, static function () use (&$called): void {
                 $called = true;
             }, $timeout);
             self::fail('Invalid input must throw');
@@ -165,7 +236,7 @@ final class RequestsTest extends TestCase
         $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
         $connection->close();
         $before = $fake->written;
-        $connection->requests([], static fn() => self::fail('Empty batch must not invoke callback'));
+        $connection->requestBatch([], static fn() => self::fail('Empty batch must not invoke callback'));
         $this->assertSame($before, $fake->written);
     }
 
@@ -174,8 +245,8 @@ final class RequestsTest extends TestCase
         $fake = new FakeTransport(['max_payload' => 16]);
         $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
         try {
-            $connection->requests([
-                ['subject' => 'work'], ['subject' => 'work', 'data' => str_repeat('x', 17)],
+            $connection->requestBatch([
+                new Request(subject: 'work'), new Request(subject: 'work', data: str_repeat('x', 17)),
             ], static fn() => self::fail('Validation must not invoke callback'));
             self::fail('Payload validation must throw');
         } catch (MaxPayloadException) {
@@ -192,8 +263,8 @@ final class RequestsTest extends TestCase
         $connection = Connection::connect(new ConnectionOptions(transportFactory: fn(): FakeTransport => $fake));
         $this->respond($fake);
         $refused = 0;
-        $connection->requests([['subject' => 'work']], function () use ($connection, &$refused): void {
-            foreach ([fn(): \Utopia\NATS\Message => $connection->request('work'), $connection->processMessage(...), fn(): array => $connection->requestMany('work'), fn() => $connection->wait(1), $connection->flush(...), $connection->tick(...), $connection->drain(...), fn() => $connection->requests([], static fn() => null)] as $read) {
+        $connection->requestBatch([new Request(subject: 'work')], function () use ($connection, &$refused): void {
+            foreach ([fn(): \Utopia\NATS\Message => $connection->request('work'), $connection->processMessage(...), fn(): array => $connection->requestMany('work'), fn() => $connection->wait(1), $connection->flush(...), $connection->tick(...), $connection->drain(...), fn() => $connection->requestBatch([], static fn() => null)] as $read) {
                 try {
                     $read();
                     self::fail('Nested read must be refused');
@@ -218,7 +289,7 @@ final class RequestsTest extends TestCase
             $respond($wire, $fake);
         };
         $results = [];
-        $connection->requests(array_fill(0, 2, ['subject' => 'work']), static function (int $index, Message|\Throwable $result) use (&$results): void {
+        $connection->requestBatch(array_fill(0, 2, new Request(subject: 'work')), static function (int $index, Message|\Throwable $result) use (&$results): void {
             $results[$index] = $result;
             if ($index === 0) {
                 usleep(30_000);
