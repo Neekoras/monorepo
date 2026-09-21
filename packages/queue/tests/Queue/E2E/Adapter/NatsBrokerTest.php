@@ -4,10 +4,15 @@ declare(strict_types=1);
 
 namespace Tests\E2E\Adapter;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Utopia\NATS\Connection;
+use Utopia\NATS\ConnectionOptions;
+use Utopia\NATS\Exception\ConnectionException;
 use Utopia\NATS\JetStream\DiscardPolicy;
 use Utopia\NATS\JetStream\StorageType;
+use Utopia\NATS\Transport\TcpTransport;
+use Utopia\NATS\Transport\Transport;
 use Utopia\Queue\Adapter\Swoole;
 use Utopia\Queue\Broker\Nats;
 use Utopia\Queue\Broker\Provisioning;
@@ -59,6 +64,73 @@ final class NatsBrokerTest extends TestCase
 
         $this->broker->commit($this->queue, $message);
         $this->assertSame(1, $this->broker->getQueueSize($this->queue));
+    }
+
+    public static function failedAcknowledgement(): iterable
+    {
+        yield 'write not delivered' => [false];
+        yield 'write delivered, confirmation lost' => [true];
+    }
+
+    #[DataProvider('failedAcknowledgement')]
+    public function testCommandsRecoverAfterFailedAcknowledgement(bool $delivered): void
+    {
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $transport = new TcpTransport();
+        $fault = $this->createStub(Transport::class);
+        foreach (['connect', 'read', 'readLine', 'upgradeTls', 'isConnected', 'close'] as $method) {
+            $fault->method($method)->willReturnCallback($transport->$method(...));
+        }
+        $state = new class {
+            public bool $fail = false;
+        };
+        $failure = new ConnectionException('Lost acknowledgement connection');
+        $fault->method('write')->willReturnCallback(static function (string $data) use ($transport, $state, $failure, $delivered): int {
+            if ($state->fail) {
+                $state->fail = false;
+                if ($delivered) {
+                    $transport->write($data);
+                }
+                throw $failure;
+            }
+            return $transport->write($data);
+        });
+        $connections = 0;
+        $broker = new Nats(function () use ($url, $fault, &$connections): Connection {
+            $connections++;
+            return Connection::connect(new ConnectionOptions(
+                servers: $url,
+                transportFactory: fn(): Transport => $connections === 2 ? $fault : new TcpTransport(),
+            ));
+        }, ackWait: 0.3);
+        try {
+            $broker->publish($this->queue, ['task' => 'uncertain']);
+            $broker->publish($this->queue, ['task' => 'next']);
+            // Populate both cached command consumer handles before breaking their socket.
+            $this->assertSame(2, $broker->getQueueSize($this->queue));
+            $messages = $broker->receive($this->queue, 1, 2);
+            $this->assertCount(2, $messages);
+            $state->fail = true;
+            try {
+                $broker->commit($this->queue, $messages[0]);
+                $this->fail('Expected acknowledgement failure');
+            } catch (ConnectionException $error) {
+                $this->assertSame($failure, $error);
+            }
+            $this->assertSame(2, $connections, 'A failed acknowledgement is not retried');
+            $broker->commit($this->queue, $messages[1]);
+            $this->assertSame(3, $connections, 'Only the command connection is replaced');
+            $this->assertSame(0, $broker->getQueueSize($this->queue));
+            $broker->commit($this->queue, $messages[0]);
+            $redelivered = $broker->receive($this->queue, 1);
+            $this->assertCount($delivered ? 0 : 1, $redelivered);
+            if (!$delivered) {
+                $this->assertSame('uncertain', $redelivered[0]->getPayload()['task']);
+                $broker->commit($this->queue, $redelivered[0]);
+            }
+        } finally {
+            $broker->close();
+        }
     }
 
     public function testPriorityMessageJumpsAhead(): void

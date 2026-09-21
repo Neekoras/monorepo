@@ -353,7 +353,19 @@ class Nats implements Synchronous, Consumer, Bounded
      */
     private function command(callable $command): mixed
     {
-        return $this->commandsLock->withLock($command, self::ACQUIRE_TIMEOUT);
+        return $this->commandsLock->withLock(function () use ($command): mixed {
+            try {
+                return $command();
+            } finally {
+                // Rebuild on the next operation, never replay an uncertain command.
+                if ($this->source instanceof \Closure && $this->commandsConnection instanceof NatsConnection
+                    && !$this->commandsConnection->isConnected()) {
+                    $this->commandsConnection = null;
+                    $this->commandsJs = null;
+                    $this->commandsConsumers = [];
+                }
+            }
+        }, self::ACQUIRE_TIMEOUT);
     }
 
     private function connection(): NatsConnection
