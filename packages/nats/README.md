@@ -362,3 +362,16 @@ NATS_URL=nats://host:4222 ./vendor/bin/phpunit --testsuite integration
 ## License
 
 Apache-2.0
+
+### Pipelined requests
+
+`Connection::requests()` sends independent requests in one write and correlates their replies. It returns a result at each input index: either a `Message` or a `Throwable`. Inspect every result; one missing reply does not discard successful replies. The optional `resolved` callback receives each result as it arrives, before unrelated requests time out.
+
+```php
+$results = $connection->requests([
+    ['subject' => 'service.first', 'data' => 'one'],
+    ['subject' => 'service.second', 'data' => 'two'],
+], timeout: 5.0);
+```
+
+Use one owner for reading the connection. This differs from `requestMany()`, which sends one request and gathers several responses. Ambiguous writes are not replayed on reconnect. A queue can use this operation for individual confirmed acknowledgements without switching to cumulative `AckAll`.

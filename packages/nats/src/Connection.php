@@ -268,6 +268,93 @@ final class Connection
     }
 
     /**
+     * Pipeline independent requests. One reader correlates replies; ambiguous writes
+     * are never replayed. Results retain their input indices after partial failure.
+     * @param list<array{subject: string, data?: string}> $requests
+     * @param (callable(int, Message|\Throwable): void)|null $resolved
+     * @return list<Message|\Throwable>
+     */
+    public function requests(array $requests, ?float $timeout = null, ?callable $resolved = null): array
+    {
+        $tokens = $results = [];
+        $timeout ??= $this->options->requestTimeout;
+        $deadline = microtime(true) + $timeout;
+        try {
+            $this->ensureConnected();
+            $this->ensureInboxSub();
+            $wire = '';
+            foreach ($requests as $index => $request) {
+                $subject = $request['subject'];
+                $data = $request['data'] ?? '';
+                if ($subject === '' || preg_match('/[\s\x00]/', $subject)) {
+                    throw new \InvalidArgumentException('Invalid request subject');
+                }
+                if (\strlen($data) > $this->serverInfo->maxPayload) {
+                    throw new MaxPayloadException('Request exceeds server maximum payload');
+                }
+                $token = Inbox::generateId();
+                $tokens[$index] = $token;
+                $this->pendingRequests[$token] = ['message' => null, 'resolved' => false];
+                $wire .= $this->writer->pub($subject, $data, $this->inboxPrefix . '.' . $token);
+            }
+            if ($wire !== '') {
+                // send() may replay buffered writes on reconnect; confirmations must
+                // instead surface uncertainty to their individual callers.
+                $this->transport->write($wire);
+            }
+            while (\count($results) < \count($requests)) {
+                foreach ($tokens as $index => $token) {
+                    if (isset($results[$index])) {
+                        continue;
+                    }
+                    if (!$this->pendingRequests[$token]['resolved']) {
+                        continue;
+                    }
+                    $message = $this->pendingRequests[$token]['message'];
+                    $results[$index] = $message?->headers?->getStatus() === '503'
+                        ? new NatsException('No responders for request')
+                        : $message;
+                    if ($resolved !== null) {
+                        $resolved($index, $results[$index]);
+                    }
+                }
+                if (\count($results) === \count($requests)) {
+                    break;
+                }
+                $remaining = $deadline - microtime(true);
+                if ($remaining <= 0) {
+                    throw new TimeoutException("Requests timed out after {$timeout}s");
+                }
+                // No automatic reconnect/read retry during an outstanding group.
+                try {
+                    [$op, $data] = $this->parser->next($remaining);
+                    $this->dispatchOp($op, $data);
+                } catch (TimeoutException) {
+                    throw new TimeoutException("Requests timed out after {$timeout}s");
+                }
+            }
+        } catch (\Throwable $error) {
+            if ($error instanceof ConnectionException) {
+                $this->recycleDeadConnection(false);
+            }
+            foreach (array_keys($requests) as $index) {
+                if (!isset($results[$index])) {
+                    $results[$index] = $error;
+                    if ($resolved !== null) {
+                        $resolved($index, $error);
+                    }
+                }
+            }
+        } finally {
+            foreach ($tokens as $token) {
+                unset($this->pendingRequests[$token]);
+            }
+        }
+        ksort($results);
+        return array_values($results);
+    }
+
+    /**
      * Scatter-gather request: publish once and collect every reply until a stop
      * condition is met (ADR-47). A 503 "no responders" reply means zero
      * responders and yields an empty list.
