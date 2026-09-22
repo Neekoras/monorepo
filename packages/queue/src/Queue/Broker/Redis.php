@@ -448,10 +448,13 @@ class Redis implements Synchronous, Consumer
                 continue;
             }
 
+            // Settlement deletes the payload and the ownership record together,
+            // so reading the payload first keeps a claim its worker settles
+            // mid-sweep from looking like an owned delivery whose payload is
+            // gone. Only legacy payloads expire while processing.
             $ownerKey = "{$queue->namespace}.owners.{$queue->name}.{$pid}";
-            $owner = $this->commands->get($ownerKey);
-            // Only legacy payloads expire while processing.
             $job = $this->getJob($queue, $pid);
+            $owner = $this->commands->get($ownerKey);
             if ($job === false) {
                 if (\is_string($owner)) {
                     throw new \RuntimeException('Queue delivery payload is missing');
