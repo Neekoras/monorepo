@@ -123,6 +123,24 @@ final class ResendRoutingTest extends TestCase
         $this->assertSame(['Plain Name <cc@example.com>'], $body['cc']);
     }
 
+    public function testEmptyReplyToOmitsTheHeader(): void
+    {
+        $stub = new ResendStub('test-key');
+
+        $message = new Email(
+            to: ['a@example.com'],
+            subject: 'Subject',
+            content: 'Body',
+            fromName: 'Sender',
+            fromEmail: 'from@example.com',
+            replyToEmail: '',
+        );
+
+        $stub->send($message);
+
+        $this->assertArrayNotHasKey('reply_to', $stub->capturedRequests[0]['body'][0]);
+    }
+
     public function testUnprocessableResponseIsInvalidInput(): void
     {
         $stub = new ResendStub('test-key');

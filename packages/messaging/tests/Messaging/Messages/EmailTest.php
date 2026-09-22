@@ -79,20 +79,6 @@ final class EmailTest extends TestCase
         }
     }
 
-    public function testEmptyReplyToOmitsTheHeaderRatherThanFailing(): void
-    {
-        $message = new Email(
-            to: ['john@appwrite.io'],
-            subject: 'Subject',
-            content: 'Body',
-            fromName: 'Sender',
-            fromEmail: 'noreply@appwrite.io',
-            replyToEmail: '',
-        );
-
-        $this->assertSame('', $message->getReplyToEmail());
-    }
-
     public function testEmptyRecipientKeepsItsType(): void
     {
         try {
