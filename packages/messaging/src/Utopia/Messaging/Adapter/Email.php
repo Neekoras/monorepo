@@ -23,12 +23,8 @@ abstract class Email extends Adapter
     }
 
     /**
-     * Format an email address with an optional display name (RFC 5322).
-     *
-     * When the display name contains any RFC 5322 special character it is
-     * wrapped in a quoted-string (with embedded quotes and backslashes
-     * escaped). Without this, a name such as "Acme, Inc." or "Doe <John>"
-     * produces a malformed address that providers reject.
+     * Format an address with an optional display name, quoting the name when
+     * it carries RFC 5322 specials such as "Acme, Inc." or "Doe <John>".
      */
     protected function formatAddress(string $email, ?string $name): string
     {

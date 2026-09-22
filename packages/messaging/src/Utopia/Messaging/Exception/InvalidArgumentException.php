@@ -5,14 +5,8 @@ declare(strict_types=1);
 namespace Utopia\Messaging\Exception;
 
 /**
- * A message, or one of its fields, that no provider could deliver.
- *
- * Thrown when the message is built or when the provider refuses the request
- * as malformed, so a caller can stop retrying and report the reason to
- * whoever supplied the input. {@see $type} carries
- * one of the constants below and {@see $value} the offending input, so the
- * caller can map the failure to its own error catalogue without parsing the
- * message text.
+ * Input no provider can deliver, refused when the message is built or when the
+ * provider rejects it. `$type` names the reason and `$value` the offending input.
  */
 class InvalidArgumentException extends \InvalidArgumentException
 {

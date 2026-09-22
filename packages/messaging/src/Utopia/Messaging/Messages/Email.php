@@ -37,8 +37,6 @@ class Email implements Message
      * @param  array<string|array<string,string>>|null  $bcc The BCC recipients of the email. Same format as $to.
      * @param  array<Attachment>|null  $attachments The attachments of the email.
      * @param  bool  $html Whether the message is HTML or not.
-     *
-     * @throws InvalidArgumentException When an address is malformed or a display name carries control characters.
      */
     public function __construct(
         array $to,
@@ -72,7 +70,7 @@ class Email implements Message
     }
 
     /**
-     * @throws InvalidArgumentException When the address is empty, malformed, or its domain cannot receive mail.
+     * @throws InvalidArgumentException
      */
     private function assertAddress(string $email, string $type = InvalidArgumentException::RECIPIENT_MALFORMED): void
     {
@@ -84,8 +82,7 @@ class Email implements Message
             throw new InvalidArgumentException($type, "Email address \"{$email}\" is not a valid address.", $email);
         }
 
-        // A domain ending in a label no registry hands out (one letter, digits)
-        // can never receive mail; providers reject it at the API before any bounce.
+        // A TLD no registry hands out (one letter, digits) can never receive mail.
         $tld = substr($email, (int) strrpos($email, '.') + 1);
         if (preg_match('/^(?:xn--[a-z0-9-]+|[a-z]{2,})$/i', $tld) !== 1) {
             throw new InvalidArgumentException(
@@ -97,9 +94,8 @@ class Email implements Message
     }
 
     /**
-     * A display name travels inside an address header, so a line break ends
-     * the header early or injects a new one. Specials such as `<` or `,` are
-     * fine: the adapter quotes them when it renders the address.
+     * A line break in a display name ends the header early; other specials
+     * are quoted by the adapter.
      *
      * @throws InvalidArgumentException
      */

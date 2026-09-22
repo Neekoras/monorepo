@@ -87,7 +87,7 @@ abstract class Adapter
      *     results: array<array<string, mixed>>
      * }> GEOSMS adapter returns an array of results keyed by adapter name.
      *
-     * @throws InvalidArgumentException When the message cannot be sent by this adapter as given.
+     * @throws InvalidArgumentException
      * @throws \Exception
      */
     public function send(Message $message): array
