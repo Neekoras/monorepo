@@ -2,7 +2,7 @@
 
 The source of truth for the [utopia-php](https://github.com/utopia-php) libraries. Each `packages/<name>` is an independent Composer library; development happens here, and every push is mirrored to its read-only repository (e.g. `utopia-php/http`), so Composer/Packagist distribution is unchanged — mechanics in [docs/distribution.md](docs/distribution.md).
 
-[`utopia-php/compression`](https://github.com/appwrite/appwrite/tree/main/packages/compression), [`utopia-php/smtp`](https://github.com/appwrite/appwrite/tree/main/packages/smtp) and [`utopia-php/system`](https://github.com/appwrite/appwrite/tree/main/packages/system) are maintained in Appwrite. Their distribution mirrors and Packagist packages remain available.
+[`utopia-php/compression`](https://github.com/appwrite/appwrite/tree/main/packages/compression), [`utopia-php/smtp`](https://github.com/appwrite/appwrite/tree/main/packages/smtp), [`utopia-php/system`](https://github.com/appwrite/appwrite/tree/main/packages/system) and [`utopia-php/telemetry`](https://github.com/appwrite/appwrite/tree/main/packages/telemetry) are maintained in Appwrite. Their distribution mirrors and Packagist packages remain available.
 
 ## Quickstart
 
@@ -46,7 +46,7 @@ To use an unmerged branch from an *external* consumer (e.g. test a fix in Appwri
 
 ## Dependency graph
 
-Arrows point at dependencies (`platform --> http` means platform requires http). Regenerate with `bin/monorepo graph` after changing a package's requirements — `bin/monorepo validate` (which CI runs on every push) fails while it is stale.
+Local siblings only: arrows point at dependencies between the packages in this checkout (`platform --> http` means platform requires http). Requirements on packages maintained elsewhere, such as the `utopia-php/telemetry` constraint that `cache`, `dns`, `http`, `messaging`, `pools`, `queue`, `schedule` and `storage` keep, are not drawn, so a node without arrows is not necessarily dependency-free. Regenerate with `bin/monorepo graph` after changing a package's requirements — `bin/monorepo validate` (which CI runs on every push) fails while it is stale.
 
 <!-- graph -->
 ```mermaid
@@ -54,14 +54,12 @@ graph TD
     audit --> validators
     cache --> circuit-breaker
     cache --> pools
-    cache --> telemetry
     cdn --> client
     cli --> servers
     client --> pools
     client --> span
     config --> validators
     console --> validators
-    dns --> telemetry
     dns --> validators
     dns --> domains
     domains --> client
@@ -70,26 +68,20 @@ graph TD
     fastly --> client
     http --> di
     http --> servers
-    http --> telemetry
     http --> validators
     messaging --> client
     messaging --> pools
-    messaging --> telemetry
     platform --> cli
     platform --> http
     platform --> queue
     platform --> servers
-    pools --> telemetry
     queue --> di
     queue --> servers
     queue --> pools
-    queue --> telemetry
     queue --> validators
-    schedule --> telemetry
     servers --> di
     servers --> validators
     span --> client
-    storage --> telemetry
     storage --> validators
     storage --> client
     vcs --> cache
@@ -99,6 +91,7 @@ graph TD
     openapi
     replication
     reputation
+    schedule
     user-agent
     websocket
 ```
