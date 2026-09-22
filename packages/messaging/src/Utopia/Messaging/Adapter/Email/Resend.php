@@ -79,15 +79,9 @@ class Resend extends EmailAdapter
 
         $emails = [];
         foreach ($message->getTo() as $to) {
-            $toFormatted = empty($to['name'])
-                ? $to['email']
-                : "{$to['name']} <{$to['email']}>";
-
             $email = [
-                'from' => $message->getFromName() !== '' && $message->getFromName() !== '0'
-                    ? "{$message->getFromName()} <{$message->getFromEmail()}>"
-                    : $message->getFromEmail(),
-                'to' => [$toFormatted],
+                'from' => $this->formatAddress($message->getFromEmail(), $message->getFromName()),
+                'to' => [$this->formatAddress($to['email'], $to['name'] ?? null)],
                 'subject' => $message->getSubject(),
             ];
 
@@ -98,19 +92,14 @@ class Resend extends EmailAdapter
             }
 
             if (!\in_array($message->getReplyToEmail(), ['', '0'], true)) {
-                $email['reply_to'] = $message->getReplyToName() !== '' && $message->getReplyToName() !== '0'
-                    ? ["{$message->getReplyToName()} <{$message->getReplyToEmail()}>"]
-                    : [$message->getReplyToEmail()];
+                $email['reply_to'] = [$this->formatAddress($message->getReplyToEmail(), $message->getReplyToName())];
             }
 
             if (! \is_null($message->getCC()) && $message->getCC() !== []) {
-                $ccList = array_map(
-                    fn(array $cc) => empty($cc['name'])
-                        ? $cc['email']
-                        : "{$cc['name']} <{$cc['email']}>",
+                $email['cc'] = array_map(
+                    fn(array $cc): string => $this->formatAddress($cc['email'], $cc['name'] ?? null),
                     $message->getCC(),
                 );
-                $email['cc'] = $ccList;
             }
 
             if ($attachments !== []) {
@@ -118,13 +107,10 @@ class Resend extends EmailAdapter
             }
 
             if (! \is_null($message->getBCC()) && $message->getBCC() !== []) {
-                $bccList = array_map(
-                    fn(array $bcc) => empty($bcc['name'])
-                        ? $bcc['email']
-                        : "{$bcc['name']} <{$bcc['email']}>",
+                $email['bcc'] = array_map(
+                    fn(array $bcc): string => $this->formatAddress($bcc['email'], $bcc['name'] ?? null),
                     $message->getBCC(),
                 );
-                $email['bcc'] = $bccList;
             }
 
             $emails[] = $email;

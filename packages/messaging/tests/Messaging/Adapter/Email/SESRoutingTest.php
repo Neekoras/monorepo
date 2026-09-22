@@ -35,11 +35,11 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com'], ['email' => 'b@example.com']],
+            to: [['email' => 'a@utopia.dev'], ['email' => 'b@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $response = $stub->send($message);
@@ -53,12 +53,12 @@ final class SESRoutingTest extends TestCase
 
         // One BulkEmailEntry per recipient, each with a single ToAddresses entry.
         $this->assertCount(2, $request['body']['BulkEmailEntries']);
-        $this->assertSame(['a@example.com'], $request['body']['BulkEmailEntries'][0]['Destination']['ToAddresses']);
-        $this->assertSame(['b@example.com'], $request['body']['BulkEmailEntries'][1]['Destination']['ToAddresses']);
+        $this->assertSame(['a@utopia.dev'], $request['body']['BulkEmailEntries'][0]['Destination']['ToAddresses']);
+        $this->assertSame(['b@utopia.dev'], $request['body']['BulkEmailEntries'][1]['Destination']['ToAddresses']);
 
         // The default content references a template by name.
         $this->assertArrayHasKey('TemplateName', $request['body']['DefaultContent']['Template']);
-        $this->assertSame('Sender <from@example.com>', $request['body']['FromEmailAddress']);
+        $this->assertSame('Sender <from@utopia.dev>', $request['body']['FromEmailAddress']);
 
         $this->assertSame(2, $response['deliveredTo']);
         $this->assertSame('success', $response['results'][0]['status']);
@@ -72,11 +72,11 @@ final class SESRoutingTest extends TestCase
         $stub->stubResponses[] = ['statusCode' => 200, 'response' => ['BulkEmailEntryResults' => [['Status' => 'SUCCESS']]]];
 
         $build = fn(): \Utopia\Messaging\Messages\Email => new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Same Subject',
             content: 'Same Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $stub->send($build());
@@ -96,19 +96,19 @@ final class SESRoutingTest extends TestCase
         $stub->stubResponses[] = ['statusCode' => 200, 'response' => ['BulkEmailEntryResults' => [['Status' => 'SUCCESS']]]];
 
         $stub->send(new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject A',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         ));
 
         $stub->send(new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject B',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         ));
 
         $first = $stub->capturedRequests[0]['body']['DefaultContent']['Template']['TemplateName'];
@@ -135,11 +135,11 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject',
             content: '<h1>Body</h1>',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
             html: true,
         );
 
@@ -181,11 +181,11 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $response = $stub->send($message);
@@ -223,11 +223,11 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $response = $stub->send($message);
@@ -251,11 +251,11 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Plain Subject',
             content: 'Plain body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $stub->send($message);
@@ -277,20 +277,20 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'good@example.com'], ['email' => 'bad@example.com']],
+            to: [['email' => 'good@utopia.dev'], ['email' => 'bad@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $response = $stub->send($message);
 
         $this->assertSame(1, $response['deliveredTo']);
         $this->assertSame('success', $response['results'][0]['status']);
-        $this->assertSame('good@example.com', $response['results'][0]['recipient']);
+        $this->assertSame('good@utopia.dev', $response['results'][0]['recipient']);
         $this->assertSame('failure', $response['results'][1]['status']);
-        $this->assertSame('bad@example.com', $response['results'][1]['recipient']);
+        $this->assertSame('bad@utopia.dev', $response['results'][1]['recipient']);
         $this->assertSame('Email address is not verified', $response['results'][1]['error']);
     }
 
@@ -303,11 +303,11 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com'], ['email' => 'b@example.com']],
+            to: [['email' => 'a@utopia.dev'], ['email' => 'b@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $response = $stub->send($message);
@@ -326,7 +326,7 @@ final class SESRoutingTest extends TestCase
         $entryResults = [];
         $recipients = [];
         for ($i = 0; $i < 50; $i++) {
-            $recipients[] = ['email' => "user{$i}@example.com"];
+            $recipients[] = ['email' => "user{$i}@utopia.dev"];
             $entryResults[] = ['Status' => 'SUCCESS'];
         }
 
@@ -340,7 +340,7 @@ final class SESRoutingTest extends TestCase
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $response = $stub->send($message);
@@ -359,7 +359,7 @@ final class SESRoutingTest extends TestCase
 
         $recipients = [];
         for ($i = 0; $i < 51; $i++) {
-            $recipients[] = ['email' => "user{$i}@example.com"];
+            $recipients[] = ['email' => "user{$i}@utopia.dev"];
         }
 
         $message = new Email(
@@ -367,7 +367,7 @@ final class SESRoutingTest extends TestCase
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $stub->send($message);
@@ -380,11 +380,11 @@ final class SESRoutingTest extends TestCase
         $stub->stubResponses[] = ['statusCode' => 200, 'response' => ['MessageId' => 'two']];
 
         $message = new Email(
-            to: [['email' => 'a@example.com'], ['email' => 'b@example.com']],
+            to: [['email' => 'a@utopia.dev'], ['email' => 'b@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
             attachments: [new Attachment(
                 name: 'note.txt',
                 path: '',
@@ -418,11 +418,11 @@ final class SESRoutingTest extends TestCase
         $stub->stubResponses[] = ['statusCode' => 400, 'response' => ['message' => 'Invalid recipient']];
 
         $message = new Email(
-            to: [['email' => 'a@example.com'], ['email' => 'b@example.com']],
+            to: [['email' => 'a@utopia.dev'], ['email' => 'b@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
             attachments: [new Attachment(
                 name: 'note.txt',
                 path: '',
@@ -447,11 +447,11 @@ final class SESRoutingTest extends TestCase
         $stub = new SESStub('key', 'secret', 'us-east-1');
 
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
             attachments: [new Attachment(
                 name: 'large.bin',
                 path: '',
@@ -472,11 +472,11 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $stub->send($message);
@@ -498,22 +498,22 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
-            cc: [['email' => 'cc@example.com', 'name' => 'CC Person']],
-            bcc: [['email' => 'bcc@example.com']],
+            fromEmail: 'from@utopia.dev',
+            cc: [['email' => 'cc@utopia.dev', 'name' => 'CC Person']],
+            bcc: [['email' => 'bcc@utopia.dev']],
         );
 
         $stub->send($message);
 
         $destination = $stub->capturedRequests[0]['body']['BulkEmailEntries'][0]['Destination'];
 
-        $this->assertSame(['a@example.com'], $destination['ToAddresses']);
-        $this->assertSame(['CC Person <cc@example.com>'], $destination['CcAddresses']);
-        $this->assertSame(['bcc@example.com'], $destination['BccAddresses']);
+        $this->assertSame(['a@utopia.dev'], $destination['ToAddresses']);
+        $this->assertSame(['CC Person <cc@utopia.dev>'], $destination['CcAddresses']);
+        $this->assertSame(['bcc@utopia.dev'], $destination['BccAddresses']);
     }
 
     public function testBulkEntriesOmitCcAndBccWhenAbsent(): void
@@ -525,11 +525,11 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $stub->send($message);
@@ -549,18 +549,18 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Acme, Inc.',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $stub->send($message);
 
         // A name containing RFC 5322 specials must be quoted or SES rejects it.
         $this->assertSame(
-            '"Acme, Inc." <from@example.com>',
+            '"Acme, Inc." <from@utopia.dev>',
             $stub->capturedRequests[0]['body']['FromEmailAddress'],
         );
     }
@@ -574,11 +574,11 @@ final class SESRoutingTest extends TestCase
         ];
 
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: str_repeat('long subject ', 64),
             content: str_repeat('long body ', 64),
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $stub->send($message);
@@ -597,11 +597,11 @@ final class SESRoutingTest extends TestCase
         $stub->stubResponses[] = ['statusCode' => 200, 'response' => []];
 
         $message = new Email(
-            to: [['email' => 'a@example.com'], ['email' => 'b@example.com']],
+            to: [['email' => 'a@utopia.dev'], ['email' => 'b@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
         );
 
         $response = $stub->send($message);
@@ -623,11 +623,11 @@ final class SESRoutingTest extends TestCase
         // ~8MB of raw content clears the raw-attachment check (< 10MB) but its
         // base64-encoded MIME exceeds the SES 10MB message limit.
         $message = new Email(
-            to: [['email' => 'a@example.com']],
+            to: [['email' => 'a@utopia.dev']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@example.com',
+            fromEmail: 'from@utopia.dev',
             attachments: [new Attachment(
                 name: 'big.bin',
                 path: '',

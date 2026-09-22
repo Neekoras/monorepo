@@ -13,6 +13,7 @@ use Swoole\Coroutine;
 use Swoole\Coroutine\WaitGroup;
 use Utopia\Client;
 use Utopia\Client\Adapter\Curl\Client as CurlAdapter;
+use Utopia\Messaging\Exception\InvalidArgumentException;
 use Utopia\Pools\Adapter\Swoole as SwoolePoolAdapter;
 use Utopia\Pools\Pool as ConnectionPool;
 use Utopia\Psr7\Request\Factory as RequestFactory;
@@ -86,19 +87,28 @@ abstract class Adapter
      *     results: array<array<string, mixed>>
      * }> GEOSMS adapter returns an array of results keyed by adapter name.
      *
+     * @throws InvalidArgumentException When the message cannot be sent by this adapter as given.
      * @throws \Exception
      */
     public function send(Message $message): array
     {
         if (!is_a($message, $this->getMessageType())) {
-            throw new \Exception('Invalid message type.');
+            throw new InvalidArgumentException(
+                InvalidArgumentException::MESSAGE_TYPE,
+                "{$this->getName()} cannot send " . $message::class . ' messages.',
+            );
         }
         if (method_exists($message, 'getTo') && \count($message->getTo()) > $this->getMaxMessagesPerRequest()) {
-            throw new \Exception("{$this->getName()} can only send {$this->getMaxMessagesPerRequest()} messages per request.");
+            throw new InvalidArgumentException(
+                InvalidArgumentException::TOO_MANY_RECIPIENTS,
+                "{$this->getName()} can only send {$this->getMaxMessagesPerRequest()} messages per request.",
+            );
         }
         if (!method_exists($this, 'process')) {
             throw new \Exception('Adapter does not implement process method.');
         }
+
+        $this->validate($message);
 
         try {
             $response = $this->process($message);
@@ -111,6 +121,16 @@ abstract class Adapter
 
         return $response;
     }
+
+    /**
+     * Refuse input this transport cannot deliver, before any request is made.
+     *
+     * The message already holds well-formed addresses; this is the place for
+     * rules that depend on the transport, such as which domains it routes to.
+     *
+     * @throws InvalidArgumentException
+     */
+    protected function validate(Message $message): void {}
 
     public function setTelemetry(Telemetry $telemetry): void
     {
