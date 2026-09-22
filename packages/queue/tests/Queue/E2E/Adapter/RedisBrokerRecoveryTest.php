@@ -40,33 +40,67 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
     }
 
     /**
-     * A connection that runs $race once, after the first key it is asked to
-     * read. Naming no key keeps the seam at "another worker settles while the
-     * sweep is reading this claim" instead of at one named step of how the
-     * sweep reads it, so restructuring those reads cannot quietly relocate it.
+     * A connection that lets other workers move a delivery underneath the
+     * sweep. Each seam is a phase of the sweep -- $snapshot once it has taken
+     * its snapshot of the processing list, $read once it has read a claim,
+     * $write just before it first acts on what it read -- rather than a named
+     * key or a counted read, so restructuring how the sweep reads or writes
+     * cannot quietly relocate them. Each closure runs once.
      */
-    private function racingConnection(\Closure $race): Connection
+    private function racingConnection(?\Closure $read = null, ?\Closure $snapshot = null, ?\Closure $write = null): Connection
     {
         $host = getenv('REDIS_HOST') ?: '127.0.0.1';
         $port = (int) (getenv('REDIS_PORT') ?: 16379);
 
-        return new class ($host, $port, $race) extends Connection {
-            public function __construct(string $host, int $port, private ?\Closure $race)
+        return new class ($host, $port, $read, $snapshot, $write) extends Connection {
+            /** @var array<string, \Closure|null> */
+            private array $races;
+
+            public function __construct(string $host, int $port, ?\Closure $read, ?\Closure $snapshot, ?\Closure $write)
             {
                 parent::__construct($host, $port);
+                $this->races = ['read' => $read, 'snapshot' => $snapshot, 'write' => $write];
+            }
+
+            #[\Override]
+            public function listRange(string $key, int $total, int $offset): array
+            {
+                $value = parent::listRange($key, $total, $offset);
+                $this->race('snapshot');
+
+                return $value;
             }
 
             #[\Override]
             public function get(string $key): array|string|null
             {
                 $value = parent::get($key);
-                if ($this->race instanceof \Closure) {
-                    $race = $this->race;
-                    $this->race = null;
-                    $race();
-                }
+                $this->race('read');
 
                 return $value;
+            }
+
+            #[\Override]
+            public function listRemove(string $queue, string $key): bool
+            {
+                $this->race('write');
+
+                return parent::listRemove($queue, $key);
+            }
+
+            #[\Override]
+            public function execute(string $script, array $keys, array $args): mixed
+            {
+                $this->race('write');
+
+                return parent::execute($script, $keys, $args);
+            }
+
+            private function race(string $phase): void
+            {
+                $once = $this->races[$phase];
+                $this->races[$phase] = null;
+                $once?->__invoke();
             }
         };
     }
@@ -302,7 +336,7 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
         $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(Message::class, $claimed);
 
-        $racing = $this->racingConnection(fn() => $this->broker->commit($this->queue, $claimed));
+        $racing = $this->racingConnection(read: fn() => $this->broker->commit($this->queue, $claimed));
 
         $requeued = new Redis($racing, $racing)->reap($this->queue, olderThan: 0);
 
@@ -313,6 +347,38 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
         $this->assertSame('1', (string) $this->redis->get($this->namespace . '.stats.recovery.success'));
         $this->assertSame('0', (string) $this->redis->get($this->namespace . '.stats.recovery.processing'), 'the settlement is not counted twice');
         $racing->close();
+    }
+
+    public function testReapLeavesARedeliveryTakenMidSweepWithItsNewOwner(): void
+    {
+        // A stopping worker hands a prefetched delivery back after the sweep
+        // has snapshotted the processing list, and another worker takes the
+        // redelivery before the sweep acts on what it read. Redeliveries keep
+        // the original pid, so the entry the sweep reads as unrecoverable is
+        // by then a live claim belonging to someone else.
+        $this->broker->publish($this->queue, ['n' => 1]);
+        $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
+        $this->assertInstanceOf(Message::class, $claimed);
+
+        $redelivered = [];
+        $racing = $this->racingConnection(
+            snapshot: fn() => $this->broker->release($this->queue, $claimed),
+            write: function () use (&$redelivered): void {
+                $redelivered = $this->broker->receive($this->queue, 0);
+            },
+        );
+
+        $requeued = new Redis($racing, $racing)->reap($this->queue, olderThan: 0);
+        $racing->close();
+
+        $this->assertSame(0, $requeued, 'the redelivery is not requeued a second time');
+        $this->assertCount(1, $redelivered, 'the released delivery is taken by another worker');
+        $this->assertSame(1, $this->processingSize(), 'the new owner keeps its claim');
+        $this->assertSame(['n' => 1], $redelivered[0]->getPayload());
+
+        $this->broker->commit($this->queue, $redelivered[0]);
+        $this->assertSame(0, $this->processingSize(), 'the new owner can still settle it');
+        $this->assertSame('0', (string) $this->redis->get($this->namespace . '.stats.recovery.processing'), 'the processing counter is settled');
     }
 
     public function testAHeartbeatedClaimIsNeverReaped(): void

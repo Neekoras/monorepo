@@ -455,9 +455,17 @@ class Redis implements Synchronous, Consumer
             $owner = $this->commands->get($ownerKey);
 
             // Legacy claims carry no ownership record, so a payload that is
-            // gone leaves nothing to reclaim atomically: drop the entry.
+            // gone leaves nothing to reclaim atomically: drop the entry. The
+            // script replays both reads, because a claim released mid-sweep is
+            // republished under its original pid: a worker can take the
+            // redelivery between those reads and this drop, and dropping it
+            // then would strand a live claim off the processing list.
             if ($job === false && !\is_string($owner)) {
-                $this->commands->listRemove($processing, $pid);
+                if (!$this->script($this->commands, 'prune', [
+                    "{$queue->namespace}.jobs.{$queue->name}.{$pid}", $ownerKey, $processing,
+                ], [$pid])) {
+                    $retained++;
+                }
                 continue;
             }
 
