@@ -27,14 +27,16 @@ final class InitWorkerTest extends TestCase
             'workerName' => 'all',
             'workers' => ['all'],
             'jobs' => [
-                'databases' => ['queue' => 'database_db_main', 'maxCoroutines' => 1],
-                'functions' => ['queue' => 'v1-functions', 'maxCoroutines' => 8],
+                'databases' => ['queue' => 'database_db_main', 'coroutines' => 1, 'prefetch' => 100],
+                'functions' => ['queue' => 'v1-functions', 'coroutines' => 8],
             ],
         ]);
 
         $this->assertCount(2, $server->jobs());
         $this->assertSame(1, $server->coroutines('database_db_main'));
+        $this->assertSame(100, $server->prefetch('database_db_main'));
         $this->assertSame(8, $server->coroutines('v1-functions'));
+        $this->assertSame(8, $server->prefetch('v1-functions'));
     }
 
     public function testSingleWorkerNamePathStillRegistersOneJob(): void
@@ -46,7 +48,7 @@ final class InitWorkerTest extends TestCase
         $platform->init(Service::TYPE_WORKER, [
             'workerName' => 'functions',
             'jobs' => [
-                'functions' => ['queue' => 'v1-functions', 'maxCoroutines' => 8],
+                'functions' => ['queue' => 'v1-functions', 'coroutines' => 8],
             ],
         ]);
 
@@ -89,9 +91,10 @@ final class InitWorkerTest extends TestCase
 
 final class FakeConsumer implements Consumer
 {
-    public function receive(Queue $queue, int $timeout): ?Message
+    // Initialization never receives; never is compatible with both queue contracts.
+    public function receive(Queue $queue, int $timeout, int $n = 1): never
     {
-        return null;
+        throw new \LogicException('Worker initialization must not receive messages');
     }
 
     public function commit(Queue $queue, Message $message): void {}
@@ -105,7 +108,7 @@ final class RecordingAdapter extends Adapter
 {
     public function __construct(string $namespace = 'utopia-queue')
     {
-        parent::__construct(static fn (string $q): Consumer => new FakeConsumer(), 1, $namespace);
+        parent::__construct(static fn(string $q): Consumer => new FakeConsumer(), 1, $namespace);
     }
 
     public function start(): self

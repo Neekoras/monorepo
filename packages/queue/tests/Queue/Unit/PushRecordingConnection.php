@@ -13,6 +13,11 @@ use Utopia\Queue\Connection;
  */
 final class PushRecordingConnection implements Connection
 {
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        throw new \LogicException('Publisher tests must not execute consumer scripts');
+    }
+
     /** @var list<array{0: string, 1: string}> */
     public array $calls = [];
 
@@ -71,12 +76,22 @@ final class PushRecordingConnection implements Connection
 
     public function rightPush(string $queue, string $payload): bool
     {
+        $this->calls[] = ['rightPush', $queue];
+        $this->pushed[] = $payload;
+
         return true;
     }
 
     public function rightPop(string $queue, int $timeout): string|false
     {
         return false;
+    }
+
+    public function rightPopMany(string $queue, int $count, int $timeout): array
+    {
+        $this->calls[] = ['rightPopMany', $queue];
+
+        return [];
     }
 
     public function rightPopLeftPush(string $queue, string $destination, int $timeout): string|false
@@ -86,6 +101,9 @@ final class PushRecordingConnection implements Connection
 
     public function leftPush(string $queue, string $payload): bool
     {
+        $this->calls[] = ['leftPush', $queue];
+        $this->pushed[] = $payload;
+
         return true;
     }
 
@@ -119,6 +137,11 @@ final class PushRecordingConnection implements Connection
         return true;
     }
 
+    public function setNotExists(string $key, string $value, int $ttl = 0): bool
+    {
+        return true;
+    }
+
     public function get(string $key): array|string|null
     {
         return null;
@@ -132,6 +155,13 @@ final class PushRecordingConnection implements Connection
     public function increment(string $key): int
     {
         return 0;
+    }
+
+    public function incrementBy(string $key, int $by): int
+    {
+        $this->calls[] = ['incrementBy', $key];
+
+        return $by;
     }
 
     public function decrement(string $key): int

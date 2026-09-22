@@ -4,23 +4,24 @@ namespace Utopia\Queue\Broker;
 
 use Utopia\Pools\Pool as UtopiaPool;
 use Utopia\Queue\Consumer;
+use Utopia\Queue\Consumer\Bounded;
 use Utopia\Queue\Message;
 use Utopia\Queue\Publisher\Synchronous;
 use Utopia\Queue\Queue;
 
-readonly class Pool implements Synchronous, Consumer
+readonly class Pool implements Synchronous, Consumer, Bounded
 {
     public function __construct(
         private ?UtopiaPool $publisher = null,
         private ?UtopiaPool $consumer = null,
     ) {}
 
-    public function publish(Queue $queue, array $payload, bool $priority = false): bool
+    public function publish(Queue $queue, array $payload): bool
     {
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
 
-    public function enqueueMany(Queue $queue, array $payloads, bool $priority = false): bool
+    public function publishMany(Queue $queue, array $payloads): bool
     {
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
@@ -44,9 +45,9 @@ readonly class Pool implements Synchronous, Consumer
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
 
-    public function receive(Queue $queue, int $timeout): ?Message
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
-        return $this->delegate($this->consumer, __FUNCTION__, \func_get_args());
+        return $this->delegate($this->consumer, __FUNCTION__, \func_get_args()) ?? [];
     }
 
     public function commit(Queue $queue, Message $message): void
@@ -81,13 +82,26 @@ readonly class Pool implements Synchronous, Consumer
      * map has no entry for it; {@see \Utopia\Queue\Broker\Nats::extend()} is
      * silent in that case by design.
      */
-    public function extend(Queue $queue, Message $message): void
+    public function release(Queue $queue, Message ...$messages): void
     {
-        $this->consumer?->use(function (Synchronous|Consumer $adapter) use ($queue, $message): void {
-            $extend = [$adapter, 'extend'];
+        $this->consumer?->use(function (Synchronous|Consumer $adapter) use ($queue, $messages): void {
+            if (\is_callable([$adapter, 'release'])) {
+                $adapter->release($queue, ...$messages);
+            }
+        });
+    }
 
-            if (\is_callable($extend)) {
-                $extend($queue, $message);
+    public function extend(Queue $queue, Message ...$messages): void
+    {
+        $this->consumer?->use(function (Synchronous|Consumer $adapter) use ($queue, $messages): void {
+            if (\is_callable([$adapter, 'extend'])) {
+                if (new \ReflectionMethod($adapter, 'extend')->isVariadic()) {
+                    $adapter->extend($queue, ...$messages);
+                } else {
+                    foreach ($messages as $message) {
+                        $adapter->extend($queue, $message);
+                    }
+                }
             }
         });
     }
@@ -108,6 +122,19 @@ readonly class Pool implements Synchronous, Consumer
 
             return \is_callable($interval) ? (float) $interval() : null;
         });
+    }
+
+    /**
+     * The leased consumer's in-flight ceiling, where it has one.
+     *
+     * Probed per lease rather than declared, for the same reason extend() is: the
+     * pool may hold a broker with no ceiling of its own (Redis), and this class is
+     * the consumer for those too. Null — an unbounded broker, or no consumer pool
+     * at all — refuses nothing.
+     */
+    public function inFlightCeiling(): ?int
+    {
+        return $this->consumer?->use(static fn(Synchronous|Consumer $adapter): ?int => $adapter instanceof Bounded ? $adapter->inFlightCeiling() : null);
     }
 
     /**

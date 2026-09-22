@@ -6,19 +6,29 @@ use Exception;
 use RedisCluster as Client;
 use Throwable;
 use Utopia\Cache\Adapter;
+use Utopia\Cache\Codec;
+use Utopia\Cache\Codec\Json;
+use Utopia\Cache\Envelope;
+use Utopia\Cache\Feature\Batchable;
 use Utopia\Cache\Feature\Retryable;
 
-class RedisCluster implements Adapter, Retryable
+class RedisCluster implements Adapter, Batchable, Retryable
 {
     private int $maxRetries = 0;
 
     private int $retryDelay = 1000;
 
+    private readonly Envelope $envelope;
+
     /**
      * @param  array<string>  $seeds
      * @param  string|array<string>|null  $auth  Password string or ['username', 'password'] array for ACL
+     * @param  Codec  $codec how values are stored; Json is the wire format every release so far has written
      */
-    public function __construct(protected Client $redis, protected array $seeds, protected ?string $name = null, private readonly float $timeout = 1.5, private readonly float $readTimeout = 1.5, private readonly bool $persistent = false, private readonly string|array|null $auth = null) {}
+    public function __construct(protected Client $redis, protected array $seeds, protected ?string $name = null, private readonly float $timeout = 1.5, private readonly float $readTimeout = 1.5, private readonly bool $persistent = false, private readonly string|array|null $auth = null, Codec $codec = new Json())
+    {
+        $this->envelope = new Envelope($codec);
+    }
 
     /**
      * @param  int  $maxRetries (0-10)
@@ -57,27 +67,49 @@ class RedisCluster implements Adapter, Retryable
             return false;
         }
 
-        $cache = Json::decode($redis_string);
-
         // A purged key keeps its field until re-cached, holding a value that
-        // is not an envelope.
-        if (! \is_array($cache) || ! isset($cache['time'], $cache['data'])) {
-            return false;
+        // is not an envelope; decode() reports that as a miss.
+        return $this->envelope->decode($redis_string, $ttl, time());
+    }
+
+    /**
+     * HMGET for an explicit field list, HGETALL when $fields is empty.
+     *
+     * @param  string[]  $fields
+     * @param  int  $ttl time in seconds
+     * @return array<string, mixed>
+     */
+    public function loadMany(string $key, array $fields, int $ttl): array
+    {
+        $now = time();
+
+        /** @var array<string, mixed> $raw */
+        $raw = (array) ($fields === []
+            ? $this->execute(fn(): array => $this->redis->hGetAll($key))
+            : $this->execute(fn(): array => $this->redis->hMget($key, $fields)));
+
+        $result = [];
+        foreach ($raw as $field => $value) {
+            if (! \is_string($value)) {
+                continue;
+            }
+
+            $decoded = $this->envelope->decode($value, $ttl, $now);
+            if ($decoded !== false) {
+                $result[(string) $field] = $decoded;
+            }
         }
 
-        if ($cache['time'] + $ttl > time()) { // Cache is valid
-            return $cache['data'];
-        }
-
-        return false;
+        return $result;
     }
 
     /**
      * @param  array<int|string, mixed>|string  $data
      * @param  string  $hash optional
+     * @param  int  $ttl time in seconds
      * @return bool|string|array<int|string, mixed>
      */
-    public function save(string $key, array|string $data, string $hash = ''): bool|string|array
+    public function save(string $key, array|string $data, string $hash = '', int $ttl = 0): bool|string|array
     {
         if ($key === '' || $key === '0' || empty($data)) {
             return false;
@@ -88,16 +120,47 @@ class RedisCluster implements Adapter, Retryable
         }
 
         try {
-            $value = json_encode([
-                'time' => time(),
-                'data' => $data,
-            ], flags: JSON_THROW_ON_ERROR);
+            $value = $this->envelope->encode($data, time());
+            $this->execute(fn(): int => $this->redis->hSet($key, $hash, $value));
+
+            if ($ttl > 0) {
+                $this->execute(fn(): bool => $this->redis->expire($key, $ttl));
+            }
+
+            return $data;
         } catch (Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * HMSET every field => value pair of $data in one round trip, then one EXPIRE.
+     *
+     * @param  array<string, mixed>  $data field => value
+     * @param  int  $ttl time in seconds
+     * @return array<string, mixed>|false
+     */
+    public function saveMany(string $key, array $data, int $ttl = 0): array|false
+    {
+        $map = [];
+        foreach ($data as $field => $value) {
+            try {
+                $map[(string) $field] = $this->envelope->encode($value, time());
+            } catch (Throwable) {
+                return false;
+            }
+        }
+
+        if ($map === []) {
             return false;
         }
 
         try {
-            $this->execute(fn(): int => $this->redis->hSet($key, $hash, $value));
+            $this->execute(fn(): bool => $this->redis->hMSet($key, $map));
+
+            if ($ttl > 0) {
+                $this->execute(fn(): bool => $this->redis->expire($key, $ttl));
+            }
 
             return $data;
         } catch (Throwable) {
@@ -121,12 +184,8 @@ class RedisCluster implements Adapter, Retryable
             return false;
         }
 
-        try {
-            /** @var array{time: int, data: mixed} $cache */
-            $cache = Json::decode($redis_string, JSON_THROW_ON_ERROR);
-            $cache['time'] = time();
-            $value = json_encode($cache, flags: JSON_THROW_ON_ERROR);
-        } catch (Throwable) {
+        $value = $this->envelope->touch($redis_string, time());
+        if ($value === false) {
             return false;
         }
 

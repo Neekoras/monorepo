@@ -13,6 +13,33 @@ class Redis implements Connection
 
     public function __construct(protected string $host, protected int $port = 6379, protected ?string $user = null, protected ?string $password = null, protected float $connectTimeout = -1, protected float $readTimeout = -1) {}
 
+    private array $scripts = [];
+
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        return $this->call(function (\Redis $redis) use ($script, $keys, $args): mixed {
+            $hash = sha1($script);
+            if (!isset($this->scripts[$hash])) {
+                $redis->script('load', $script);
+                $this->scripts[$hash] = true;
+            }
+            $redis->clearLastError();
+            $result = $redis->evalSha($hash, [...$keys, ...$args], \count($keys));
+            $error = $redis->getLastError();
+            if ($result === false && $error !== null && str_starts_with($error, 'NOSCRIPT')) {
+                // The server definitively did not execute this operation.
+                $redis->script('load', $script);
+                $redis->clearLastError();
+                $result = $redis->evalSha($hash, [...$keys, ...$args], \count($keys));
+                $error = $redis->getLastError();
+            }
+            if ($result === false && $error !== null) {
+                throw new \RedisException($error);
+            }
+            return $result;
+        });
+    }
+
     public function rightPopLeftPushArray(string $queue, string $destination, int $timeout): array|false
     {
         $response = $this->rightPopLeftPush($queue, $destination, $timeout);
@@ -25,7 +52,7 @@ class Redis implements Connection
     }
     public function rightPopLeftPush(string $queue, string $destination, int $timeout): string|false
     {
-        $response = $this->getRedis()->bRPopLPush($queue, $destination, $timeout);
+        $response = $this->call(fn(\Redis $redis): \Redis|string|false => $redis->bRPopLPush($queue, $destination, $timeout));
 
         if (!$response) {
             return false;
@@ -35,22 +62,22 @@ class Redis implements Connection
     }
     public function rightPushArray(string $queue, array $value): bool
     {
-        return (bool) $this->getRedis()->rPush($queue, json_encode($value));
+        return (bool) $this->call(fn(\Redis $redis): int|\Redis|false => $redis->rPush($queue, json_encode($value)));
     }
 
     public function rightPush(string $queue, string $value): bool
     {
-        return (bool) $this->getRedis()->rPush($queue, $value);
+        return (bool) $this->call(fn(\Redis $redis): int|\Redis|false => $redis->rPush($queue, $value));
     }
 
     public function leftPushArray(string $queue, array $value): bool
     {
-        return (bool) $this->getRedis()->lPush($queue, json_encode($value));
+        return (bool) $this->call(fn(\Redis $redis): int|\Redis|false => $redis->lPush($queue, json_encode($value)));
     }
 
     public function leftPush(string $queue, string $value): bool
     {
-        return (bool) $this->getRedis()->lPush($queue, $value);
+        return (bool) $this->call(fn(\Redis $redis): int|\Redis|false => $redis->lPush($queue, $value));
     }
 
     public function leftPushMany(string $queue, array $payloads): bool
@@ -59,7 +86,7 @@ class Redis implements Connection
             return true;
         }
 
-        return (bool) $this->getRedis()->lPush($queue, ...$payloads);
+        return (bool) $this->call(fn(\Redis $redis): int|\Redis|false => $redis->lPush($queue, ...$payloads));
     }
 
     public function rightPushMany(string $queue, array $payloads): bool
@@ -68,7 +95,7 @@ class Redis implements Connection
             return true;
         }
 
-        return (bool) $this->getRedis()->rPush($queue, ...$payloads);
+        return (bool) $this->call(fn(\Redis $redis): int|\Redis|false => $redis->rPush($queue, ...$payloads));
     }
 
     /** @phpstan-impure */
@@ -85,7 +112,7 @@ class Redis implements Connection
 
     public function rightPop(string $queue, int $timeout): string|false
     {
-        $response = $this->getRedis()->brPop([$queue], $timeout);
+        $response = $this->call(fn(\Redis $redis): array|\Redis|false|null => $redis->brPop([$queue], $timeout));
 
         if (empty($response)) {
             return false;
@@ -94,9 +121,31 @@ class Redis implements Connection
         return $response[1];
     }
 
+    public function rightPopMany(string $queue, int $count, int $timeout): array
+    {
+        if ($count < 1) {
+            return [];
+        }
+
+        // BLMPOP (Redis 7.0), so the wait and the drain are one round trip
+        // rather than a BRPOP followed by an RPOP that asks what else arrived.
+        // Not idempotent, for the reason call() gives about pops: a replay
+        // after an ambiguous transport error would take a second helping off
+        // the list and drop the first.
+        $response = $this->call(fn(\Redis $redis): mixed => $redis->blmpop((float) $timeout, [$queue], 'RIGHT', $count));
+
+        // [key, [payload, ...]] when something was popped; false or null when
+        // the timeout passed with the list empty.
+        if (!\is_array($response) || !\is_array($response[1] ?? null)) {
+            return [];
+        }
+
+        return array_values(array_filter($response[1], \is_string(...)));
+    }
+
     public function leftPopArray(string $queue, int $timeout): array|false
     {
-        $response = $this->getRedis()->blPop($queue, $timeout);
+        $response = $this->call(fn(\Redis $redis): \Redis|array|false|null => $redis->blPop($queue, $timeout));
 
         if (empty($response)) {
             return false;
@@ -107,7 +156,7 @@ class Redis implements Connection
 
     public function leftPop(string $queue, int $timeout): string|false
     {
-        $response = $this->getRedis()->blPop($queue, $timeout);
+        $response = $this->call(fn(\Redis $redis): \Redis|array|false|null => $redis->blPop($queue, $timeout));
 
         if (empty($response)) {
             return false;
@@ -118,12 +167,12 @@ class Redis implements Connection
 
     public function listRemove(string $queue, string $key): bool
     {
-        return (bool) $this->getRedis()->lRem($queue, $key, 1);
+        return (bool) $this->call(fn(\Redis $redis): int|\Redis|false => $redis->lRem($queue, $key, 1), idempotent: true);
     }
 
     public function remove(string $key): bool
     {
-        return (bool) $this->getRedis()->del($key);
+        return (bool) $this->call(fn(\Redis $redis): int|\Redis|false => $redis->del($key), idempotent: true);
     }
 
     public function setArray(string $key, array $value, int $ttl = 0): bool
@@ -134,29 +183,46 @@ class Redis implements Connection
     public function set(string $key, string $value, int $ttl = 0): bool
     {
         if ($ttl > 0) {
-            return $this->getRedis()->setex($key, $ttl, $value);
+            return $this->call(fn(\Redis $redis): bool|\Redis => $redis->setex($key, $ttl, $value), idempotent: true);
         }
-        return $this->getRedis()->set($key, $value);
+        return $this->call(fn(\Redis $redis): \Redis|string|bool => $redis->set($key, $value), idempotent: true);
+    }
+
+    public function setNotExists(string $key, string $value, int $ttl = 0): bool
+    {
+        $options = $ttl > 0 ? ['nx', 'ex' => $ttl] : ['nx'];
+
+        // A retried SET NX that already landed answers false the second time,
+        // which reads as "someone holds it" -- the safe answer for a lock, so
+        // the retry stays on.
+        return (bool) $this->call(fn(\Redis $redis): \Redis|string|bool => $redis->set($key, $value, $options), idempotent: true);
     }
 
     public function get(string $key): array|string|null
     {
-        return $this->getRedis()->get($key);
+        $value = $this->call(fn(\Redis $redis): mixed => $redis->get($key), idempotent: true);
+
+        return $value === false ? null : $value;
     }
 
     public function listSize(string $key): int
     {
-        return $this->getRedis()->lLen($key);
+        return $this->call(fn(\Redis $redis): int|\Redis|false => $redis->lLen($key), idempotent: true);
     }
 
     public function increment(string $key): int
     {
-        return $this->getRedis()->incr($key);
+        return $this->call(fn(\Redis $redis): int|\Redis|false => $redis->incr($key));
+    }
+
+    public function incrementBy(string $key, int $by): int
+    {
+        return $this->call(fn(\Redis $redis): int|\Redis|false => $redis->incrBy($key, $by));
     }
 
     public function decrement(string $key): int
     {
-        return $this->getRedis()->decr($key);
+        return $this->call(fn(\Redis $redis): int|\Redis|false => $redis->decr($key));
     }
 
     public function listRange(string $key, int $total, int $offset): array
@@ -164,7 +230,7 @@ class Redis implements Connection
         $start = $offset;
         $end = $start + $total - 1;
 
-        return $this->getRedis()->lRange($key, $start, $end);
+        return $this->call(fn(\Redis $redis): array|\Redis|false => $redis->lRange($key, $start, $end), idempotent: true);
     }
 
     public function ping(): bool
@@ -185,7 +251,58 @@ class Redis implements Connection
         } catch (\Throwable) {
         } finally {
             $this->redis = null;
+            $this->scripts = [];
         }
+    }
+
+    /**
+     * Run a command on the cached client. When phpredis reports the socket
+     * is gone, drop the client so the next command opens a fresh one, and
+     * for a command that is safe to repeat run it again right away.
+     *
+     * phpredis reconnects a dropped socket by itself, but when the peer stays
+     * away past its retry budget it parks the client in a failed state for
+     * good, and every later command throws "went away". A worker that lived
+     * through a broker failover longer than those retries would otherwise fail
+     * every ack until the process restarts.
+     *
+     * Commands whose execution the server may already have applied (pops,
+     * pushes, counters) are never replayed: the caller sees the error and the
+     * broker's own retry path decides.
+     *
+     * @template T
+     * @param callable(\Redis): T $command
+     * @return T
+     */
+    protected function call(callable $command, bool $idempotent = false): mixed
+    {
+        try {
+            return $command($this->getRedis());
+        } catch (\RedisException $e) {
+            if (!$this->isTransportError($e)) {
+                throw $e;
+            }
+
+            $this->close();
+
+            if (!$idempotent) {
+                throw $e;
+            }
+
+            return $command($this->getRedis());
+        }
+    }
+
+    /**
+     * phpredis errors that mean the socket is gone rather than the command
+     * being wrong. Anything else (WRONGTYPE, OOM, ...) is the caller's to see.
+     */
+    private function isTransportError(\RedisException $e): bool
+    {
+        return (bool) preg_match(
+            '/went away|Connection (lost|closed|refused)|read error on connection/',
+            $e->getMessage(),
+        );
     }
 
     protected function getRedis(): \Redis
@@ -201,6 +318,11 @@ class Redis implements Connection
 
             try {
                 $redis->connect($this->host, $this->port, $connectTimeout);
+
+                if ($this->password !== null && $this->password !== '') {
+                    $hasUser = $this->user !== null && $this->user !== '';
+                    $redis->auth($hasUser ? [$this->user, $this->password] : $this->password);
+                }
 
                 if ($this->readTimeout >= 0) {
                     $redis->setOption(\Redis::OPT_READ_TIMEOUT, $this->readTimeout);

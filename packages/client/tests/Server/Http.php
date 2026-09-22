@@ -50,12 +50,16 @@ final class Http
      * later connection is kept alive and answers repeatedly. Returns the number
      * of connections accepted, so a caller can confirm a reusing client had to
      * re-establish the dropped connection rather than open one per request.
+     * With $dropResponse, read the second request completely and close without
+     * answering it, so tests can detect an unsafe replay after a send.
      *
-     * @param callable(int): void $test receives the listening port
+     * @param callable(int, string): void $test receives the listening port and TLS certificate path
+     * @param list<string>|null $receivedRequests receives the HTTP request headers observed by the server
+     * @param-out list<string> $receivedRequests
      *
      * @return int connections the server accepted
      */
-    public static function dropsFirstKeepAliveConnection(callable $test): int
+    public static function dropsFirstKeepAliveConnection(callable $test, bool $tls = false, bool $dropResponse = false, string $peerName = '127.0.0.1', ?array &$receivedRequests = null): int
     {
         $readyFile = tempnam(sys_get_temp_dir(), 'utopia-drop-ready-');
         $countFile = tempnam(sys_get_temp_dir(), 'utopia-drop-count-');
@@ -66,26 +70,58 @@ final class Http
 
         unlink($readyFile);
 
+        $certificateFile = '';
+        if ($tls) {
+            $certificateFile = tempnam(sys_get_temp_dir(), 'utopia-tls-');
+            $key = openssl_pkey_new(['private_key_bits' => 2048]);
+            if ($certificateFile === false || $key === false) {
+                throw new RuntimeException('Unable to create the TLS fixture key.');
+            }
+
+            $csr = openssl_csr_new(['commonName' => $peerName], $key);
+            if (!$csr instanceof \OpenSSLCertificateSigningRequest || !$key instanceof \OpenSSLAsymmetricKey) {
+                throw new RuntimeException('Unable to create the TLS fixture CSR.');
+            }
+
+            $certificate = openssl_csr_sign($csr, null, $key, 1);
+            if ($certificate === false) {
+                throw new RuntimeException('Unable to sign the TLS fixture certificate.');
+            }
+
+            if (!openssl_x509_export($certificate, $pem) || !openssl_pkey_export($key, $privateKey)
+                || !\is_string($pem) || !\is_string($privateKey)) {
+                throw new RuntimeException('Unable to export the TLS fixture certificate.');
+            }
+
+            file_put_contents($certificateFile, $pem . $privateKey);
+        }
+
         $port = self::availablePort();
 
         $code = <<<'PHP'
             $port = (int) $argv[1];
             $readyFile = $argv[2];
             $countFile = $argv[3];
-            $server = stream_socket_server('tcp://127.0.0.1:' . $port, $errorCode, $errorMessage);
+            $certificateFile = $argv[4];
+            $tls = $certificateFile !== '';
+            $dropResponse = $argv[5] === '1';
+            $requests = 0;
+            $context = stream_context_create(['ssl' => ['local_cert' => $certificateFile, 'verify_peer' => false]]);
+            $server = stream_socket_server(($tls ? 'tls' : 'tcp') . '://127.0.0.1:' . $port, $errorCode, $errorMessage, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $context);
             if (!is_resource($server)) {
                 fwrite(STDERR, $errorCode . ' ' . $errorMessage);
                 exit(1);
             }
             file_put_contents($readyFile, 'ready');
             $connections = 0;
+            $receivedRequests = [];
             while (true) {
                 $connection = @stream_socket_accept($server, 30);
                 if (!is_resource($connection)) {
                     continue;
                 }
                 $connections++;
-                file_put_contents($countFile, (string) $connections);
+                file_put_contents($countFile, json_encode(['connections' => $connections, 'requests' => $receivedRequests]));
                 $dropAfterResponse = ($connections === 1);
                 while (true) {
                     $request = '';
@@ -98,9 +134,27 @@ final class Http
                     if ($request === '') {
                         break;
                     }
-                    $body = 'ok';
+                    $length = preg_match('/Content-Length:\s*(\d+)/i', $request, $match) ? (int) $match[1] : 0;
+                    $body = '';
+                    while (strlen($body) < $length) {
+                        $chunk = fread($connection, $length - strlen($body));
+                        if ($chunk === false || $chunk === '') {
+                            break;
+                        }
+                        $body .= $chunk;
+                    }
+                    $requests++;
+                    $receivedRequests[] = $request;
+                    file_put_contents($countFile, json_encode(['connections' => $connections, 'requests' => $receivedRequests]));
+                    if ($dropAfterResponse && $dropResponse && $requests === 2) {
+                        stream_socket_shutdown($connection, STREAM_SHUT_RDWR);
+                        break;
+                    }
+                    $body = $body === '' ? 'ok' : $body;
                     @fwrite($connection, "HTTP/1.1 200 OK\r\nContent-Length: " . strlen($body) . "\r\n\r\n" . $body);
-                    if ($dropAfterResponse) {
+                    if ($dropAfterResponse && !$dropResponse) {
+                        // Close TCP without TLS close_notify, as an idle peer can disappear.
+                        stream_socket_shutdown($connection, STREAM_SHUT_RDWR);
                         break;
                     }
                 }
@@ -109,7 +163,7 @@ final class Http
             PHP;
 
         $server = proc_open(
-            [\PHP_BINARY, '-r', $code, (string) $port, $readyFile, $countFile],
+            [\PHP_BINARY, '-r', $code, (string) $port, $readyFile, $countFile, $certificateFile, $dropResponse ? '1' : '0'],
             [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
             $pipes,
         );
@@ -122,13 +176,18 @@ final class Http
         self::waitForReadyFile($readyFile);
 
         try {
-            $test($port);
+            $test($port, $certificateFile);
         } finally {
             self::stop($server);
+            /** @var array{connections: int, requests: list<string>} $observed */
+            $observed = json_decode((string) file_get_contents($countFile), true) ?: ['connections' => 0, 'requests' => []];
+            $count = $observed['connections'];
+            $receivedRequests = $observed['requests'];
+            @unlink($countFile);
+            if ($certificateFile !== '') {
+                @unlink($certificateFile);
+            }
         }
-
-        $count = is_file($countFile) ? (int) file_get_contents($countFile) : 0;
-        @unlink($countFile);
 
         return $count;
     }

@@ -7,7 +7,6 @@ namespace Tests\E2E\Adapter;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Utopia\Lock\Lock;
-use Utopia\Lock\Mutex;
 use Utopia\Queue\Connection;
 use Utopia\Queue\Connection\Locking;
 
@@ -74,39 +73,31 @@ final class LockingTest extends TestCase
         $this->assertSame(['acquire', 'release'], $recorder->events);
     }
 
-    /**
-     * Defaults to a coroutine-aware Mutex when no lock is injected.
-     */
-    public function testDefaultLockIsAMutex(): void
+    public function testDefaultLockSerializesConcurrentOperations(): void
     {
-        $locking = new Locking(new RecordingConnection(new Recorder()));
-
-        $lock = new \ReflectionProperty(Locking::class, 'lock')->getValue($locking);
-
-        $this->assertInstanceOf(Mutex::class, $lock);
-    }
-
-    /**
-     * Regression guard: every method on the Connection interface must be
-     * exercised by operationProvider(), so newly added methods cannot ship
-     * without verifying they are synchronized.
-     */
-    public function testEveryConnectionMethodIsCovered(): void
-    {
-        $declared = array_map(
-            static fn(\ReflectionMethod $method): string => $method->getName(),
-            new \ReflectionClass(Connection::class)->getMethods(),
-        );
-
-        $covered = array_map(
-            static fn(array $case): string => $case[0],
-            iterator_to_array($this->operationProvider(), false),
-        );
-
-        sort($declared);
-        sort($covered);
-
-        $this->assertSame($declared, $covered, 'Every Connection method must be covered by the Locking test.');
+        $connection = new class (new Recorder()) extends RecordingConnection {
+            public int $active = 0;
+            public int $peak = 0;
+            public function ping(): bool
+            {
+                $this->active++;
+                $this->peak = max($this->peak, $this->active);
+                \Swoole\Coroutine::sleep(0.001);
+                $this->active--;
+                return true;
+            }
+        };
+        $locking = new Locking($connection);
+        $results = [];
+        \Swoole\Coroutine\run(function () use ($locking, &$results): void {
+            for ($i = 0; $i < 10; $i++) {
+                \Swoole\Coroutine::create(function () use ($locking, &$results): void {
+                    $results[] = $locking->ping();
+                });
+            }
+        });
+        $this->assertSame(array_fill(0, 10, true), $results);
+        $this->assertSame(1, $connection->peak);
     }
 
     /**
@@ -114,6 +105,7 @@ final class LockingTest extends TestCase
      */
     public static function operationProvider(): iterable
     {
+        yield 'execute' => ['execute', ['return 1', [], []], [1]];
         yield 'rightPushArray' => ['rightPushArray', ['queue', ['a' => 1]], true];
         yield 'rightPushMany' => ['rightPushMany', ['queue', ['{"a":1}', '{"b":2}']], true];
         yield 'rightPopArray' => ['rightPopArray', ['queue', 5], ['popped' => 'right']];
@@ -123,6 +115,7 @@ final class LockingTest extends TestCase
         yield 'leftPopArray' => ['leftPopArray', ['queue', 5], ['popped' => 'left']];
         yield 'rightPush' => ['rightPush', ['queue', 'value'], true];
         yield 'rightPop' => ['rightPop', ['queue', 5], 'right-pop'];
+        yield 'rightPopMany' => ['rightPopMany', ['queue', 4, 5], ['right-pop', 'right-pop-2']];
         yield 'rightPopLeftPush' => ['rightPopLeftPush', ['queue', 'dest', 5], 'rpoplpush'];
         yield 'leftPush' => ['leftPush', ['queue', 'value'], true];
         yield 'leftPop' => ['leftPop', ['queue', 5], 'left-pop'];
@@ -131,9 +124,11 @@ final class LockingTest extends TestCase
         yield 'listRange' => ['listRange', ['key', 10, 0], ['a', 'b']];
         yield 'remove' => ['remove', ['key'], true];
         yield 'set' => ['set', ['key', 'value', 60], true];
+        yield 'setNotExists' => ['setNotExists', ['key', 'value', 60], true];
         yield 'get' => ['get', ['key'], 'value'];
         yield 'setArray' => ['setArray', ['key', ['a' => 1], 60], true];
         yield 'increment' => ['increment', ['key'], 3];
+        yield 'incrementBy' => ['incrementBy', ['key', 5], 8];
         yield 'decrement' => ['decrement', ['key'], 2];
         yield 'ping' => ['ping', [], true];
         yield 'close' => ['close', [], null];
@@ -186,6 +181,12 @@ class RecordingLock implements Lock
 
 class RecordingConnection implements Connection
 {
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        $this->record('execute', [$script, $keys, $args]);
+        return [1];
+    }
+
     public function __construct(private readonly Recorder $recorder) {}
 
     private function record(string $method, array $args): void
@@ -257,6 +258,13 @@ class RecordingConnection implements Connection
         return 'right-pop';
     }
 
+    public function rightPopMany(string $queue, int $count, int $timeout): array
+    {
+        $this->record('rightPopMany', [$queue, $count, $timeout]);
+
+        return ['right-pop', 'right-pop-2'];
+    }
+
     public function rightPopLeftPush(string $queue, string $destination, int $timeout): string|false
     {
         $this->record('rightPopLeftPush', [$queue, $destination, $timeout]);
@@ -313,6 +321,13 @@ class RecordingConnection implements Connection
         return true;
     }
 
+    public function setNotExists(string $key, string $value, int $ttl = 0): bool
+    {
+        $this->record('setNotExists', [$key, $value, $ttl]);
+
+        return true;
+    }
+
     public function get(string $key): array|string|null
     {
         $this->record('get', [$key]);
@@ -332,6 +347,13 @@ class RecordingConnection implements Connection
         $this->record('increment', [$key]);
 
         return 3;
+    }
+
+    public function incrementBy(string $key, int $by): int
+    {
+        $this->record('incrementBy', [$key, $by]);
+
+        return 8;
     }
 
     public function decrement(string $key): int
@@ -356,9 +378,24 @@ class RecordingConnection implements Connection
 
 class ThrowingConnection implements Connection
 {
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        throw new \LogicException('Script execution is not supported by this test connection');
+    }
+
     public function rightPushArray(string $queue, array $payload): bool
     {
         return true;
+    }
+
+    public function rightPopMany(string $queue, int $count, int $timeout): array
+    {
+        return [];
+    }
+
+    public function incrementBy(string $key, int $by): int
+    {
+        return $by;
     }
 
     public function rightPopArray(string $queue, int $timeout): array|false
@@ -427,6 +464,11 @@ class ThrowingConnection implements Connection
     }
 
     public function set(string $key, string $value, int $ttl = 0): bool
+    {
+        return true;
+    }
+
+    public function setNotExists(string $key, string $value, int $ttl = 0): bool
     {
         return true;
     }

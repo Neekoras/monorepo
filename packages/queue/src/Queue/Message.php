@@ -10,6 +10,7 @@ class Message
     protected array $payload;
     protected int $attempts = 0;
     protected ?int $sequence = null;
+    protected bool $terminal = false;
 
     public function __construct(array $array = [])
     {
@@ -23,6 +24,19 @@ class Message
         $this->payload = $array['payload'] ?? [];
         $this->attempts = $array['attempts'] ?? 0;
         $this->sequence = $array['sequence'] ?? null;
+    }
+
+    private ?string $receipt = null;
+
+    public function getReceipt(): ?string
+    {
+        return $this->receipt;
+    }
+
+    public function setReceipt(string $receipt): self
+    {
+        $this->receipt = $receipt;
+        return $this;
     }
 
     public function setPid(string $pid): self
@@ -108,6 +122,40 @@ class Message
         $this->sequence = $sequence;
 
         return $this;
+    }
+
+    /**
+     * Declare that this message must not be delivered again.
+     *
+     * The verdict a handler reaches about its own failure: this payload will
+     * fail the same way on every attempt, so spending the redelivery budget on
+     * it buys nothing and — on a broker that counts an unacked message against a
+     * ceiling, as JetStream does — costs a delivery slot for the whole of it.
+     * {@see Broker\Nats::reject()} dead-letters a terminal message at once
+     * instead of scheduling the next attempt; {@see Broker\Redis::reject()}
+     * parks it where its retry sweep will not pick it up again. A broker with no
+     * notion of the distinction rejects it the way it always has.
+     *
+     * Throwing {@see PermanentFailure} sets this and is the shorter route. This
+     * is here for a handler that cannot: the exception type belongs to a library,
+     * or the classification happens somewhere that only has the message. It is
+     * read when the message is rejected, so set it before the handler gives up.
+     *
+     * Per delivery, not part of the envelope: a redelivered copy of the same
+     * payload arrives with a fresh verdict, because the reason it failed may
+     * have been fixed in between.
+     */
+    public function terminal(bool $terminal = true): self
+    {
+        $this->terminal = $terminal;
+
+        return $this;
+    }
+
+    /** Whether the handler declared this failure permanent. {@see self::terminal()} */
+    public function isTerminal(): bool
+    {
+        return $this->terminal;
     }
 
     public function asArray(): array

@@ -123,7 +123,7 @@ abstract class Adapter
      * @param callable(Message): void $successCallback
      * @param callable(?Message, \Throwable): void $errorCallback Receives null when
      *        the failure was in obtaining a message rather than handling one.
-     * @param array<int, array{queue: Queue, maxCoroutines: int, consumer?: Consumer}> $queues
+     * @param array<int, array{queue: Queue, coroutines: int, prefetch?: int, consumer?: Consumer}> $queues
      *        Queue identity and concurrency come from Server::job(); sequential
      *        adapters run specs one after another, Swoole runs independent loops.
      */
@@ -142,18 +142,19 @@ abstract class Adapter
         foreach ($queues as $spec) {
             $this->run(
                 $spec['queue'],
-                $spec['maxCoroutines'],
+                $spec['coroutines'],
                 $messageCallback,
                 $successCallback,
                 $errorCallback,
                 $spec['consumer'] ?? $this->consumer,
+                $spec['prefetch'] ?? $spec['coroutines'],
             );
         }
     }
 
     /**
-     * One-queue loop. `$maxCoroutines` is accepted for adapter parity; the
-     * sequential fallback processes one message at a time (effective cap 1).
+     * One-queue loop. `$coroutines` and `$prefetch` are accepted for adapter
+     * parity; the sequential fallback processes one message at a time.
      *
      * Binds `$this->queue` / `$this->consumer` for the duration so the hot
      * path matches pre-multi-queue (no per-message queue/consumer args).
@@ -164,13 +165,15 @@ abstract class Adapter
      */
     protected function run(
         Queue $queue,
-        int $maxCoroutines,
+        int $coroutines,
         callable $messageCallback,
         callable $successCallback,
         callable $errorCallback,
         Consumer $consumer,
+        ?int $prefetch = null,
     ): void {
-        unset($maxCoroutines);
+        // Sequential adapters receive and acknowledge one message at a time.
+        unset($coroutines, $prefetch);
 
         $previousConsumer = $this->consumer;
         $this->queue = $queue;
@@ -260,20 +263,7 @@ abstract class Adapter
      */
     protected function nextMessage(callable $errorCallback): ?Message
     {
-        try {
-            return $this->consumer->receive($this->queue, static::RECEIVE_TIMEOUT);
-        } catch (\Throwable $error) {
-            // A reporting hook that throws must not cost the worker either.
-            try {
-                $errorCallback(null, $error);
-            } catch (\Throwable $reportFailure) {
-                $this->reportUnreported($error, $reportFailure);
-            }
-
-            sleep(static::RECEIVE_BACKOFF);
-
-            return null;
-        }
+        return $this->nextMessageFrom($errorCallback, $this->queue, $this->consumer);
     }
 
     /**
@@ -284,8 +274,19 @@ abstract class Adapter
      */
     protected function nextMessageFrom(callable $errorCallback, Queue $queue, Consumer $consumer): ?Message
     {
+        return $this->nextBatchFrom($errorCallback, $queue, $consumer, 1)[0] ?? null;
+    }
+
+    /**
+     * Claim up to $max messages at once.
+     *
+     * @param callable(?Message, \Throwable): void $errorCallback
+     * @return list<Message>
+     */
+    protected function nextBatchFrom(callable $errorCallback, Queue $queue, Consumer $consumer, int $max): array
+    {
         try {
-            return $consumer->receive($queue, static::RECEIVE_TIMEOUT);
+            return $consumer->receive($queue, static::RECEIVE_TIMEOUT, $max);
         } catch (\Throwable $error) {
             try {
                 $errorCallback(null, $error);
@@ -295,7 +296,7 @@ abstract class Adapter
 
             sleep(static::RECEIVE_BACKOFF);
 
-            return null;
+            return [];
         }
     }
 
@@ -329,7 +330,8 @@ abstract class Adapter
      * both of those the handler has already run to completion:
      *
      *  - handler threw       — the work did not happen; the message is rejected
-     *                          and will be retried.
+     *                          and will be retried, unless the handler threw
+     *                          {@see PermanentFailure} and it is dead-lettered.
      *  - commit threw        — the work happened; nothing is rejected, and the
      *                          broker may still redeliver on its own deadline.
      *  - success hook threw  — the work happened and is acked; nothing will
@@ -374,7 +376,17 @@ abstract class Adapter
                 $messageCallback($message);
             });
         } catch (\Throwable $error) {
-            // The work did not happen, so hand the message back to be retried.
+            // A handler that knows the work can never succeed says so by throwing
+            // PermanentFailure, and the verdict has to be on the message before it
+            // is rejected: reject() is where the broker decides between another
+            // attempt and the dead letter, and it runs here — ahead of the error
+            // report below, which is the only other place a host sees the failure.
+            if ($error instanceof PermanentFailure) {
+                $message->terminal();
+            }
+
+            // The work did not happen, so hand the message back to be retried
+            // (or, for a terminal verdict, to be dead-lettered now).
             try {
                 $consumer->reject($queue, $message);
             } catch (\Throwable) {

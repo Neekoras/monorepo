@@ -256,30 +256,32 @@ class GitHub extends Git
             $responseHeaders = $response['headers'] ?? [];
             $statusCode = $responseHeaders['status-code'] ?? 0;
 
-            // The search API rejects a query naming an owner that does not exist,
-            // which is a missing owner rather than a failure worth reporting.
-            if ($statusCode === 422) {
+            if ($statusCode !== 422) {
+                if ($statusCode >= 400) {
+                    throw new Exception("Failed to search repositories: HTTP {$statusCode}", $statusCode);
+                }
+
+                $responseBody = $response['body'] ?? [];
+
+                return [
+                    'items' => $responseBody['items'] ?? [],
+                    'total' => $responseBody['total_count'] ?? 0,
+                ];
+            }
+
+            // Private profiles cannot be searched, but their installation can
+            // still list repositories. Keep unknown owners returning no results.
+            if (strcasecmp($owner, $this->getOwnerName($this->installationId)) !== 0) {
                 return ['items' => [], 'total' => 0];
             }
-
-            if ($statusCode >= 400) {
-                throw new Exception("Failed to search repositories: HTTP {$statusCode}", $statusCode);
-            }
-
-            $responseBody = $response['body'] ?? [];
-
-            return [
-                'items' => $responseBody['items'] ?? [],
-                'total' => $responseBody['total_count'] ?? 0,
-            ];
         }
 
-        // Installation has access to specific repositories, we need to perform client-side filtering.
+        // Restricted installations and unsearchable owners use the installation API.
         $url = '/installation/repositories';
         $repositories = [];
 
         // When no search query is provided, delegate pagination to the GitHub API.
-        if ($search === '' || $search === '0') {
+        if ($search === '') {
             $response = $this->call(self::METHOD_GET, $url, ['Authorization' => "Bearer $this->accessToken"], [
                 'page' => $page,
                 'per_page' => $per_page,
@@ -644,20 +646,29 @@ class GitHub extends Git
      */
     protected function generateAccessToken(string $privateKey, ?string $appId): void
     {
+        // Some env files can't hold a multiline PEM, so also accept it base64-encoded or with escaped newlines.
+        // Strict decoding rejects the '-' in a raw PEM, so a working key is never decoded.
+        $decoded = base64_decode($privateKey, true);
+        if ($decoded !== false && str_contains($decoded, '-----BEGIN')) {
+            $privateKey = $decoded;
+        }
+        if (str_contains($privateKey, '-----BEGIN')) {
+            $privateKey = str_replace('\n', "\n", $privateKey);
+        }
+
         // adhocore/jwt treats a string key as a file path, so it must receive the parsed key object
         $privateKeyObj = openssl_pkey_get_private($privateKey);
         if ($privateKeyObj === false) {
             throw new Exception('Failed to read the GitHub App private key');
         }
 
-        $appIdentifier = $appId;
-
         $iat = time();
         $exp = $iat + self::GITHUB_APP_JWT_EXPIRY;
         $payload = [
             'iat' => $iat,
             'exp' => $exp,
-            'iss' => $appIdentifier,
+            // GitHub 401s a numeric App ID encoded as a JSON string.
+            'iss' => \is_string($appId) && ctype_digit($appId) ? (int) $appId : $appId,
         ];
 
         // generate access token
@@ -1190,7 +1201,8 @@ class GitHub extends Git
      */
     public function generateCloneCommand(string $owner, string $repositoryName, string $version, string $versionType, string $directory, string $rootDirectory): string
     {
-        if ($rootDirectory === '' || $rootDirectory === '0') {
+        $rootDirectory = $this->normalizeRepositoryPath($rootDirectory);
+        if ($rootDirectory === '') {
             $rootDirectory = '*';
         }
 

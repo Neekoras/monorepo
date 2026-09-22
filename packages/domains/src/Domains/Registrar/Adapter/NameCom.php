@@ -4,6 +4,8 @@ namespace Utopia\Domains\Registrar\Adapter;
 
 use DateTime;
 use Exception;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Client\ClientInterface;
 use Utopia\Domains\Exception as DomainsException;
 use Utopia\Domains\Registrar;
 use Utopia\Domains\Registrar\Adapter;
@@ -24,9 +26,21 @@ use Utopia\Domains\Registrar\Renewal;
 use Utopia\Domains\Registrar\TransferStatus;
 use Utopia\Domains\Registrar\TransferStatusEnum;
 use Utopia\Domains\Registrar\UpdateDetails;
+use Utopia\Psr7\Request\Factory;
 
 class NameCom extends Adapter
 {
+    private const int AVAILABILITY_BATCH_SIZE = 50;
+
+    private const int AVAILABILITY_CACHE_TTL = 60;
+
+    private const int TLD_PAGE_SIZE = 1000;
+
+    /**
+     * TLDs with a minimum term above one year; availability quotes them at that term.
+     */
+    private const array MINIMUM_TERM_YEARS = ['ai' => 2];
+
     /**
      * Name.com API Error Keys
      */
@@ -79,12 +93,16 @@ class NameCom extends Adapter
      * @param  string  $username  Name.com API username
      * @param  string  $token  Name.com API token
      * @param  string  $endpoint  The endpoint to use for the API (use https://api.name.com for production)
+     * @param  ClientInterface|null  $client  Optional transport; owns timeout, TLS, redirect and connection settings
      */
     public function __construct(
         protected string $username,
         protected string $token,
         protected string $endpoint = 'https://api.name.com',
+        ?ClientInterface $client = null,
     ) {
+        $this->client = $client;
+
         if (str_starts_with($endpoint, 'http://')) {
             $this->endpoint = 'https://' . substr($endpoint, 7);
         } elseif (!str_starts_with($endpoint, 'https://')) {
@@ -92,7 +110,7 @@ class NameCom extends Adapter
         }
 
         $this->headers = [
-            'Content-Type: application/json',
+            'Content-Type' => 'application/json',
         ];
     }
 
@@ -105,25 +123,78 @@ class NameCom extends Adapter
     }
 
     /**
-     * Check if a domain is available
+     * Check if domains are available
      *
-     * @param string $domain The domain name to check
-     * @return bool True if the domain is available, false otherwise
+     * Name.com accepts up to 50 domains per availability request. Each result
+     * also carries the registration and renewal price, so when a cache is set
+     * the prices are stored too and a following getPrice() for the same domain
+     * costs no registrar request.
+     *
+     * @param array<string> $domains Domain names to check
+     * @return array<string, bool> Availability keyed by domain name
      */
-    public function available(string $domain): bool
+    public function available(array $domains): array
     {
-        try {
-            $result = $this->send('POST', '/core/v1/domains:checkAvailability', [
-                'domainNames' => [$domain],
-            ]);
-        } catch (Exception $e) {
-            return match ($this->matchError($e)) {
-                self::ERROR_INVALID_DOMAINS => false,
-                default => throw $e,
-            };
+        $domains = array_values(array_unique($domains));
+        $availability = array_fill_keys($domains, false);
+
+        foreach (array_chunk($domains, self::AVAILABILITY_BATCH_SIZE) as $chunk) {
+            try {
+                $result = $this->send('POST', '/core/v1/domains:checkAvailability', [
+                    'domainNames' => $chunk,
+                ]);
+            } catch (Exception $e) {
+                if ($this->matchError($e) === self::ERROR_INVALID_DOMAINS) {
+                    continue;
+                }
+
+                throw $e;
+            }
+
+            foreach ($result['results'] ?? [] as $domain) {
+                $domainName = $domain['domainName'] ?? null;
+                if ($domainName === null) {
+                    continue;
+                }
+                if (!\array_key_exists((string) $domainName, $availability)) {
+                    continue;
+                }
+
+                $availability[$domainName] = $domain['purchasable'] ?? false;
+
+                if (!$this->cache instanceof \Utopia\Domains\Cache) {
+                    continue;
+                }
+
+                $this->cache->save("{$domainName}_availability", $domain);
+                if (empty($domain['purchasable'])) {
+                    continue;
+                }
+                if (!isset($domain['purchasePrice'])) {
+                    continue;
+                }
+
+                // Same premium rule as getPrice(). Only the price types this
+                // endpoint reports are stored, so a later lookup for another
+                // type still asks the registrar instead of being told the
+                // price does not exist. A renewal price of 0 means name.com has
+                // no renewal data for the listing.
+                $purchaseType = $domain['purchaseType'] ?? 'registration';
+                $isPremium = ($domain['premium'] ?? false) === true || ($purchaseType !== '' && $purchaseType !== 'registration');
+                $cacheData = [
+                    Registrar::REG_TYPE_NEW => ['price' => (float) $domain['purchasePrice'], 'premium' => $isPremium],
+                ];
+                if (!empty($domain['renewalPrice'])) {
+                    $cacheData[Registrar::REG_TYPE_RENEWAL] = ['price' => (float) $domain['renewalPrice'], 'premium' => $isPremium];
+                }
+
+                $parts = explode('.', $domainName);
+                $periodYears = self::MINIMUM_TERM_YEARS[end($parts)] ?? 1;
+                $this->cache->save("{$domainName}_{$periodYears}", $cacheData);
+            }
         }
 
-        return $result['results'][0]['purchasable'] ?? false;
+        return $availability;
     }
 
     /**
@@ -399,20 +470,31 @@ class NameCom extends Adapter
             // getPricing only covers standard registry registrations. Premium
             // aftermarket listings are priced by the availability endpoint, so
             // without this merge a premium domain is quoted at the base TLD price.
+            // A recent available() call leaves its result in the cache, which
+            // saves one registrar request per domain in bulk price lookups.
             $availability = null;
             $availabilityFailed = false;
-            try {
-                $availabilityResult = $this->send('POST', '/core/v1/domains:checkAvailability', [
-                    'domainNames' => [$domain],
-                ]);
-                $availability = $availabilityResult['results'][0] ?? null;
-            } catch (RateLimitException $e) {
-                throw $e;
-            } catch (Exception $e) {
-                // Registry pricing is still usable for standard domains; skip
-                // the premium override and skip caching so the merge is
-                // retried on the next request
-                $availabilityFailed = true;
+            if ($this->cache instanceof \Utopia\Domains\Cache) {
+                $cachedAvailability = $this->cache->load("{$domain}_availability", self::AVAILABILITY_CACHE_TTL);
+                if (\is_array($cachedAvailability)) {
+                    $availability = $cachedAvailability;
+                }
+            }
+
+            if ($availability === null) {
+                try {
+                    $availabilityResult = $this->send('POST', '/core/v1/domains:checkAvailability', [
+                        'domainNames' => [$domain],
+                    ]);
+                    $availability = $availabilityResult['results'][0] ?? null;
+                } catch (RateLimitException $e) {
+                    throw $e;
+                } catch (Exception) {
+                    // Registry pricing is still usable for standard domains; skip
+                    // the premium override and skip caching so the merge is
+                    // retried on the next request
+                    $availabilityFailed = true;
+                }
             }
 
             $purchaseType = $availability['purchaseType'] ?? 'registration';
@@ -482,8 +564,20 @@ class NameCom extends Adapter
      */
     public function tlds(): array
     {
-        // Name.com supports too many TLDs to return efficiently
-        return [];
+        $tlds = [];
+        $page = 1;
+
+        do {
+            $result = $this->send('GET', '/core/v1/tldpricing?perPage=' . self::TLD_PAGE_SIZE . "&page={$page}");
+            foreach ($result['pricing'] ?? [] as $pricing) {
+                if (isset($pricing['tld'])) {
+                    $tlds[] = (string) $pricing['tld'];
+                }
+            }
+            $page = $result['nextPage'] ?? null;
+        } while ($page !== null);
+
+        return $tlds;
     }
 
     /**
@@ -674,15 +768,7 @@ class NameCom extends Adapter
     {
         $url = "{$this->endpoint}{$path}";
 
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $this->headers);
-        curl_setopt($ch, CURLOPT_USERPWD, "{$this->username}:{$this->token}");
-        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $this->connectTimeout);
-        curl_setopt($ch, CURLOPT_TIMEOUT, $this->timeout);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+        $body = '';
 
         if ($data !== null && \in_array($method, ['POST', 'PUT', 'PATCH'])) {
             $jsonData = json_encode($data);
@@ -691,16 +777,20 @@ class NameCom extends Adapter
                 throw new Exception("Failed to encode request data to JSON: {$jsonError}");
             }
 
-            curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonData);
+            $body = $jsonData;
         }
 
-        $result = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $request = new Factory()->body($method, $url, $body, 'application/json', $this->headers)
+            ->withHeader('Authorization', 'Basic ' . base64_encode("{$this->username}:{$this->token}"));
 
-        if ($result === false) {
-            $error = curl_error($ch);
-            throw new Exception("Failed to send request to Name.com: {$error}");
+        try {
+            $httpResponse = $this->getHttpClient()->sendRequest($request);
+        } catch (ClientExceptionInterface $error) {
+            throw new Exception("Failed to send request to Name.com: {$error->getMessage()}", 0, $error);
         }
+
+        $httpCode = $httpResponse->getStatusCode();
+        $result = (string) $httpResponse->getBody();
 
         $response = json_decode($result, true);
         if ($response === null && $result !== 'null' && $result !== '') {

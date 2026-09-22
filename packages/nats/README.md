@@ -175,6 +175,28 @@ $ack = $js->publish('orders.new', '{"id": 1}', msgId: 'order-1');
 $ack = $js->publish('orders.new', $data, expectedLastSeq: 42);
 ```
 
+### Publishing a batch
+
+`publish()` waits for each acknowledgment before it sends the next message, so a
+batch of `N` messages costs `N` round trips. `publishMany()` writes a window of
+messages first and reads their acknowledgments afterwards, which costs one round
+trip per window. Each message keeps its own acknowledgment, so deduplication and
+per-message errors work the same way.
+
+```php
+$acks = $js->publishMany([
+    ['subject' => 'orders.new', 'data' => '{"id": 1}', 'msgId' => 'order-1'],
+    ['subject' => 'orders.new', 'data' => '{"id": 2}', 'msgId' => 'order-2'],
+]);
+
+// The acknowledgments come back in the order the messages were given.
+echo "Seq: {$acks[0]->sequence}\n";
+```
+
+The `window` argument sets how many messages stay in flight before their
+acknowledgments are collected. A message the server rejects throws, as it does on
+`publish()`.
+
 ### Consumers
 
 ```php
@@ -336,6 +358,37 @@ $conn = Connection::connect(new ConnectionOptions(
 # With custom NATS URL
 NATS_URL=nats://host:4222 ./vendor/bin/phpunit --testsuite integration
 ```
+
+## Batched requests
+
+`Connection::requestBatch()` sends independent requests together and delivers each outcome to `reply` as it arrives. The callback receives the original input index and either a `Message` or a `Throwable`. One missing reply does not delay successful replies or discard their outcomes.
+
+```php
+$connection->requestBatch(
+    requests: [
+        new Request(subject: 'service.first', data: 'one'),
+        new Request(subject: 'service.second', data: 'two', headers: $headers),
+    ],
+    reply: function (int $index, Message|Throwable $result): void {
+        // Handle this request's reply or failure.
+    },
+    timeout: 5.0,
+);
+```
+
+`Request` has read-only typed fields; both `request()` and `requestBatch()` use its subject validation and the same request lifecycle. The method returns `void`; collect results in the callback if you need an array. Completion order can differ from input order. The timeout is one response deadline for the whole group, starting after the write, rather than a separate wait per reply. Callback execution counts toward that deadline. Empty input performs no I/O. Invalid input throws before any request is published; request headers and payload limits follow `request()`.
+
+If the callback throws, collection stops immediately, pending state is cleaned up, and the exception propagates. Requests already sent are not cancelled or replayed. Later replies can still arrive. Use one owner for reading the connection; nested reads from the callback throw `LogicException`.
+
+This differs from `requestMany()`, which sends one request and gathers several responses. Ambiguous writes are not replayed on reconnect. Use `JetStream::ackBatch()` to confirm a selected list of `JetStreamMessage` instances. JetStream constructs each acknowledgement; its callback receives the original index and `null` on server confirmation or a `Throwable` on failure. The consumer's configured acknowledgement policy still applies. Use `AckPolicy::Explicit` to leave messages outside the list unacknowledged. With `AckPolicy::All`, acknowledging a later message also acknowledges earlier messages, including those outside the list.
+
+```php
+$jetStream->ackBatch($messages, function (int $index, ?Throwable $error): void {
+    // Null means this message's acknowledgement was confirmed.
+});
+```
+
+Single `request()` calls retain one retry for an explicit stale-connection rejection. Batch requests do not retry. Neither path replays an ambiguous write.
 
 ## License
 

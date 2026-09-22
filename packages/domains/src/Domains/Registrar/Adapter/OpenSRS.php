@@ -4,6 +4,8 @@ namespace Utopia\Domains\Registrar\Adapter;
 
 use DateTime;
 use Exception;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Client\ClientInterface;
 use Utopia\Domains\Exception as DomainsException;
 use Utopia\Domains\Registrar;
 use Utopia\Domains\Registrar\Adapter;
@@ -19,6 +21,7 @@ use Utopia\Domains\Registrar\Renewal;
 use Utopia\Domains\Registrar\TransferStatus;
 use Utopia\Domains\Registrar\TransferStatusEnum;
 use Utopia\Domains\Registrar\UpdateDetails;
+use Utopia\Psr7\Request\Factory;
 
 class OpenSRS extends Adapter
 {
@@ -52,13 +55,17 @@ class OpenSRS extends Adapter
      * Instantiate a new adapter.
      *
      * @param  string  $endpoint - The endpoint to use for the API (use rr-n1-tor.opensrs.net:55443 for production)
+     * @param  ClientInterface|null  $client  Optional transport; owns timeout, TLS, redirect and connection settings
      */
     public function __construct(
         protected string $apiKey,
         string $username,
         string $password,
         protected string $endpoint = 'https://horizon.opensrs.net:55443',
+        ?ClientInterface $client = null,
     ) {
+        $this->client = $client;
+
         if (str_starts_with($endpoint, 'http://')) {
             $this->endpoint = 'https://' . substr($endpoint, 7);
         } elseif (!str_starts_with($endpoint, 'https://')) {
@@ -71,32 +78,36 @@ class OpenSRS extends Adapter
         ];
 
         $this->headers = [
-            'Content-Type:text/xml',
-            'X-Username: ' . $username,
+            'Content-Type' => 'text/xml',
+            'X-Username' => $username,
         ];
     }
 
     /**
-     * Check if a domain is available
+     * Check if domains are available
      *
-     * @param string $domain The domain name to check
-     * @return bool True if the domain is available, false otherwise
+     * @param array<string> $domains Domain names to check
+     * @return array<string, bool> Availability keyed by domain name
      */
-    public function available(string $domain): bool
+    public function available(array $domains): array
     {
-        $result = $this->send([
-            'object' => 'DOMAIN',
-            'action' => 'LOOKUP',
-            'attributes' => [
-                'domain' => $domain,
-            ],
-        ]);
+        $availability = [];
 
+        foreach (array_unique($domains) as $domain) {
+            $result = $this->send([
+                'object' => 'DOMAIN',
+                'action' => 'LOOKUP',
+                'attributes' => [
+                    'domain' => $domain,
+                ],
+            ]);
 
-        $result = $this->sanitizeResponse($result);
-        $elements = $result->xpath('//body/data_block/dt_assoc/item[@key="response_code"]');
+            $result = $this->sanitizeResponse($result);
+            $elements = $result->xpath('//body/data_block/dt_assoc/item[@key="response_code"]');
+            $availability[$domain] = (int) $elements[0] === self::RESPONSE_CODE_DOMAIN_AVAILABLE;
+        }
 
-        return (int) $elements[0] === self::RESPONSE_CODE_DOMAIN_AVAILABLE;
+        return $availability;
     }
 
     public function updateNameservers(string $domain, array $nameservers): array
@@ -800,23 +811,18 @@ class OpenSRS extends Adapter
         $xml = $this->buildEnvelop($object, $action, $attributes, $domain);
 
         $headers = array_merge($this->headers, [
-            'X-Signature:' . md5(md5($xml . $this->apiKey) . $this->apiKey),
+            'X-Signature' => md5(md5($xml . $this->apiKey) . $this->apiKey),
         ]);
 
-        $ch = curl_init($this->endpoint);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $xml);
+        $request = new Factory()->xml('POST', $this->endpoint, $xml, $headers);
 
-        $result = curl_exec($ch);
-
-        if ($result === false) {
-            $error = curl_error($ch);
-            throw new Exception('Failed to send request to OpenSRS: ' . $error);
+        try {
+            $response = $this->getHttpClient()->sendRequest($request);
+        } catch (ClientExceptionInterface $error) {
+            throw new Exception('Failed to send request to OpenSRS: ' . $error->getMessage(), 0, $error);
         }
 
-        return $result;
+        return (string) $response->getBody();
     }
 
     private function sanitizeResponse(string $response): \SimpleXMLElement

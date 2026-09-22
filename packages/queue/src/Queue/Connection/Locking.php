@@ -39,6 +39,11 @@ class Locking implements Connection
         return $this->lock->withLock($command, self::ACQUIRE_TIMEOUT);
     }
 
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        return $this->synchronize(fn(): mixed => $this->connection->execute($script, $keys, $args));
+    }
+
     public function rightPushArray(string $queue, array $payload): bool
     {
         return $this->synchronize(fn(): bool => $this->connection->rightPushArray($queue, $payload));
@@ -84,6 +89,11 @@ class Locking implements Connection
         return $this->synchronize(fn(): string|false => $this->connection->rightPop($queue, $timeout));
     }
 
+    public function rightPopMany(string $queue, int $count, int $timeout): array
+    {
+        return $this->synchronize(fn(): array => $this->connection->rightPopMany($queue, $count, $timeout));
+    }
+
     public function rightPopLeftPush(string $queue, string $destination, int $timeout): string|false
     {
         return $this->synchronize(fn(): string|false => $this->connection->rightPopLeftPush($queue, $destination, $timeout));
@@ -124,6 +134,11 @@ class Locking implements Connection
         return $this->synchronize(fn(): bool => $this->connection->set($key, $value, $ttl));
     }
 
+    public function setNotExists(string $key, string $value, int $ttl = 0): bool
+    {
+        return $this->synchronize(fn(): bool => $this->connection->setNotExists($key, $value, $ttl));
+    }
+
     public function get(string $key): array|string|null
     {
         return $this->synchronize(fn(): string|array|null => $this->connection->get($key));
@@ -137,6 +152,11 @@ class Locking implements Connection
     public function increment(string $key): int
     {
         return $this->synchronize(fn(): int => $this->connection->increment($key));
+    }
+
+    public function incrementBy(string $key, int $by): int
+    {
+        return $this->synchronize(fn(): int => $this->connection->incrementBy($key, $by));
     }
 
     public function decrement(string $key): int

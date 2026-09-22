@@ -5,7 +5,9 @@ namespace Utopia\Queue\Adapter;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Channel;
 use Swoole\Coroutine\WaitGroup;
+use Swoole\Event;
 use Swoole\Process;
+use Swoole\Timer;
 use Utopia\DI\Container;
 use Utopia\Queue\Adapter;
 use Utopia\Queue\Consumer;
@@ -24,9 +26,13 @@ class Swoole extends Adapter
 
     /** Whether the maintenance coroutine should keep looping. */
     protected bool $maintaining = false;
+    private ?float $stopping = null;
 
     /** @var Process[] */
     protected array $workers = [];
+
+    /** @var array<int, int> Process ID to worker ID. */
+    protected array $workerIds = [];
 
     /** @var callable[] */
     protected array $onWorkerStart = [];
@@ -42,27 +48,46 @@ class Swoole extends Adapter
         int $workerNum,
         string $namespace = 'utopia-queue',
         Container $resources = new Container(),
+        private readonly float $shutdownTimeout = 30.0,
     ) {
+        if ($shutdownTimeout <= 0) {
+            throw new \InvalidArgumentException('Shutdown timeout must be positive');
+        }
         parent::__construct($consumer, $workerNum, $namespace, $resources);
     }
 
     public function start(): self
     {
-        for ($i = 0; $i < $this->workerNum; $i++) {
-            $this->spawnWorker($i);
-        }
+        $this->stopped = false;
+        $this->stopping = null;
+        // Dispatch signals without a persistent coroutine: Swoole cannot fork
+        // a replacement while any coroutine is running in the supervisor.
+        $timer = Timer::tick(1000, static fn(): null => null);
+        Process::signal(SIGTERM, fn(): \Utopia\Queue\Adapter\Swoole => $this->stop());
+        Process::signal(SIGINT, fn(): \Utopia\Queue\Adapter\Swoole => $this->stop());
+        Process::signal(SIGCHLD, static fn(): null => null);
 
-        Coroutine::set(['hook_flags' => SWOOLE_HOOK_ALL]);
-
-        Coroutine\run(function (): void {
-            Process::signal(SIGTERM, fn(): \Utopia\Queue\Adapter\Swoole => $this->stop());
-            Process::signal(SIGINT, fn(): \Utopia\Queue\Adapter\Swoole => $this->stop());
-            Process::signal(SIGCHLD, fn() => $this->reap());
-
-            while (\count($this->workers) > 0) {
-                Coroutine::sleep(1);
+        try {
+            for ($i = 0; $i < $this->workerNum; $i++) {
+                $this->spawnWorker($i);
             }
-        });
+
+            while ($this->workers !== []) {
+                Event::dispatch();
+                $this->reap();
+            }
+        } finally {
+            $this->stop();
+            while ($this->workers !== []) {
+                Event::dispatch();
+                $this->reap();
+            }
+            Timer::clear($timer);
+            Process::signal(SIGTERM, null);
+            Process::signal(SIGINT, null);
+            Process::signal(SIGCHLD, null);
+            Event::wait();
+        }
 
         return $this;
     }
@@ -70,12 +95,15 @@ class Swoole extends Adapter
     protected function spawnWorker(int $workerId): void
     {
         $process = new Process(function () use ($workerId): void {
+            // Only the supervisor owns sibling processes.
+            $this->workers = [];
+            $this->workerIds = [];
             Coroutine::set(['hook_flags' => SWOOLE_HOOK_ALL]);
 
             Coroutine\run(function () use ($workerId): void {
                 Process::signal(SIGTERM, function (): void {
                     // Flip the flag and let the loop drain. Closing the consumer
-                    // here landed mid-job: at maxCoroutines=1 the loop is parked
+                    // here landed mid-job: at coroutines=1 the loop is parked
                     // while a handler runs, so the socket went away underneath
                     // it. The handler then finished, commit() threw on a closed
                     // connection, execution fell through to reject() which threw
@@ -99,11 +127,15 @@ class Swoole extends Adapter
         }, false, 0, false);
 
         $pid = $process->start();
+        if ($pid === false) {
+            throw new \RuntimeException('Failed to start queue worker ' . $workerId);
+        }
         $this->workers[$pid] = $process;
+        $this->workerIds[$pid] = $workerId;
     }
 
     /**
-     * @param array<int, array{queue: Queue, maxCoroutines: int, consumer?: Consumer}> $queues
+     * @param array<int, array{queue: Queue, coroutines: int, prefetch?: int, consumer?: Consumer}> $queues
      */
     #[\Override]
     public function consume(
@@ -121,29 +153,8 @@ class Swoole extends Adapter
         $this->startMaintenance($errorCallback);
 
         try {
-            // Single queue: same hot path as pre-multi-queue main — bind
-            // $this->queue/$this->consumer and keep the Coroutine::create capture
-            // list identical (no per-message queue/consumer args).
-            if (\count($queues) === 1) {
-                $spec = $queues[0];
-                $previousConsumer = $this->consumer;
-                $this->queue = $spec['queue'];
-                $this->consumer = $spec['consumer'] ?? $this->consumer;
-                if ($this->consumer !== $previousConsumer) {
-                    $this->consumers[] = $this->consumer;
-                }
-
-                try {
-                    $this->consumeBound($spec['maxCoroutines'], $messageCallback, $successCallback, $errorCallback);
-                } finally {
-                    $this->consumer = $previousConsumer;
-                }
-
-                return;
-            }
-
             // Independent loop per queue so each cap is isolated (a databases loop
-            // at maxCoroutines=1 cannot share a pool with functions=8).
+            // at coroutines=1 cannot share a pool with functions=8).
             $waitGroup = new WaitGroup();
 
             foreach ($queues as $spec) {
@@ -152,11 +163,12 @@ class Swoole extends Adapter
                     try {
                         $this->run(
                             $spec['queue'],
-                            $spec['maxCoroutines'],
+                            $spec['coroutines'],
                             $messageCallback,
                             $successCallback,
                             $errorCallback,
                             $spec['consumer'] ?? $this->consumer,
+                            $spec['prefetch'] ?? $spec['coroutines'],
                         );
                     } finally {
                         $waitGroup->done();
@@ -188,188 +200,128 @@ class Swoole extends Adapter
         }
     }
 
-    /**
-     * Receive on one loop with `$this->queue` / `$this->consumer` already bound.
-     * Structure matches origin/main's Swoole::consume body.
-     *
-     * @param callable(Message): void $messageCallback
-     * @param callable(Message): void $successCallback
-     * @param callable(?Message, \Throwable): void $errorCallback
-     */
-    protected function consumeBound(
-        int $maxCoroutines,
-        callable $messageCallback,
-        callable $successCallback,
-        callable $errorCallback,
-    ): void {
-        $slots = new Channel($maxCoroutines);
-        $waitGroup = new WaitGroup();
-
-        while (!$this->isStopped()) {
-            $slots->push(true);
-
-            $message = $this->nextMessage($errorCallback);
-
-            if (!$message instanceof Message) {
-                $slots->pop();
-                continue;
-            }
-
-            $waitGroup->add();
-
-            Coroutine::create(function () use ($message, $messageCallback, $successCallback, $errorCallback, $slots, $waitGroup): void {
-                try {
-                    $this->process($message, $messageCallback, $successCallback, $errorCallback);
-                } catch (\Throwable $error) {
-                    // process() is total; net for a stray throw so it isn't lost
-                    error_log('Uncaught error while processing queue message: ' . $error->getMessage());
-                } finally {
-                    $this->releaseSlot($waitGroup, $slots);
-                }
-            });
-        }
-
-        $waitGroup->wait();
-    }
-
-    /**
-     * Concurrent multi-queue loop: queue/consumer stay on the stack so sibling
-     * loops do not race `$this->queue`.
-     *
-     * A slot is reserved before the receive, never after: a message popped with
-     * no capacity to run it would sit captive in this loop — out of the broker,
-     * unprocessed, invisible to every idle sibling consumer — for as long as the
-     * in-flight handlers hold the pool. Blocking without a message leaves it in
-     * the broker for whichever consumer frees up first.
-     */
+    /** One bounded buffer and renewal loop per queue, independent of processing concurrency. */
     #[\Override]
     protected function run(
         Queue $queue,
-        int $maxCoroutines,
+        int $coroutines,
         callable $messageCallback,
         callable $successCallback,
         callable $errorCallback,
         Consumer $consumer,
+        ?int $prefetch = null,
     ): void {
         if ($consumer !== $this->consumer) {
             $this->consumers[] = $consumer;
         }
-
-        $slots = new Channel($maxCoroutines);
+        $prefetch ??= $coroutines;
+        if ($coroutines < 1 || $prefetch < $coroutines) {
+            throw new \InvalidArgumentException('Prefetch must be at least the positive number of coroutines');
+        }
+        $running = new Channel($coroutines);
+        $available = new Channel($prefetch);
         $waitGroup = new WaitGroup();
-
-        while (!$this->isStopped()) {
-            $slots->push(true);
-
-            $message = $this->nextMessageFrom($errorCallback, $queue, $consumer);
-
-            if (!$message instanceof Message) {
-                $slots->pop();
-                continue;
-            }
-
+        $finished = new Channel(1);
+        /** @var \ArrayObject<int, Message> $deliveries */
+        $deliveries = new \ArrayObject();
+        $beat = \is_callable([$consumer, 'extendInterval']) ? $consumer->extendInterval() : null;
+        $renewing = is_numeric($beat) && $beat > 0 && \is_callable([$consumer, 'extend']);
+        if ($renewing) {
             $waitGroup->add();
-
-            Coroutine::create(function () use ($message, $messageCallback, $successCallback, $errorCallback, $slots, $waitGroup, $queue, $consumer): void {
+            Coroutine::create(function () use ($consumer, $queue, $beat, &$deliveries, $finished, $waitGroup, $errorCallback): void {
                 try {
-                    $this->processFrom($message, $messageCallback, $successCallback, $errorCallback, $queue, $consumer);
-                } catch (\Throwable $error) {
-                    // processFrom() is total; net for a stray throw so it isn't lost
-                    error_log('Uncaught error while processing queue message: ' . $error->getMessage());
+                    while ($finished->pop((float) $beat) === false) {
+                        if ($deliveries->count() === 0) {
+                            continue;
+                        }
+                        try {
+                            // Older third-party consumers may expose only single-message renewal.
+                            if (new \ReflectionMethod($consumer, 'extend')->isVariadic()) {
+                                $consumer->extend($queue, ...array_values($deliveries->getArrayCopy()));
+                            } else {
+                                foreach ($deliveries as $message) {
+                                    $consumer->extend($queue, $message);
+                                }
+                            }
+                        } catch (\Throwable $error) {
+                            try {
+                                $errorCallback(null, $error);
+                            } catch (\Throwable $reportFailure) {
+                                $this->reportUnreported($error, $reportFailure);
+                            }
+                        }
+                    }
                 } finally {
-                    $this->releaseSlot($waitGroup, $slots);
+                    $waitGroup->done();
                 }
             });
         }
-
-        $waitGroup->wait();
-    }
-
-    /**
-     * Hold the broker's delivery deadline open for as long as the handler runs.
-     *
-     * ackWait is how long the server waits for an ack before deciding the
-     * worker died. Nothing extended it, so it was a hard ceiling on job
-     * duration — and being redelivered while the first attempt is still running
-     * is worse than being retried: two workers do the same side effect at the
-     * same time. Screenshots ran 76.9% of production renders past their old 10s
-     * ackWait with four processes pulling the same durable.
-     *
-     * A coroutine alongside the handler reports progress on the broker's own
-     * cadence, and stops the moment the handler returns, however it returns.
-     * Only brokers that expose both halves are extended; there is no default
-     * interval to fall back on, because guessing one that is longer than the
-     * real ackWait would extend nothing while looking like it did.
-     *
-     * @param \Closure(): void $work
-     */
-    #[\Override]
-    protected function withAckExtension(Consumer $consumer, Queue $queue, Message $message, \Closure $work): void
-    {
-        $extend = [$consumer, 'extend'];
-        $interval = [$consumer, 'extendInterval'];
-
-        if (!\is_callable($extend) || !\is_callable($interval)) {
-            $work();
-
-            return;
-        }
-
-        // Asked once, not once per beat. A pooled consumer answers this by
-        // leasing a broker, so calling it from inside the heartbeat loop would
-        // take a lease on every beat -- contending with the handler for the
-        // pool it is running on behalf of. ackWait does not change under us,
-        // so the cadence is a constant for the life of this message.
-        //
-        // Null is how a consumer that cannot extend says so after being asked:
-        // a pool only knows once it has a broker in hand. Anything non-positive
-        // is treated the same way, because a heartbeat that fires continuously
-        // would be worse than none.
-        $beat = $interval();
-
-        if (!\is_int($beat) && !\is_float($beat)) {
-            $work();
-
-            return;
-        }
-
-        $beat = (float) $beat;
-
-        if ($beat <= 0.0) {
-            $work();
-
-            return;
-        }
-
-        // The handler signals completion by pushing, so waiting for the next
-        // beat and noticing the handler has finished are the same operation.
-        // A sleep followed by a flag check leaves a window between the two
-        // where the handler can finish and the consume loop can go back to
-        // reading the socket — and extending then would write to a connection
-        // another coroutine is reading. Waiting on the channel closes it, and
-        // ends the heartbeat the moment the handler returns rather than at the
-        // end of an interval it no longer needs.
-        $finished = new Channel(1);
-
-        Coroutine::create(function () use ($finished, $extend, $beat, $queue, $message): void {
-            // pop() yields false when the wait times out, and the pushed value
-            // when the handler is done.
-            while ($finished->pop($beat) === false) {
-                try {
-                    $extend($queue, $message);
-                } catch (\Throwable) {
-                    // The connection is gone, or the message no longer in
-                    // flight. Either way there is nothing left to extend, and
-                    // the handler's own failure is the one worth reporting.
-                    return;
+        try {
+            while (!$this->isStopped()) {
+                while ($prefetch - \count($deliveries) < max(1, intdiv($prefetch, 2)) && !$this->isStopped()) {
+                    $available->pop(0.1);
+                }
+                if ($this->isStopped()) {
+                    break;
+                }
+                $messages = $this->nextBatchFrom($errorCallback, $queue, $consumer, $prefetch - \count($deliveries));
+                foreach ($messages as $message) {
+                    $deliveries[spl_object_id($message)] = $message;
+                }
+                foreach ($messages as $index => $message) {
+                    $running->push(true);
+                    if ($this->isStopped()) {
+                        $running->pop();
+                        $waiting = \array_slice($messages, $index);
+                        try {
+                            if (\is_callable([$consumer, 'release'])) {
+                                $consumer->release($queue, ...$waiting);
+                            }
+                        } catch (\Throwable $error) {
+                            try {
+                                $errorCallback(null, $error);
+                            } catch (\Throwable $reportFailure) {
+                                $this->reportUnreported($error, $reportFailure);
+                            }
+                        } finally {
+                            foreach ($waiting as $pending) {
+                                unset($deliveries[spl_object_id($pending)]);
+                            }
+                        }
+                        break;
+                    }
+                    $waitGroup->add();
+                    Coroutine::create(function () use ($message, $queue, $consumer, $messageCallback, $successCallback, $errorCallback, $running, $available, $waitGroup, &$deliveries): void {
+                        try {
+                            $this->processFrom($message, function (Message $message) use ($messageCallback, $running): void {
+                                try {
+                                    $messageCallback($message);
+                                } finally {
+                                    // Confirmation may remain in flight while the next handler starts.
+                                    $running->pop();
+                                }
+                            }, $successCallback, $errorCallback, $queue, $consumer);
+                        } catch (\Throwable $error) {
+                            error_log('Uncaught error while processing queue message: ' . $error->getMessage());
+                        } finally {
+                            unset($deliveries[spl_object_id($message)]);
+                            if (!$available->isFull()) {
+                                $available->push(true);
+                            }
+                            $waitGroup->done();
+                        }
+                    });
                 }
             }
-        });
-
-        try {
-            $work();
         } finally {
-            $finished->push(true);
+            // Keep renewing until every handler and confirmation has finished.
+            while ($deliveries->count() > 0) {
+                $available->pop(0.1);
+            }
+            if ($renewing) {
+                $finished->push(true);
+            }
+            $waitGroup->wait();
         }
     }
 
@@ -451,34 +403,34 @@ class Swoole extends Adapter
         parent::releaseContext();
     }
 
-    /**
-     * Pop the concurrency slot even if wait-group accounting throws, so a
-     * failed teardown cannot permanently cap the worker below maxCoroutines.
-     */
-    private function releaseSlot(WaitGroup $waitGroup, Channel $slots): void
-    {
-        try {
-            $waitGroup->done();
-        } finally {
-            $slots->pop();
-        }
-    }
-
     protected function reap(): void
     {
+        if ($this->stopping !== null && microtime(true) - $this->stopping >= $this->shutdownTimeout) {
+            foreach (array_keys($this->workers) as $pid) {
+                Process::kill($pid, SIGKILL);
+            }
+        }
+        $exited = [];
         while (($ret = Process::wait(false)) !== false) {
-            unset($this->workers[$ret['pid']]);
+            $pid = $ret['pid'];
+            if (isset($this->workerIds[$pid])) {
+                $exited[] = $this->workerIds[$pid];
+                unset($this->workers[$pid], $this->workerIds[$pid]);
+            }
+        }
+
+        if (! $this->stopped) {
+            foreach ($exited as $workerId) {
+                $this->spawnWorker($workerId);
+            }
         }
     }
 
     public function stop(): self
     {
-        // Flip the flag only — same as main. Closing consumers here races with
-        // in-flight commit/reject after the handler that called stop(), and is
-        // unnecessary to end the loop (the next receive returns and isStopped
-        // is checked). SIGTERM still closes every consumer so a blocking
-        // receive unblocks on worker shutdown.
+        // Drain until the supervisor deadline; unfinished deliveries stay recoverable.
         $this->stopped = true;
+        $this->stopping ??= microtime(true);
 
         foreach (array_keys($this->workers) as $pid) {
             Process::kill($pid, SIGTERM);

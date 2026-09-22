@@ -2,6 +2,8 @@
 
 The source of truth for the [utopia-php](https://github.com/utopia-php) libraries. Each `packages/<name>` is an independent Composer library; development happens here, and every push is mirrored to its read-only repository (e.g. `utopia-php/http`), so Composer/Packagist distribution is unchanged — mechanics in [docs/distribution.md](docs/distribution.md).
 
+[`utopia-php/compression`](https://github.com/appwrite/appwrite/tree/main/packages/compression) and [`utopia-php/system`](https://github.com/appwrite/appwrite/tree/main/packages/system) are maintained in Appwrite. Their distribution mirrors and Packagist packages remain available.
+
 ## Quickstart
 
 ```sh
@@ -56,24 +58,20 @@ graph TD
     cdn --> client
     cli --> servers
     client --> pools
-    client --> psr7
     client --> span
     config --> validators
     console --> validators
     dns --> telemetry
     dns --> validators
     dns --> domains
+    domains --> client
     domains --> validators
     domains --> cache
     fastly --> client
-    fastly --> psr7
     http --> di
     http --> servers
-    http --> compression
-    http --> psr7
     http --> telemetry
     http --> validators
-    http --> system
     messaging --> client
     messaging --> pools
     messaging --> smtp
@@ -84,7 +82,6 @@ graph TD
     platform --> servers
     pools --> telemetry
     queue --> di
-    queue --> lock
     queue --> servers
     queue --> pools
     queue --> telemetry
@@ -93,16 +90,16 @@ graph TD
     servers --> di
     servers --> validators
     span --> client
-    span --> psr7
     storage --> telemetry
     storage --> validators
     storage --> client
-    storage --> psr7
     vcs --> cache
     auth
     image
     nats
+    openapi
     replication
+    reputation
     user-agent
     websocket
 ```

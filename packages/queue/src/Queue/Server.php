@@ -5,6 +5,8 @@ namespace Utopia\Queue;
 use Exception;
 use Throwable;
 use Utopia\DI\Container;
+use Utopia\Queue\Consumer\Bounded;
+use Utopia\Queue\Consumer\Exclusive;
 use Utopia\Queue\Publisher\Synchronous;
 use Utopia\Servers\Hook;
 use Utopia\Telemetry\Adapter as Telemetry;
@@ -110,6 +112,13 @@ class Server
      */
     protected array $workerStopHooks = [];
 
+    /**
+     * Messages one receive may claim at once, per queue.
+     *
+     * @var array<string, int>
+     */
+    protected array $prefetches = [];
+
     private Histogram $jobWaitTime;
     private Histogram $processDuration;
 
@@ -125,17 +134,28 @@ class Server
     /**
      * Register a job for a queue. Queue name and concurrency live only here —
      * the adapter is transport (processes, namespace, consumer).
+     *
+     * $coroutines limits running handlers. $prefetch limits all unacknowledged
+     * messages: waiting, running, and awaiting confirmation. It defaults to
+     * $coroutines and must be at least that value.
      */
-    public function job(string $queue, int $maxCoroutines = 1): Job
+    public function job(string $queue, int $coroutines = 1, ?int $prefetch = null): Job
     {
         if ($queue === '') {
             throw new Exception('Queue name is required');
         }
 
+        $coroutines = max(1, $coroutines);
+        $prefetch ??= $coroutines;
+        if ($prefetch < $coroutines) {
+            throw new \InvalidArgumentException('Prefetch must be at least the number of coroutines');
+        }
+
         $job = new Job();
         $this->job = $job;
         $this->jobs[$queue] = $job;
-        $this->coroutines[$queue] = max(1, $maxCoroutines);
+        $this->coroutines[$queue] = $coroutines;
+        $this->prefetches[$queue] = $prefetch;
 
         return $job;
     }
@@ -164,6 +184,11 @@ class Server
     public function coroutines(string $queue): int
     {
         return $this->coroutines[$queue] ?? 1;
+    }
+
+    public function prefetch(string $queue): int
+    {
+        return $this->prefetches[$queue] ?? 1;
     }
 
     protected function jobFor(Message $message): Job
@@ -433,12 +458,55 @@ class Server
 
                 $queues = [];
                 foreach (array_keys($this->jobs) as $queueName) {
+                    $coroutines = $this->coroutines[$queueName] ?? 1;
+                    $prefetch = $this->prefetches[$queueName] ?? 1;
+                    $consumer = \is_callable($this->consumer)
+                        ? ($this->consumer)($queueName)
+                        : $this->adapter->createConsumer($queueName);
+
+                    // An exclusive consumer owns a single socket and does not serialise
+                    // access to it. Above one coroutine the receive loop is parked in a
+                    // read on it while the handlers that are still running commit, reject
+                    // or extend on the same socket, and Swoole aborts the worker on the
+                    // first overlap. Refuse here so a concurrency that a serialising
+                    // consumer -- Broker\Redis and Broker\Nats both are -- carries safely
+                    // cannot reach production as a crash loop on one that is not.
+                    if ($prefetch > 1 && $consumer instanceof Exclusive) {
+                        throw new Exception(\sprintf(
+                            "Queue '%s' is registered with job('%s', %d), but its consumer %s drives a single socket that only one coroutine may read at a time. Use one coroutine with prefetch 1 and add replicas for throughput.",
+                            $queueName,
+                            $queueName,
+                            $coroutines,
+                            $consumer::class,
+                        ));
+                    }
+
+                    // A bounded consumer hands out at most N messages before it waits for
+                    // an acknowledgment, and a message parked in redelivery backoff is one
+                    // of those N -- asleep rather than being worked, holding a slot the
+                    // whole time. So a ceiling at or below the coroutine cap is filled by
+                    // as many failures as there are handlers, after which the queue is not
+                    // delivered into at all: the wedge looks like a backlog with idle
+                    // workers in front of it. Refuse it here, the way an exclusive
+                    // consumer's cap is refused, rather than let it be found in a graph.
+                    $ceiling = $consumer instanceof Bounded ? $consumer->inFlightCeiling() : null;
+                    if ($ceiling !== null && $ceiling <= $prefetch) {
+                        throw new Exception(\sprintf(
+                            "Queue '%s' is registered with job('%s', %d), but its consumer %s holds at most %d message(s) in flight. Waiting retries also count toward this ceiling, so filling it with local deliveries can stop further delivery. Raise the in-flight ceiling (Broker\\Nats: maxAckPending) above %d, or lower the prefetch limit.",
+                            $queueName,
+                            $queueName,
+                            $coroutines,
+                            $consumer::class,
+                            $ceiling,
+                            $prefetch,
+                        ));
+                    }
+
                     $queues[] = [
                         'queue' => new Queue($queueName, $this->adapter->namespace),
-                        'maxCoroutines' => $this->coroutines[$queueName] ?? 1,
-                        'consumer' => \is_callable($this->consumer)
-                            ? ($this->consumer)($queueName)
-                            : $this->adapter->createConsumer($queueName),
+                        'coroutines' => $coroutines,
+                        'prefetch' => $prefetch,
+                        'consumer' => $consumer,
                     ];
                 }
                 $this->adapter->consume($messageCallback, $successCallback, $errorCallback, $queues);

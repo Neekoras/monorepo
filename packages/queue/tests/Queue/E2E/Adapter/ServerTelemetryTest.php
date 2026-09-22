@@ -271,7 +271,7 @@ final class ServerTelemetryAdapter extends Adapter
         foreach ($queues as $spec) {
             $queue = $spec['queue'];
             $this->queue = $queue;
-            while (($message = $this->consumer->receive($queue, 0)) instanceof Message) {
+            while (($message = ($this->consumer->receive($queue, 0)[0] ?? null)) instanceof Message) {
                 $this->context = new Container($this->resources());
                 $this->process($message, $messageCallback, $successCallback, $errorCallback);
             }
@@ -295,20 +295,20 @@ class ServerTelemetryConsumer implements Consumer
 {
     private bool $delivered = false;
 
-    public function receive(Queue $queue, int $timeout): ?Message
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         if ($this->delivered) {
-            return null;
+            return [];
         }
 
         $this->delivered = true;
 
-        return new Message([
+        return [new Message([
             'pid' => 'test-pid',
             'queue' => $queue->name,
             'timestamp' => time() - 1,
             'payload' => [],
-        ]);
+        ])];
     }
 
     public function commit(Queue $queue, Message $message): void {}
@@ -325,11 +325,11 @@ final class ServerTelemetryMultiMessageConsumer implements Consumer
      */
     public function __construct(private array $messages) {}
 
-    public function receive(Queue $queue, int $timeout): ?Message
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
         $message = array_shift($this->messages);
 
-        return $message instanceof Message ? $message : null;
+        return $message instanceof Message ? [$message] : [];
     }
 
     public function commit(Queue $queue, Message $message): void {}
@@ -347,12 +347,12 @@ final class ServerTelemetryPublisherConsumer extends ServerTelemetryConsumer imp
      */
     public function __construct(private array $queueSizes, private array $failedQueueSizes = []) {}
 
-    public function publish(Queue $queue, array $payload, bool $priority = false): bool
+    public function publish(Queue $queue, array $payload): bool
     {
         return true;
     }
 
-    public function enqueueMany(Queue $queue, array $payloads, bool $priority = false): bool
+    public function publishMany(Queue $queue, array $payloads): bool
     {
         return true;
     }
@@ -371,12 +371,12 @@ final class ServerTelemetryPublisherConsumer extends ServerTelemetryConsumer imp
 
 final class ServerTelemetryFailingPublisherConsumer extends ServerTelemetryConsumer implements Synchronous
 {
-    public function publish(Queue $queue, array $payload, bool $priority = false): bool
+    public function publish(Queue $queue, array $payload): bool
     {
         return true;
     }
 
-    public function enqueueMany(Queue $queue, array $payloads, bool $priority = false): bool
+    public function publishMany(Queue $queue, array $payloads): bool
     {
         return true;
     }

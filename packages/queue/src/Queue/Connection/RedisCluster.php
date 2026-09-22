@@ -11,7 +11,26 @@ class RedisCluster implements Connection
     protected const int CONNECT_MAX_BACKOFF_MS = 3_000;
     protected ?\RedisCluster $redis = null;
 
-    public function __construct(protected array $seeds, protected float $connectTimeout = -1, protected float $readTimeout = -1) {}
+    public function __construct(protected array $seeds, protected float $connectTimeout = -1, protected float $readTimeout = -1, protected ?string $user = null, protected ?string $password = null) {}
+
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        $tag = null;
+        foreach ($keys as $key) {
+            if (!preg_match('/\{([^{}]+)\}/', (string) $key, $match) || ($tag !== null && $tag !== $match[1])) {
+                throw new \InvalidArgumentException('Atomic Redis queue operations require a shared hash tag in the queue namespace, for example {utopia-queue}. Migrate existing keys before changing the namespace.');
+            }
+            $tag = $match[1];
+        }
+        $redis = $this->getRedis();
+        $redis->clearLastError();
+        $result = $redis->eval($script, [...$keys, ...$args], \count($keys));
+        $error = $redis->getLastError();
+        if ($result === false && $error) {
+            throw new \RedisClusterException($error);
+        }
+        return $result;
+    }
 
     public function rightPopLeftPushArray(string $queue, string $destination, int $timeout): array|false
     {
@@ -94,6 +113,24 @@ class RedisCluster implements Connection
         return $response[1];
     }
 
+    public function rightPopMany(string $queue, int $count, int $timeout): array
+    {
+        if ($count < 1) {
+            return [];
+        }
+
+        // BLMPOP over a single key, so the cluster routes it by that key like
+        // any other list command; the numkeys > 1 form is what would need every
+        // key in one slot, and this never uses it.
+        $response = $this->getRedis()->blmpop((float) $timeout, [$queue], 'RIGHT', $count);
+
+        if (!\is_array($response) || !\is_array($response[1] ?? null)) {
+            return [];
+        }
+
+        return array_values(array_filter($response[1], \is_string(...)));
+    }
+
     public function leftPopArray(string $queue, int $timeout): array|false
     {
         $response = $this->getRedis()->blPop([$queue], $timeout);
@@ -139,9 +176,18 @@ class RedisCluster implements Connection
         return $this->getRedis()->set($key, $value);
     }
 
+    public function setNotExists(string $key, string $value, int $ttl = 0): bool
+    {
+        $options = $ttl > 0 ? ['nx', 'ex' => $ttl] : ['nx'];
+
+        return $this->getRedis()->set($key, $value, $options);
+    }
+
     public function get(string $key): array|string|null
     {
-        return $this->getRedis()->get($key);
+        $value = $this->getRedis()->get($key);
+
+        return $value === false ? null : $value;
     }
 
     public function listSize(string $key): int
@@ -152,6 +198,11 @@ class RedisCluster implements Connection
     public function increment(string $key): int
     {
         return $this->getRedis()->incr($key);
+    }
+
+    public function incrementBy(string $key, int $by): int
+    {
+        return $this->getRedis()->incrBy($key, $by);
     }
 
     public function decrement(string $key): int
@@ -201,7 +252,12 @@ class RedisCluster implements Connection
 
         for ($attempt = 1; $attempt <= self::CONNECT_MAX_ATTEMPTS; $attempt++) {
             try {
-                $this->redis = new \RedisCluster(null, $this->seeds, $connectTimeout, $readTimeout);
+                $auth = match (true) {
+                    $this->password === null || $this->password === '' => null,
+                    $this->user !== null && $this->user !== '' => [$this->user, $this->password],
+                    default => $this->password,
+                };
+                $this->redis = new \RedisCluster(null, $this->seeds, $connectTimeout, $readTimeout, false, $auth);
                 return $this->redis;
             } catch (\RedisClusterException $e) {
                 if ($attempt === self::CONNECT_MAX_ATTEMPTS) {
