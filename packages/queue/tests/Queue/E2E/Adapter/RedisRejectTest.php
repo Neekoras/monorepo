@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace Tests\E2E\Adapter;
 
+use Utopia\Queue\Adapter;
 use Utopia\Queue\Broker\Redis;
+use Utopia\Queue\Consumer;
+use Utopia\Queue\Message;
 use Utopia\Queue\Queue;
 
 /**
@@ -46,6 +49,68 @@ final class RedisRejectTest extends RedisTestCase
         // one gets there on the first failure instead of after N of them.
         $this->assertSame(0, $broker->getQueueSize($queue, failedJobs: true));
         $this->assertSame([], $broker->receive($queue, 0));
+        $this->assertSame([$message->getPid()], $connection->listRange($this->namespace . '.dead.audits', 10, 0));
+    }
+
+    /**
+     * The verdict end to end, against real storage: a handler whose payload cannot
+     * satisfy its own signature throws, and the message is parked where nothing
+     * will bring it back on its own.
+     *
+     * Asserted on where the message physically is rather than on the flag the
+     * adapter set, because the flag is only a claim about the destination -- this
+     * stays red if the broker ever routes a terminal reject to the failed list.
+     */
+    public function testATypeErrorOutOfAHandlerParksTheMessageOnTheDeadList(): void
+    {
+        $connection = $this->connection;
+        $broker = new Redis($connection, $connection);
+
+        $queue = new Queue('audits', $this->namespace);
+        $broker->publish($queue, ['task' => 'a', 'project' => 'not-an-array']);
+        $message = $broker->receive($queue, 0)[0];
+
+        $adapter = new class ($broker) extends Adapter {
+            public function __construct(Consumer $consumer)
+            {
+                parent::__construct($consumer, 1);
+            }
+
+            public function runOne(Queue $queue, Message $message, callable $handler): void
+            {
+                $this->processFrom($message, $handler, static function (): void {}, static function (): void {}, $queue, $this->consumer);
+            }
+
+            public function start(): self
+            {
+                return $this;
+            }
+
+            public function stop(): self
+            {
+                return $this;
+            }
+
+            public function workerStart(callable $callback): self
+            {
+                return $this;
+            }
+
+            public function workerStop(callable $callback): self
+            {
+                return $this;
+            }
+        };
+
+        $adapter->runOne($queue, $message, static function (Message $message): void {
+            // Thrown by PHP, not by the test: the payload carries a string where
+            // the signature takes an array, which is the shape production hits
+            // when an envelope holds an object a handler constructs from.
+            (static fn(array $project): array => $project)($message->getPayload()['project']);
+        });
+
+        $this->assertSame(0, $broker->getQueueSize($queue, failedJobs: true), 'a type error must not join the retry sweep');
+        $this->assertSame([], $broker->receive($queue, 0), 'and must not be delivered again');
         $this->assertSame([$message->getPid()], $connection->listRange($this->namespace . '.dead.audits', 10, 0));
     }
 }
