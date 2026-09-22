@@ -30,7 +30,7 @@ final class RedisRejectTest extends RedisTestCase
         $message = $broker->receive($queue, 0)[0];
         $broker->reject($queue, $message);
 
-        $this->assertSame(1, $broker->getQueueSize($queue, failedJobs: true));
+        $this->assertSame(1, $broker->getFailedCount($queue));
         $this->assertSame([], $broker->receive($queue, 0));
         $this->assertSame(0, $connection->listSize($this->namespace . '.dead.audits'));
     }
@@ -51,9 +51,10 @@ final class RedisRejectTest extends RedisTestCase
         $message = $broker->receive($queue, 0)[0];
         $broker->reject($queue, $message->terminal());
 
-        $this->assertSame(1, $broker->getQueueSize($queue, failedJobs: true));
-        $this->assertSame(0, $connection->listSize($this->namespace . '.dead.audits'), 'nothing pops the dead list, so nothing may be parked there by a verdict alone');
-        $this->assertSame([], $broker->receive($queue, 0), 'and it is not re-run on its own');
+        $this->assertSame(1, $broker->getFailedCount($queue), 'the failure is counted');
+        $this->assertSame([$message->getPid()], $connection->listRange($this->namespace . '.failed.audits', 10, 0), 'and stays on the list the sweep reads');
+        $this->assertSame(0, $connection->listSize($this->namespace . '.dead.audits'), 'nothing pops the dead list, so a verdict alone may not park it there');
+        $this->assertSame([], $broker->receive($queue, 0), 'it is not re-run on its own');
 
         // The property this test exists for: once the fault behind the verdict is
         // fixed, the existing sweep brings the work back.
@@ -63,14 +64,13 @@ final class RedisRejectTest extends RedisTestCase
 
     /**
      * The verdict end to end, against real storage: a handler whose payload cannot
-     * satisfy its own signature throws, and the message is parked where nothing
-     * will bring it back on its own.
+     * satisfy its own signature throws, the message is not re-run on its own, and
+     * the operator sweep can still bring it back.
      *
      * Asserted on where the message physically is rather than on the flag the
-     * adapter set, because the flag is only a claim about the destination -- this
-     * stays red if the broker ever routes a terminal reject to the failed list.
+     * adapter set, because the flag is only a claim about the destination.
      */
-    public function testATypeErrorOutOfAHandlerParksTheMessageOnTheDeadList(): void
+    public function testATypeErrorOutOfAHandlerStaysWhereTheSweepCanReachIt(): void
     {
         $connection = $this->connection;
         $broker = new Redis($connection, $connection);
