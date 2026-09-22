@@ -3,6 +3,7 @@
 namespace Utopia\Messaging\Adapter\Email;
 
 use Utopia\Messaging\Adapter\Email as EmailAdapter;
+use Utopia\Messaging\Exception\InvalidArgumentException;
 use Utopia\Messaging\Messages\Email as EmailMessage;
 use Utopia\Messaging\Response;
 
@@ -144,6 +145,8 @@ class Resend extends EmailAdapter
 
         $statusCode = $result['statusCode'];
 
+        $this->assertAccepted($result, $message->getTo());
+
         if ($statusCode === 200) {
             $responseData = $result['response'];
 
@@ -208,6 +211,12 @@ class Resend extends EmailAdapter
 
             $statusCode = $result['statusCode'];
 
+            // With several recipients each gets its own request, so one
+            // refusal is a per-recipient failure and the rest still deliver.
+            if (\count($emails) === 1) {
+                $this->assertAccepted($result, [$to]);
+            }
+
             if ($statusCode >= 200 && $statusCode < 300) {
                 $response->addResult($to['email']);
                 $deliveredTo++;
@@ -223,6 +232,32 @@ class Resend extends EmailAdapter
         $response->setDeliveredTo($deliveredTo);
 
         return $response->toArray();
+    }
+
+    /**
+     * A 422 is Resend refusing the whole request as malformed: an address it
+     * cannot parse or route, a display name that broke the header, a domain
+     * it blocks by policy. Retrying cannot change that, so it surfaces as
+     * invalid input rather than a delivery failure.
+     *
+     * @link https://resend.com/docs/api-reference/errors
+     *
+     * @param  array{statusCode: int, response: array<string, mixed>|string|null}  $result
+     * @param  array<array<string, string>>  $recipients
+     *
+     * @throws InvalidArgumentException
+     */
+    private function assertAccepted(array $result, array $recipients): void
+    {
+        if ($result['statusCode'] !== 422) {
+            return;
+        }
+
+        throw new InvalidArgumentException(
+            InvalidArgumentException::PROVIDER_REJECTED,
+            $this->extractErrorMessage($result['response'], 'Unprocessable request'),
+            \count($recipients) === 1 ? $recipients[0]['email'] : null,
+        );
     }
 
     /**

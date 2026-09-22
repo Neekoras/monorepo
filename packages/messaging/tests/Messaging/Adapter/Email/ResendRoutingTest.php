@@ -18,11 +18,11 @@ final class ResendRoutingTest extends TestCase
         $stub->stubResponses[] = ['statusCode' => 200, 'response' => []];
 
         $message = new Email(
-            to: [['email' => 'a@utopia.dev'], ['email' => 'b@utopia.dev']],
+            to: [['email' => 'a@example.com'], ['email' => 'b@example.com']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@utopia.dev',
+            fromEmail: 'from@example.com',
         );
 
         $response = $stub->send($message);
@@ -41,11 +41,11 @@ final class ResendRoutingTest extends TestCase
         $stub->stubResponses[] = ['statusCode' => 200, 'response' => ['id' => 'two']];
 
         $message = new Email(
-            to: [['email' => 'a@utopia.dev'], ['email' => 'b@utopia.dev']],
+            to: [['email' => 'a@example.com'], ['email' => 'b@example.com']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@utopia.dev',
+            fromEmail: 'from@example.com',
             attachments: [new Attachment(
                 name: 'note.txt',
                 path: '',
@@ -77,11 +77,11 @@ final class ResendRoutingTest extends TestCase
         $stub->stubResponses[] = ['statusCode' => 422, 'response' => ['message' => 'Invalid recipient']];
 
         $message = new Email(
-            to: [['email' => 'a@utopia.dev'], ['email' => 'b@utopia.dev']],
+            to: [['email' => 'a@example.com'], ['email' => 'b@example.com']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@utopia.dev',
+            fromEmail: 'from@example.com',
             attachments: [new Attachment(
                 name: 'note.txt',
                 path: '',
@@ -103,48 +103,51 @@ final class ResendRoutingTest extends TestCase
         $stub = new ResendStub('test-key');
 
         $message = new Email(
-            to: [['email' => 'a@utopia.dev', 'name' => 'Doe, John <JD>']],
+            to: [['email' => 'a@example.com', 'name' => 'Doe, John <JD>']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Acme "Labs"',
-            fromEmail: 'from@utopia.dev',
+            fromEmail: 'from@example.com',
             replyToName: 'Support',
-            replyToEmail: 'support@utopia.dev',
-            cc: [['email' => 'cc@utopia.dev', 'name' => 'Plain Name']],
+            replyToEmail: 'support@example.com',
+            cc: [['email' => 'cc@example.com', 'name' => 'Plain Name']],
         );
 
         $stub->send($message);
 
         $body = $stub->capturedRequests[0]['body'][0];
 
-        $this->assertSame(['"Doe, John <JD>" <a@utopia.dev>'], $body['to']);
-        $this->assertSame('"Acme \\"Labs\\"" <from@utopia.dev>', $body['from']);
-        $this->assertSame(['Support <support@utopia.dev>'], $body['reply_to']);
-        $this->assertSame(['Plain Name <cc@utopia.dev>'], $body['cc']);
+        $this->assertSame(['"Doe, John <JD>" <a@example.com>'], $body['to']);
+        $this->assertSame('"Acme \\"Labs\\"" <from@example.com>', $body['from']);
+        $this->assertSame(['Support <support@example.com>'], $body['reply_to']);
+        $this->assertSame(['Plain Name <cc@example.com>'], $body['cc']);
     }
 
-    public function testReservedRecipientDomainIsRefusedBeforeAnyRequest(): void
+    public function testUnprocessableResponseIsInvalidInput(): void
     {
         $stub = new ResendStub('test-key');
+        $stub->stubResponses[] = [
+            'statusCode' => 422,
+            'response' => ['statusCode' => 422, 'name' => 'validation_error', 'message' => 'Invalid `to` field.'],
+        ];
 
         $message = new Email(
-            to: [['email' => 'a@utopia.dev'], ['email' => 'b@example.com']],
+            to: [['email' => 'a@example.com']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@utopia.dev',
-            bcc: ['c@mail.localhost.test'],
+            fromEmail: 'from@example.com',
+            attachments: [new Attachment(name: 'note.txt', path: '', type: 'text/plain', content: 'hello')],
         );
 
         try {
             $stub->send($message);
-            $this->fail('Expected reserved domain failure');
+            $this->fail('Expected invalid input');
         } catch (InvalidArgumentException $exception) {
-            $this->assertSame(InvalidArgumentException::RECIPIENT_DOMAIN_RESERVED, $exception->getType());
-            $this->assertSame('b@example.com', $exception->getValue());
+            $this->assertSame(InvalidArgumentException::PROVIDER_REJECTED, $exception->getType());
+            $this->assertSame('a@example.com', $exception->getValue());
+            $this->assertSame('Invalid `to` field.', $exception->getMessage());
         }
-
-        $this->assertSame([], $stub->capturedRequests);
     }
 
     public function testAttachmentExceedingMaxSizeThrows(): void
@@ -155,11 +158,11 @@ final class ResendRoutingTest extends TestCase
         $stub = new ResendStub('test-key');
 
         $message = new Email(
-            to: [['email' => 'a@utopia.dev']],
+            to: [['email' => 'a@example.com']],
             subject: 'Subject',
             content: 'Body',
             fromName: 'Sender',
-            fromEmail: 'from@utopia.dev',
+            fromEmail: 'from@example.com',
             attachments: [new Attachment(
                 name: 'large.bin',
                 path: '',

@@ -19,10 +19,6 @@ class SMTP extends EmailAdapter
 {
     protected const NAME = 'SMTP';
 
-    // A relay delivers wherever it is pointed, including a local catcher that
-    // takes mail for example.com; only hosted providers refuse those domains.
-    protected const bool DELIVERS_TO_RESERVED_DOMAINS = true;
-
     private ?Client $client = null;
 
     /**

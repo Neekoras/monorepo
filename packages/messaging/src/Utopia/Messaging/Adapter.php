@@ -108,8 +108,6 @@ abstract class Adapter
             throw new \Exception('Adapter does not implement process method.');
         }
 
-        $this->validate($message);
-
         try {
             $response = $this->process($message);
         } catch (\Throwable $error) {
@@ -121,16 +119,6 @@ abstract class Adapter
 
         return $response;
     }
-
-    /**
-     * Refuse input this transport cannot deliver, before any request is made.
-     *
-     * The message already holds well-formed addresses; this is the place for
-     * rules that depend on the transport, such as which domains it routes to.
-     *
-     * @throws InvalidArgumentException
-     */
-    protected function validate(Message $message): void {}
 
     public function setTelemetry(Telemetry $telemetry): void
     {

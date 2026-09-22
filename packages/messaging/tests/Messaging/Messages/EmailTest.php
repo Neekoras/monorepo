@@ -36,7 +36,7 @@ final class EmailTest extends TestCase
         }
     }
 
-    public function testReservedDomainIsWellFormedHere(): void
+    public function testDocumentationDomainIsWellFormed(): void
     {
         $message = $this->message(to: ['john@example.com', 'john@xn--bcher-kva.example']);
 
