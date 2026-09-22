@@ -12,16 +12,14 @@ use Utopia\Messaging\Messages\Email;
 final class EmailTest extends TestCase
 {
     /**
-     * @return array<string, array{string, string}>
+     * @return \Iterator<string, array{string, string}>
      */
-    public static function undeliverableRecipients(): array
+    public static function undeliverableRecipients(): \Iterator
     {
-        return [
-            'no at' => ['john', InvalidArgumentException::RECIPIENT_MALFORMED],
-            'angle brackets' => ['John <john@appwrite.io>', InvalidArgumentException::RECIPIENT_MALFORMED],
-            'one letter tld' => ['john@c.c', InvalidArgumentException::RECIPIENT_DOMAIN_INVALID],
-            'digits in tld' => ['john@gyung.me976153', InvalidArgumentException::RECIPIENT_DOMAIN_INVALID],
-        ];
+        yield 'no at' => ['john', InvalidArgumentException::RECIPIENT_MALFORMED];
+        yield 'angle brackets' => ['John <john@appwrite.io>', InvalidArgumentException::RECIPIENT_MALFORMED];
+        yield 'one letter tld' => ['john@c.c', InvalidArgumentException::RECIPIENT_DOMAIN_INVALID];
+        yield 'digits in tld' => ['john@gyung.me976153', InvalidArgumentException::RECIPIENT_DOMAIN_INVALID];
     }
 
     #[DataProvider('undeliverableRecipients')]
@@ -61,11 +59,12 @@ final class EmailTest extends TestCase
     }
 
     /**
-     * @return array<string, array{string}>
+     * @return \Iterator<string, array{string}>
      */
-    public static function malformedSenders(): array
+    public static function malformedSenders(): \Iterator
     {
-        return ['no domain' => ['noreply'], 'empty' => ['']];
+        yield 'no domain' => ['noreply'];
+        yield 'empty' => [''];
     }
 
     #[DataProvider('malformedSenders')]
