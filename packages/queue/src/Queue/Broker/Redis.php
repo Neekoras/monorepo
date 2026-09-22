@@ -454,7 +454,12 @@ class Redis implements Synchronous, Consumer
             $job = $this->getJob($queue, $pid);
             if ($job === false) {
                 if (\is_string($owner)) {
-                    throw new \RuntimeException('Queue delivery payload is missing');
+                    // A settlement can delete both keys between the owner and payload reads.
+                    // Do not prune a delivery whose ownership changed during the inspection.
+                    if ($this->commands->get($ownerKey) === $owner) {
+                        throw new \RuntimeException('Queue delivery payload is missing');
+                    }
+                    continue;
                 }
                 $this->commands->listRemove($processing, $pid);
                 continue;

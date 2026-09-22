@@ -70,6 +70,53 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
         $this->assertSame(1, $retried->getAttempts(), 'the requeue is counted');
     }
 
+    public function testReapToleratesACommitAfterReadingOwnership(): void
+    {
+        $this->broker->publish($this->queue, ['n' => 1]);
+        $message = $this->broker->receive($this->queue, 0)[0];
+        $ownerKey = $this->namespace . '.owners.recovery.' . $message->getPid();
+        $connection = new class (getenv('REDIS_HOST') ?: '127.0.0.1', (int) (getenv('REDIS_PORT') ?: 16379)) extends \Utopia\Queue\Connection\Redis {
+            public ?\Closure $afterGet = null;
+
+            public function get(string $key): array|string|null
+            {
+                $value = parent::get($key);
+                ($this->afterGet)?->__invoke($key);
+                return $value;
+            }
+        };
+        $connection->afterGet = function (string $key) use ($ownerKey, $message, $connection): void {
+            if ($key === $ownerKey) {
+                $connection->afterGet = null;
+                $this->broker->commit($this->queue, $message);
+            }
+        };
+        $reaper = new Redis($connection, $connection);
+
+        $this->assertSame(0, $reaper->reap($this->queue, olderThan: 0));
+        $this->assertSame(0, $this->processingSize());
+        $this->assertSame(0, $this->broker->getQueueSize($this->queue));
+        $this->assertSame('1', $this->connection->get($this->namespace . '.stats.recovery.success'));
+        $connection->close();
+    }
+
+    public function testReapReportsMissingPayloadWithUnchangedOwnership(): void
+    {
+        $this->broker->publish($this->queue, ['n' => 1]);
+        $message = $this->broker->receive($this->queue, 0)[0];
+        $this->connection->remove($this->namespace . '.jobs.recovery.' . $message->getPid());
+
+        try {
+            $this->broker->reap($this->queue, olderThan: 0);
+            self::fail('Missing owned payload must still be reported');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Queue delivery payload is missing', $error->getMessage());
+        }
+        $this->assertSame(1, $this->processingSize());
+        $this->assertIsString($this->connection->get($this->namespace . '.owners.recovery.' . $message->getPid()));
+        $this->assertSame(0, $this->broker->getQueueSize($this->queue));
+    }
+
     public function testReapLeavesClaimsYoungerThanTheCutoff(): void
     {
         $this->broker->publish($this->queue, ['n' => 1]);
