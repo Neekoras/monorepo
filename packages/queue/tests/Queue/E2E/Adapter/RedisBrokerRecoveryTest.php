@@ -209,10 +209,10 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
         $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(Message::class, $claimed);
 
-        // Commit the claim while the sweep is reading it.
+        // The worker commits the claim as the sweep starts inspecting it.
         $settle = fn() => $this->broker->commit($this->queue, $claimed);
         $racing = new class (getenv('REDIS_HOST') ?: '127.0.0.1', (int) (getenv('REDIS_PORT') ?: 16379), $settle) extends Connection {
-            public function __construct(string $host, int $port, private readonly \Closure $settle)
+            public function __construct(string $host, int $port, private ?\Closure $settle)
             {
                 parent::__construct($host, $port);
             }
@@ -220,10 +220,12 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
             #[\Override]
             public function get(string $key): array|string|null
             {
-                if (str_contains($key, '.jobs.')) {
+                $value = parent::get($key);
+                if ($this->settle instanceof \Closure) {
                     ($this->settle)();
+                    $this->settle = null;
                 }
-                return parent::get($key);
+                return $value;
             }
         };
 
