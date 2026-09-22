@@ -289,9 +289,9 @@ class Background implements Synchronous, Asynchronous
         $this->publisher->retry($queue, $limit);
     }
 
-    public function getPendingCount(Queue $queue): int
+    public function getQueueSize(Queue $queue, bool $failedJobs = false): int
     {
-        return $this->publisher->getPendingCount($queue);
+        return $this->publisher->getQueueSize($queue, $failedJobs);
     }
 
     public function getFailedCount(Queue $queue): int

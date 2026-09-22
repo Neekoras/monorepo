@@ -359,8 +359,12 @@ final class ServerTelemetryPublisherConsumer extends ServerTelemetryConsumer imp
 
     public function retry(Queue $queue, ?int $limit = null): void {}
 
-    public function getPendingCount(Queue $queue): int
+    public function getQueueSize(Queue $queue, bool $failedJobs = false): int
     {
+        if ($failedJobs) {
+            return array_shift($this->failedQueueSizes) ?? 0;
+        }
+
         return array_shift($this->queueSizes) ?? 0;
     }
 
@@ -384,7 +388,7 @@ final class ServerTelemetryFailingPublisherConsumer extends ServerTelemetryConsu
 
     public function retry(Queue $queue, ?int $limit = null): void {}
 
-    public function getPendingCount(Queue $queue): int
+    public function getQueueSize(Queue $queue, bool $failedJobs = false): int
     {
         throw new \RuntimeException('Queue size unavailable.');
     }

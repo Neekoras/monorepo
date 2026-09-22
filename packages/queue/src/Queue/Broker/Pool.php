@@ -40,7 +40,7 @@ readonly class Pool implements Synchronous, Consumer, Bounded
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
 
-    public function getPendingCount(Queue $queue): int
+    public function getQueueSize(Queue $queue, bool $failedJobs = false): int
     {
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }

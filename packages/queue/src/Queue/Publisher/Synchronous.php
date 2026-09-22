@@ -35,9 +35,14 @@ interface Synchronous
     public function retry(Queue $queue, ?int $limit = null): void;
 
     /**
-     * Messages waiting to be delivered.
+     * Returns the amount of pending messages in the queue.
+     *
+     * `$failedJobs` is the older spelling of {@see self::getFailedCount()} and
+     * delegates to it. Prefer the named method: what a queue is holding and what
+     * it could not get through are different questions over different objects,
+     * and a boolean reads like one question with a variant.
      */
-    public function getPendingCount(Queue $queue): int;
+    public function getQueueSize(Queue $queue, bool $failedJobs = false): int;
 
     /**
      * Messages this queue could not get through, whatever stopped them.

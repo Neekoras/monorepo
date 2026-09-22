@@ -528,18 +528,11 @@ class Redis implements Synchronous, Consumer
     }
 
     /**
-     * Messages waiting to be delivered.
-     */
-    public function getPendingCount(Queue $queue): int
-    {
-        return $this->commands->listSize("{$queue->namespace}.queue.{$queue->name}");
-    }
-
-    /**
-     * Everything this queue could not get through, from all three lists it uses.
+     * Pending work, or everything this queue could not get through.
      *
-     * A message leaves the work queue for three different reasons, and an
-     * operator asking "is this queue in trouble" means all of them:
+     * The failed count is a sum of three lists because a message leaves the
+     * work queue for three different reasons, and an operator asking "is this
+     * queue in trouble" means all of them:
      *
      *  - failed: rejected with attempts left, waiting for {@see self::retry()}.
      *  - dead:   rejected terminally, or out of attempts. Nothing retries these.
@@ -549,9 +542,19 @@ class Redis implements Synchronous, Consumer
      * the other two lists exist to record -- a handler declaring work permanently
      * impossible, or a codec change leaving envelopes nobody can decode -- while
      * {@see Broker\Nats} answered the same call with its dead stream. The gauge
-     * built on this ({@see \Utopia\Queue\Server::setTelemetry()}) read flat for
-     * both, so the one number watching a poisoned queue was the one number that
-     * could not see it.
+     * built on this flag ({@see \Utopia\Queue\Server::setTelemetry()}) read flat
+     * for both, so the one number watching a poisoned queue was the one number
+     * that could not see it.
+     */
+    public function getQueueSize(Queue $queue, bool $failedJobs = false): int
+    {
+        return $failedJobs
+            ? $this->getFailedCount($queue)
+            : $this->commands->listSize("{$queue->namespace}.queue.{$queue->name}");
+    }
+
+    /**
+     * Everything this queue could not get through, from all three lists it uses.
      */
     public function getFailedCount(Queue $queue): int
     {

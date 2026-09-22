@@ -168,7 +168,7 @@ final class SwooleRestartTest extends TestCase
     {
         $broker = new Redis(new Connection('127.0.0.1', 16379), new Connection('127.0.0.1', 16379));
 
-        return $broker->getPendingCount(new Queue('worker-' . $worker, $this->namespace));
+        return $broker->getQueueSize(new Queue('worker-' . $worker, $this->namespace));
     }
 
     private function waitFor(string $event, int $count): array

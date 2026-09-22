@@ -146,7 +146,7 @@ abstract class MaintenanceConsumer implements Consumer
 
     public function reject(Queue $queue, Message $message): void {}
 
-    public function getPendingCount(Queue $queue): int
+    public function getQueueSize(Queue $queue, bool $failedJobs = false): int
     {
         return 0;
     }

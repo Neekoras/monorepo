@@ -81,7 +81,7 @@ final class NatsPoolTest extends Base
 
         // Measured as a delta: the work stream outlives the test run, so an
         // absolute depth would depend on what earlier runs left behind.
-        $before = $broker->getPendingCount($queue);
+        $before = $broker->getQueueSize($queue);
 
         // Open the connection, then leave it idle in the pool.
         $this->assertTrue($broker->publish($queue, ['seq' => 'first']));
@@ -99,6 +99,6 @@ final class NatsPoolTest extends Base
         // And it is still usable: the message really is on the stream, not
         // written into a socket the server has already dropped.
         $this->assertTrue($broker->publish($queue, ['seq' => 'second']));
-        $this->assertSame($before + 2, $broker->getPendingCount($queue));
+        $this->assertSame($before + 2, $broker->getQueueSize($queue));
     }
 }

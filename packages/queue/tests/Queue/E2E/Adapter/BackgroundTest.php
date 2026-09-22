@@ -192,7 +192,7 @@ final class BackgroundTest extends TestCase
 
             public function retry(Queue $queue, ?int $limit = null): void {}
 
-            public function getPendingCount(Queue $queue): int
+            public function getQueueSize(Queue $queue, bool $failedJobs = false): int
             {
                 return 0;
             }
@@ -249,7 +249,7 @@ final class BackgroundTest extends TestCase
         $published = [['id' => 1], ['id' => 2]];
         $background = new Background($this->recordingPublisher($published));
 
-        $this->assertSame(2, $background->getPendingCount(new Queue('emails')));
+        $this->assertSame(2, $background->getQueueSize(new Queue('emails')));
     }
 
     public function testEnqueueThrowsWhenBufferStaysFull(): void
@@ -274,7 +274,7 @@ final class BackgroundTest extends TestCase
 
             public function retry(Queue $queue, ?int $limit = null): void {}
 
-            public function getPendingCount(Queue $queue): int
+            public function getQueueSize(Queue $queue, bool $failedJobs = false): int
             {
                 return 0;
             }
@@ -370,7 +370,7 @@ final class BackgroundTest extends TestCase
 
             public function retry(Queue $queue, ?int $limit = null): void {}
 
-            public function getPendingCount(Queue $queue): int
+            public function getQueueSize(Queue $queue, bool $failedJobs = false): int
             {
                 return \count($this->buffer);
             }
@@ -410,7 +410,7 @@ final class BackgroundTest extends TestCase
 
             public function retry(Queue $queue, ?int $limit = null): void {}
 
-            public function getPendingCount(Queue $queue): int
+            public function getQueueSize(Queue $queue, bool $failedJobs = false): int
             {
                 return \count($this->batches);
             }

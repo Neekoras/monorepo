@@ -242,29 +242,26 @@ class Server
             $telemetry,
             'messaging.queue.depth',
             'Number of pending messages in the queue.',
-            count: static fn(Synchronous $broker, Queue $queue): int => $broker->getPendingCount($queue),
+            failedJobs: false,
         );
 
         $this->createDepthGauge(
             $telemetry,
             'messaging.queue.failed.depth',
             'Number of messages in the failed queue.',
-            count: static fn(Synchronous $broker, Queue $queue): int => $broker->getFailedCount($queue),
+            failedJobs: true,
         );
     }
 
-    /**
-     * @param callable(Synchronous, Queue): int $count what this gauge reads per queue
-     */
     private function createDepthGauge(
         Telemetry $telemetry,
         string $name,
         string $description,
-        callable $count,
+        bool $failedJobs,
     ): void {
         $gauge = $telemetry->createObservableGauge($name, '{message}', $description);
 
-        $gauge->observe(function (callable $observe) use ($count): void {
+        $gauge->observe(function (callable $observe) use ($failedJobs): void {
             if (!$this->adapter->consumer instanceof Synchronous) {
                 return;
             }
@@ -275,7 +272,7 @@ class Server
                 $queue = new Queue($queueName, $this->adapter->namespace);
 
                 try {
-                    $size = $count($this->adapter->consumer, $queue);
+                    $size = $this->adapter->consumer->getQueueSize($queue, $failedJobs);
                 } catch (Throwable) {
                     continue;
                 }
