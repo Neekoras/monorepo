@@ -48,7 +48,7 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
      */
     private function failedSize(): int
     {
-        return $this->connection->listSize('tests.failed.recovery');
+        return $this->connection->listSize($this->namespace . '.failed.recovery');
     }
 
     /**
