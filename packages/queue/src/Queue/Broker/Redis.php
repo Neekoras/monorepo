@@ -190,7 +190,15 @@ class Redis implements Synchronous, Consumer
     {
         $pid = $message->getPid();
         $outcome = $operation === 'commit' ? 'success' : 'failed';
-        $list = $operation === 'release' ? 'queue' : ($message->isTerminal() ? 'dead' : 'failed');
+        // A terminal verdict changes nothing here, and that is deliberate. What it
+        // buys on JetStream is the ack slot back: an attempt there holds one for the
+        // length of its backoff, so enough permanent failures stop the queue. This
+        // broker has no such window -- a rejected message is already out of the way
+        // on the failed list, and nothing re-runs it until an operator sweeps. So
+        // the only thing routing it to `dead` would change is that retry() could no
+        // longer reach it, and nothing else pops that list. Terminal must not mean
+        // "unrecoverable" on the transport where recovery is a manual sweep.
+        $list = $operation === 'release' ? 'queue' : 'failed';
         $this->settlements[$queue->namespace] ??= new \Utopia\Queue\Internal\Buffer(function (array $requests, callable $resolved): void {
             $keys = $args = [];
             foreach ($requests as [$requestKeys, $requestArgs]) {
@@ -527,12 +535,39 @@ class Redis implements Synchronous, Consumer
         return \is_array($value) ? new Message($value) : false;
     }
 
+    /**
+     * Pending work, or everything this queue could not get through.
+     *
+     * The failed count is a sum of three lists because a message leaves the
+     * work queue for three different reasons, and an operator asking "is this
+     * queue in trouble" means all of them:
+     *
+     *  - failed: rejected with attempts left, waiting for {@see self::retry()}.
+     *  - dead:   rejected terminally, or out of attempts. Nothing retries these.
+     *  - poison: bytes no codec here could read, set aside by {@see self::park()}.
+     *
+     * Counting only the failed list reported zero through exactly the incidents
+     * the other two lists exist to record -- a handler declaring work permanently
+     * impossible, or a codec change leaving envelopes nobody can decode -- while
+     * {@see Broker\Nats} answered the same call with its dead stream. The gauge
+     * built on this flag ({@see \Utopia\Queue\Server::setTelemetry()}) read flat
+     * for both, so the one number watching a poisoned queue was the one number
+     * that could not see it.
+     */
     public function getQueueSize(Queue $queue, bool $failedJobs = false): int
     {
-        $queueName = "{$queue->namespace}.queue.{$queue->name}";
-        if ($failedJobs) {
-            $queueName = "{$queue->namespace}.failed.{$queue->name}";
-        }
-        return $this->commands->listSize($queueName);
+        return $failedJobs
+            ? $this->getFailedCount($queue)
+            : $this->commands->listSize("{$queue->namespace}.queue.{$queue->name}");
+    }
+
+    /**
+     * Everything this queue could not get through, from all three lists it uses.
+     */
+    public function getFailedCount(Queue $queue): int
+    {
+        return $this->commands->listSize("{$queue->namespace}.failed.{$queue->name}")
+            + $this->commands->listSize("{$queue->namespace}.dead.{$queue->name}")
+            + $this->commands->listSize("{$queue->namespace}.poison.{$queue->name}");
     }
 }

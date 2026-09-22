@@ -121,7 +121,9 @@ $server->job('v1-region-manager')->action(function (array $payload) use ($region
 });
 ```
 
-The broker dead-letters it on the first failure instead of scheduling the next attempt: on NATS the delivery is terminated and the payload copied to the dead stream, on Redis it goes to the dead list rather than the failed list the `retry()` sweep reads. Either way the payload is still there to inspect, and `retry()` re-drives it once the underlying fault is fixed. A handler that cannot reach the throw site — an exception type owned by a library, or a classification made elsewhere — calls `$message->terminal()` instead and throws the exception it already had. The failure is reported to the error hooks either way.
+What that means depends on what the broker charges for an attempt. On NATS the delivery is terminated and the payload copied to the dead stream at once, because every further attempt would hold one of the consumer's `maxAckPending` slots for the length of its backoff. On Redis it stays on the failed list with every other rejection: there is no ack window to protect, nothing re-runs it until an operator sweeps, and moving it to the dead list would only put it beyond `retry()`. Either way the payload is still there to inspect, and `retry()` re-drives it once the underlying fault is fixed. A handler that cannot reach the throw site — an exception type owned by a library, or a classification made elsewhere — calls `$message->terminal()` instead and throws the exception it already had. The failure is reported to the error hooks either way.
+
+A `TypeError` or `ValueError` thrown out of a handler is treated the same way without the handler saying anything: the payload and the signature disagree, and they will disagree identically on every delivery, so the attempts after the first only spend the budget to reach the conclusion the first one reached. Other `\Error`s are not — `OutOfMemoryError` and the stack overflow say the host was short at that moment, which is what redelivery is for.
 
 Keep it to failures that are permanent for this payload. A database that is down is what the redelivery budget is for; dead-lettering it converts an outage into lost work.
 
@@ -243,6 +245,8 @@ Changing the codec of a queue that already holds messages needs `Codec\Compat`. 
 On NATS every published message carries a `Content-Type` header naming the format it is in — `application/json` or `application/vnd.php.igbinary` — so a consumer can switch on the header instead of inspecting the payload. `Codec\Compat` still reads by sniffing the bytes, because messages written before this release carry no header. Redis lists have nowhere to put one, so there the sniff is the whole answer.
 
 Bytes that no codec can read are parked rather than dropped or retried: the Redis broker moves them to `<namespace>.poison.<queue>`, and the NATS broker publishes them to the queue's dead subject and terminates the delivery. The pop has already taken them off the queue by the time anything can tell, so the only question is where they go — and a message every worker chokes on must not sit at the head of the queue.
+
+Parked bytes are counted by `getFailedCount()` — and by `getQueueSize($queue, failedJobs: true)`, the older spelling that delegates to it — which reports everything a queue could not get through: the retry sweep's list, the dead letters, and the parked bytes together. Counting the retry list alone answers zero for a queue whose handlers declare every message permanently impossible, and zero again for one whose envelopes nothing can decode — the two cases where the number matters most.
 
 ## Background publishing
 
