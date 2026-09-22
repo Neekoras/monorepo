@@ -17,6 +17,7 @@ use Utopia\NATS\Transport\Transport;
 final class FakeTransport implements Transport
 {
     public string $written = '';
+    public ?\Closure $onWrite = null;
     /** @var list<string> */
     public array $writes = [];
     /** @var list<array<string, mixed>> */
@@ -45,6 +46,9 @@ final class FakeTransport implements Transport
     {
         $this->written .= $data;
         $this->writes[] = $data;
+        if ($this->onWrite instanceof \Closure) {
+            ($this->onWrite)($data, $this);
+        }
 
         // Answer PINGs so the handshake / flush / drain barrier completes.
         if ($this->answerPings) {

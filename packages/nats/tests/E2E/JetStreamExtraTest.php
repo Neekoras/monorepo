@@ -161,6 +161,34 @@ final class JetStreamExtraTest extends TestCase
         $this->assertCount(0, $again->getMessages(), 'acked message must not be redelivered');
     }
 
+    public function testAckBatchConfirmsOnlySelectedMessages(): void
+    {
+        $id = uniqid();
+        $subject = "ackbatch.{$id}";
+        $stream = $this->createStream($subject);
+        foreach (['first', 'unfinished', 'third'] as $data) {
+            $this->js->publish($subject, $data);
+        }
+        $consumer = $this->js->createConsumer($stream, new ConsumerConfig(
+            durableName: 'c_' . $id,
+            ackPolicy: AckPolicy::Explicit,
+            ackWait: 0.2,
+        ));
+        $messages = $consumer->fetch(3, 2.0)->getMessages();
+        $this->assertCount(3, $messages);
+        $confirmed = [];
+        $this->js->ackBatch([$messages[0], $messages[2]], static function (int $index, ?\Throwable $error) use (&$confirmed): void {
+            $confirmed[$index] = $error;
+        });
+        ksort($confirmed);
+        $this->assertSame([null, null], $confirmed);
+        usleep(300_000);
+        $remaining = $consumer->fetch(3, 0.5, noWait: true)->getMessages();
+        $this->assertCount(1, $remaining);
+        $this->assertSame('unfinished', $remaining[0]->getData());
+        $remaining[0]->ackSync();
+    }
+
     public function testMetadataStreamOpsAndNumPending(): void
     {
         $id = uniqid();

@@ -62,7 +62,6 @@ use Utopia\Queue\Broker\Redis as RedisBroker;
 use Utopia\Queue\Connection\Locking;
 use Utopia\Queue\Connection\Redis as RedisConnection;
 use Utopia\Queue\Consumer;
-use Utopia\Queue\Consumer\Batched;
 use Utopia\Queue\Message;
 use Utopia\Queue\Queue;
 
@@ -75,9 +74,8 @@ const DEFAULTS = [
     'repeat' => '3',
     'sleep-ms' => '0',
     'cpu-iters' => '0',
-    // Messages one receive may claim at once, bounded by --coroutines. This is
-    // the knob the batched consume path exists for; 1 is the old behaviour.
-    'batch' => '1',
+    // Messages to prefetch, independently of --coroutines.
+    'prefetch' => '',
     'label' => '',
     // Milliseconds between child starts, so provisioning does not storm. It costs the
     // measurement nothing: the clocks start together regardless. See the header.
@@ -109,7 +107,7 @@ foreach (array_slice($_SERVER['argv'] ?? [], 1) as $arg) {
  * pass-through, extend() included, so the adapter's ack extension still reaches the
  * broker rather than being silently disabled by the wrapper.
  */
-final class Timed implements Consumer, Batched
+final class Timed implements Consumer
 {
     /** @var list<float> microseconds per acknowledgment */
     public array $commits = [];
@@ -126,26 +124,9 @@ final class Timed implements Consumer, Batched
 
     public function __construct(private readonly Consumer $inner) {}
 
-    public function receive(Queue $queue, int $timeout): ?Message
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
-        return $this->inner->receive($queue, $timeout);
-    }
-
-    /**
-     * Pass-through, and declared unconditionally for the same reason extend()
-     * is: the adapter probes the consumer it was handed, which is this wrapper.
-     * A decorator that quietly dropped the capability would measure the
-     * unbatched path and report it as the batched one.
-     */
-    public function receiveBatch(Queue $queue, int $timeout, int $max): array
-    {
-        if ($this->inner instanceof Batched) {
-            return $this->inner->receiveBatch($queue, $timeout, $max);
-        }
-
-        $message = $this->inner->receive($queue, $timeout);
-
-        return $message instanceof Message ? [$message] : [];
+        return $this->inner->receive($queue, $timeout, $n);
     }
 
     public function commit(Queue $queue, Message $message): void
@@ -166,10 +147,10 @@ final class Timed implements Consumer, Batched
         $this->inner->close();
     }
 
-    public function extend(Queue $queue, Message $message): void
+    public function extend(Queue $queue, Message ...$messages): void
     {
         if (is_callable([$this->inner, 'extend'])) {
-            $this->inner->extend($queue, $message);
+            $this->inner->extend($queue, ...$messages);
         }
     }
 
@@ -251,8 +232,8 @@ function consume(array $args): array
     $client = new Timed($inner);
     $queue = queueFor($args['backend']);
 
-    $slots = max(1, (int) $args['coroutines']);
-    $batch = max(1, min($slots, (int) $args['batch']));
+    $coroutines = max(1, (int) $args['coroutines']);
+    $prefetch = $args['prefetch'] === '' ? $coroutines : (int) $args['prefetch'];
     $share = (int) $args['share'];
     $sleep = ((float) $args['sleep-ms']) / 1000;
     $iters = (int) $args['cpu-iters'];
@@ -261,7 +242,7 @@ function consume(array $args): array
     $handled = 0;
     $error = null;
 
-    Coroutine\run(function () use ($client, $queue, $slots, $batch, $share, $sleep, $iters, $gate, &$handled, &$error): void {
+    Coroutine\run(function () use ($client, $queue, $coroutines, $prefetch, $share, $sleep, $iters, $gate, &$handled, &$error): void {
         // Provision on this process's own connections, before the gate opens, so the
         // measured window contains draining and nothing else.
         try {
@@ -317,7 +298,7 @@ function consume(array $args): array
                 $adapter->stop();
             },
             [
-                ['queue' => $queue, 'maxCoroutines' => $slots, 'batch' => $batch],
+                ['queue' => $queue, 'coroutines' => $coroutines, 'prefetch' => $prefetch],
             ],
         );
 
@@ -354,7 +335,7 @@ function measure(string $name, array $args): array
     // own tally, and leave its own behind for the next one.
     $client->publish($queue, ['warmup' => true, 'filler' => $filler]);
     $leftover = 0;
-    while (($stale = $client->receive($queue, 1)) instanceof \Utopia\Queue\Message) {
+    while (($stale = ($client->receive($queue, 1)[0] ?? null)) instanceof \Utopia\Queue\Message) {
         $client->commit($queue, $stale);
         if (++$leftover > $total * 10) {
             return $fail('queue would not drain before the run');
@@ -415,7 +396,7 @@ function measure(string $name, array $args): array
 
     for ($p = 0; $p < $processes; $p++) {
         $command = [PHP_BINARY, __FILE__, '--role=consume', '--backend=' . $name, '--share=' . $total, '--gate=' . $gate];
-        foreach (['coroutines', 'messages', 'payload', 'sleep-ms', 'cpu-iters', 'batch'] as $key) {
+        foreach (['coroutines', 'messages', 'payload', 'sleep-ms', 'cpu-iters', 'prefetch'] as $key) {
             $command[] = '--' . $key . '=' . $args[$key];
         }
 

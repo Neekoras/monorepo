@@ -13,6 +13,11 @@ use Utopia\Queue\Connection;
  */
 final class PushRecordingConnection implements Connection
 {
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        throw new \LogicException('Publisher tests must not execute consumer scripts');
+    }
+
     /** @var list<array{0: string, 1: string}> */
     public array $calls = [];
 
@@ -128,6 +133,11 @@ final class PushRecordingConnection implements Connection
     }
 
     public function set(string $key, string $value, int $ttl = 0): bool
+    {
+        return true;
+    }
+
+    public function setNotExists(string $key, string $value, int $ttl = 0): bool
     {
         return true;
     }

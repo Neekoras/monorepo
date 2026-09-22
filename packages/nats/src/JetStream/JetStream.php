@@ -13,6 +13,7 @@ use Utopia\NATS\Inbox;
 use Utopia\NATS\KeyValue\KeyValue;
 use Utopia\NATS\KeyValue\KeyValueConfig;
 use Utopia\NATS\Message;
+use Utopia\NATS\Request;
 
 final class JetStream
 {
@@ -37,6 +38,23 @@ final class JetStream
         } else {
             $this->apiPrefix = '$JS.API';
         }
+    }
+
+    /**
+     * Confirm acknowledgements for the selected messages using the consumer policy.
+     * AckPolicy::Explicit is required to leave unselected messages unacknowledged.
+     * With AckPolicy::All, acknowledging a later message also acknowledges earlier ones.
+     * @param list<JetStreamMessage> $messages
+     * @param \Closure(int, ?\Throwable): void $confirmed Null means server-confirmed.
+     */
+    public function ackBatch(array $messages, \Closure $confirmed, ?float $timeout = null): void
+    {
+        $requests = array_map(static fn(JetStreamMessage $message): Request => new Request(
+            subject: $message->message->replyTo ?? throw new \RuntimeException('Cannot acknowledge: message has no reply subject'),
+        ), $messages);
+        $this->conn->requestBatch($requests, static function (int $index, Message|\Throwable $result) use ($confirmed): void {
+            $confirmed($index, $result instanceof \Throwable ? $result : null);
+        }, $timeout ?? 5.0);
     }
 
     // --- Stream Management ---

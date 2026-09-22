@@ -4,10 +4,15 @@ declare(strict_types=1);
 
 namespace Tests\E2E\Adapter;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Utopia\NATS\Connection;
+use Utopia\NATS\ConnectionOptions;
+use Utopia\NATS\Exception\ConnectionException;
 use Utopia\NATS\JetStream\DiscardPolicy;
 use Utopia\NATS\JetStream\StorageType;
+use Utopia\NATS\Transport\TcpTransport;
+use Utopia\NATS\Transport\Transport;
 use Utopia\Queue\Adapter\Swoole;
 use Utopia\Queue\Broker\Nats;
 use Utopia\Queue\Broker\Provisioning;
@@ -47,13 +52,13 @@ final class NatsBrokerTest extends TestCase
         $this->broker->close();
     }
 
-    public function testEnqueueReceiveCommit(): void
+    public function testPublishReceiveCommit(): void
     {
         $this->broker->publish($this->queue, ['task' => 'a']);
         $this->broker->publish($this->queue, ['task' => 'b']);
         $this->assertSame(2, $this->broker->getQueueSize($this->queue));
 
-        $message = $this->broker->receive($this->queue, 2);
+        $message = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $message);
         $this->assertSame('a', $message->getPayload()['task']);
 
@@ -61,28 +66,121 @@ final class NatsBrokerTest extends TestCase
         $this->assertSame(1, $this->broker->getQueueSize($this->queue));
     }
 
-    public function testPriorityMessageJumpsAhead(): void
+    public function testExistingQueueWithUnusedLegacyConsumerStillWorks(): void
     {
-        $this->broker->publish($this->queue, ['task' => 'normal']);
-        $this->broker->publish($this->queue, ['task' => 'urgent'], priority: true);
-
-        $message = $this->broker->receive($this->queue, 2);
-        $this->assertInstanceOf(Message::class, $message);
-        $this->assertSame('urgent', $message->getPayload()['task']);
-        $this->broker->commit($this->queue, $message);
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $this->broker->publish($this->queue, ['task' => 'existing']);
+        $admin = Connection::connect($url);
+        $replacement = new Nats(fn(): Connection => Connection::connect($url));
+        try {
+            $js = $admin->jetStream();
+            $stream = 'Q_' . strtoupper($this->queue->name);
+            $config = $js->getStreamInfo($stream)->config->toArray();
+            $legacy = 'q.' . $this->queue->name . '.priority';
+            $js->updateStream(new \Utopia\NATS\JetStream\StreamConfig(
+                name: $stream,
+                subjects: [...$config['subjects'], $legacy],
+                retention: \Utopia\NATS\JetStream\RetentionPolicy::WorkQueue,
+                metadata: $config['metadata'],
+            ));
+            $js->createConsumer($stream, new \Utopia\NATS\JetStream\ConsumerConfig(
+                durableName: 'worker_priority',
+                ackPolicy: \Utopia\NATS\JetStream\AckPolicy::Explicit,
+                filterSubject: $legacy,
+            ));
+            $replacement->publish($this->queue, ['task' => 'new']);
+            $messages = $replacement->receive($this->queue, 1, 2);
+            $this->assertSame(['existing', 'new'], array_map(static fn(Message $message): string => $message->getPayload()['task'], $messages));
+            foreach ($messages as $message) {
+                $replacement->commit($this->queue, $message);
+            }
+            $this->assertSame(0, $replacement->getQueueSize($this->queue));
+        } finally {
+            $replacement->close();
+            $admin->close();
+        }
     }
+
+    public static function failedAcknowledgement(): iterable
+    {
+        yield 'write not delivered' => [false];
+        yield 'write delivered, confirmation lost' => [true];
+    }
+
+    #[DataProvider('failedAcknowledgement')]
+    public function testCommandsRecoverAfterFailedAcknowledgement(bool $delivered): void
+    {
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $transport = new TcpTransport();
+        $fault = $this->createStub(Transport::class);
+        foreach (['connect', 'read', 'readLine', 'upgradeTls', 'isConnected', 'close'] as $method) {
+            $fault->method($method)->willReturnCallback($transport->$method(...));
+        }
+        $state = new class {
+            public bool $fail = false;
+        };
+        $failure = new ConnectionException('Lost acknowledgement connection');
+        $fault->method('write')->willReturnCallback(static function (string $data) use ($transport, $state, $failure, $delivered): int {
+            if ($state->fail) {
+                $state->fail = false;
+                if ($delivered) {
+                    $transport->write($data);
+                }
+                throw $failure;
+            }
+            return $transport->write($data);
+        });
+        $connections = 0;
+        $broker = new Nats(function () use ($url, $fault, &$connections): Connection {
+            $connections++;
+            return Connection::connect(new ConnectionOptions(
+                servers: $url,
+                transportFactory: fn(): Transport => $connections === 2 ? $fault : new TcpTransport(),
+            ));
+        }, ackWait: 0.3);
+        try {
+            $broker->publish($this->queue, ['task' => 'uncertain']);
+            $broker->publish($this->queue, ['task' => 'next']);
+            // Populate both cached command consumer handles before breaking their socket.
+            $this->assertSame(2, $broker->getQueueSize($this->queue));
+            $messages = $broker->receive($this->queue, 1, 2);
+            $this->assertCount(2, $messages);
+            $state->fail = true;
+            try {
+                $broker->commit($this->queue, $messages[0]);
+                $this->fail('Expected acknowledgement failure');
+            } catch (ConnectionException $error) {
+                $this->assertSame($failure, $error);
+            }
+            $this->assertSame(2, $connections, 'A failed acknowledgement is not retried');
+            $broker->commit($this->queue, $messages[1]);
+            $this->assertSame(3, $connections, 'Only the command connection is replaced');
+            $this->assertSame(0, $broker->getQueueSize($this->queue));
+            $broker->commit($this->queue, $messages[0]);
+            $redelivered = $broker->receive($this->queue, 1);
+            $this->assertCount($delivered ? 0 : 1, $redelivered);
+            if (!$delivered) {
+                $this->assertSame('uncertain', $redelivered[0]->getPayload()['task']);
+                $broker->commit($this->queue, $redelivered[0]);
+            }
+        } finally {
+            $broker->close();
+        }
+    }
+
+
 
     public function testRejectRedeliversAndCountsAttempts(): void
     {
         $this->broker->publish($this->queue, ['task' => 'retryable']);
 
-        $first = $this->broker->receive($this->queue, 2);
+        $first = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $first);
         $this->assertSame(0, $first->getAttempts());
 
         $this->broker->reject($this->queue, $first);
 
-        $second = $this->broker->receive($this->queue, 3);
+        $second = $this->broker->receive($this->queue, 3)[0] ?? null;
         $this->assertInstanceOf(Message::class, $second);
         $this->assertSame('retryable', $second->getPayload()['task']);
         $this->assertSame(1, $second->getAttempts());
@@ -95,7 +193,7 @@ final class NatsBrokerTest extends TestCase
 
         // maxDeliver = 3: reject three deliveries; the third exhausts and dead-letters.
         for ($i = 0; $i < 3; $i++) {
-            $message = $this->broker->receive($this->queue, 3);
+            $message = $this->broker->receive($this->queue, 3)[0] ?? null;
             $this->assertInstanceOf(Message::class, $message);
             $this->broker->reject($this->queue, $message);
         }
@@ -108,7 +206,7 @@ final class NatsBrokerTest extends TestCase
         $this->assertSame(1, $this->broker->getQueueSize($this->queue));
         $this->assertSame(0, $this->broker->getQueueSize($this->queue, true));
 
-        $recovered = $this->broker->receive($this->queue, 2);
+        $recovered = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $recovered);
         $this->assertSame('doomed', $recovered->getPayload()['task']);
         $this->broker->commit($this->queue, $recovered);
@@ -118,7 +216,7 @@ final class NatsBrokerTest extends TestCase
     {
         $this->broker->publish($this->queue, ['task' => 'doomed']);
 
-        $message = $this->broker->receive($this->queue, 2);
+        $message = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $message);
 
         // maxDeliver is 3 here: without the verdict this reject schedules attempt
@@ -130,11 +228,11 @@ final class NatsBrokerTest extends TestCase
 
         // TERM, not NAK: nothing is redelivered on the ackWait deadline either.
         sleep(3);
-        $this->assertNotInstanceOf(\Utopia\Queue\Message::class, $this->broker->receive($this->queue, 2));
+        $this->assertNotInstanceOf(\Utopia\Queue\Message::class, ($this->broker->receive($this->queue, 2)[0] ?? null));
 
         // Still re-drivable: ending the attempt early must not lose the work.
         $this->broker->retry($this->queue, 10);
-        $recovered = $this->broker->receive($this->queue, 2);
+        $recovered = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $recovered);
         $this->assertSame('doomed', $recovered->getPayload()['task']);
         $this->broker->commit($this->queue, $recovered);
@@ -158,12 +256,12 @@ final class NatsBrokerTest extends TestCase
             $broker->publish($queue, ['task' => 'poison']);
             $broker->publish($queue, ['task' => 'good']);
 
-            $poison = $broker->receive($queue, 2);
+            $poison = $broker->receive($queue, 2)[0] ?? null;
             $this->assertInstanceOf(Message::class, $poison);
             $this->assertSame('poison', $poison->getPayload()['task']);
             $broker->reject($queue, $poison->terminal());
 
-            $good = $broker->receive($queue, 3);
+            $good = $broker->receive($queue, 3)[0] ?? null;
             $this->assertInstanceOf(Message::class, $good, 'the slot must come back before the backoff expires');
             $this->assertSame('good', $good->getPayload()['task']);
             $broker->commit($queue, $good);
@@ -178,14 +276,14 @@ final class NatsBrokerTest extends TestCase
         // message: JetStream redelivers it after AckWait — the reap() replacement.
         $this->broker->publish($this->queue, ['task' => 'survivor']);
 
-        $first = $this->broker->receive($this->queue, 2);
+        $first = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $first);
         $this->assertSame(0, $first->getAttempts());
 
         // Never commit; wait past ackWait (2s).
         sleep(3);
 
-        $redelivered = $this->broker->receive($this->queue, 3);
+        $redelivered = $this->broker->receive($this->queue, 3)[0] ?? null;
         $this->assertInstanceOf(Message::class, $redelivered);
         $this->assertSame('survivor', $redelivered->getPayload()['task']);
         $this->assertSame(1, $redelivered->getAttempts());
@@ -194,7 +292,7 @@ final class NatsBrokerTest extends TestCase
 
     public function testReceiveReturnsNullOnEmptyQueue(): void
     {
-        $this->assertNotInstanceOf(Message::class, $this->broker->receive($this->queue, 1));
+        $this->assertNotInstanceOf(Message::class, ($this->broker->receive($this->queue, 1)[0] ?? null));
     }
 
     public function testSeparateQueuesAreIsolated(): void
@@ -202,10 +300,10 @@ final class NatsBrokerTest extends TestCase
         $other = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
 
         $this->broker->publish($this->queue, ['q' => 'mine']);
-        $this->assertNotInstanceOf(Message::class, $this->broker->receive($other, 1), 'a message in one queue is invisible to another');
+        $this->assertNotInstanceOf(Message::class, ($this->broker->receive($other, 1)[0] ?? null), 'a message in one queue is invisible to another');
         $this->assertSame(1, $this->broker->getQueueSize($this->queue));
 
-        $mine = $this->broker->receive($this->queue, 2);
+        $mine = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $mine);
         $this->broker->commit($this->queue, $mine);
     }
@@ -222,7 +320,7 @@ final class NatsBrokerTest extends TestCase
         $seen = [];
         for ($i = 0; $i < 6; $i++) {
             $consumer = ($i % 2 === 0) ? $this->broker : $other;
-            $message = $consumer->receive($this->queue, 3);
+            $message = $consumer->receive($this->queue, 3)[0] ?? null;
             $this->assertInstanceOf(Message::class, $message);
             $seen[] = $message->getPayload()['n'];
             $consumer->commit($this->queue, $message);
@@ -245,7 +343,7 @@ final class NatsBrokerTest extends TestCase
 
         $second = new Nats(Connection::connect($url));
         $this->assertSame(1, $second->getQueueSize($this->queue), 'message persisted across reconnect');
-        $survivor = $second->receive($this->queue, 2);
+        $survivor = $second->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $survivor);
         $this->assertTrue($survivor->getPayload()['keep']);
         $second->commit($this->queue, $survivor);
@@ -258,7 +356,7 @@ final class NatsBrokerTest extends TestCase
         $dotted = new Queue('v1-database.shard.main');
         $this->broker->publish($dotted, ['ok' => 1]);
 
-        $message = $this->broker->receive($dotted, 2);
+        $message = $this->broker->receive($dotted, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $message);
         $this->assertSame(1, $message->getPayload()['ok']);
         $this->broker->commit($dotted, $message);
@@ -275,13 +373,12 @@ final class NatsBrokerTest extends TestCase
         $info = $js->getStreamInfo('Q_' . strtoupper($name));
         $this->assertSame('Q_' . strtoupper($name), $info->config->name);
         $this->assertContains('q.' . strtolower($name) . '.normal', $info->config->subjects);
-        $this->assertContains('q.' . strtolower($name) . '.priority', $info->config->subjects);
     }
 
     /**
      * A consumer switching formats reads the header, not the bytes: it says
      * which codec wrote the payload without anyone having to sniff it, and it
-     * has to be on both publish paths, since enqueueMany() builds its own
+     * has to be on both publish paths, since publishMany() builds its own
      * message array rather than going through publish().
      */
     public function testPublishedMessagesCarryTheCodecsContentType(): void
@@ -297,7 +394,7 @@ final class NatsBrokerTest extends TestCase
         $this->assertSame('a', json_decode($stored->data, true)['payload']['task']);
 
         $many = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
-        $this->broker->enqueueMany($many, [['task' => 'b'], ['task' => 'c']]);
+        $this->broker->publishMany($many, [['task' => 'b'], ['task' => 'c']]);
 
         $stored = $js->getLastMessage('Q_' . strtoupper($many->name), 'q.' . strtolower($many->name) . '.normal');
         $this->assertSame('application/json', $stored->headers?->get('Content-Type'));
@@ -390,9 +487,9 @@ final class NatsBrokerTest extends TestCase
 
         $broker->publish($queue, ['poison' => true]);
 
-        $this->assertInstanceOf(Message::class, $broker->receive($queue, 2)); // delivery 1
+        $this->assertCount(1, $broker->receive($queue, 2)); // delivery 1
         sleep(2);                                                              // > ackWait
-        $this->assertInstanceOf(Message::class, $broker->receive($queue, 2)); // delivery 2 == maxDeliver
+        $this->assertCount(1, $broker->receive($queue, 2)); // delivery 2 == maxDeliver
         sleep(2);                                                              // advisory fires
 
         // Dead-lettering happens on the consume path (receive() drains the max-deliveries
@@ -482,20 +579,20 @@ final class NatsBrokerTest extends TestCase
 
         $broker->publish($queue, ['task' => 'slowpoke']);
 
-        $first = $broker->receive($queue, 2);
+        $first = $broker->receive($queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $first);
 
         // First redelivery: due after backoff[0] = 1s.
-        $second = $broker->receive($queue, 3);
+        $second = $broker->receive($queue, 3)[0] ?? null;
         $this->assertInstanceOf(Message::class, $second);
         $this->assertSame(1, $second->getAttempts());
 
         // Second redelivery: due after backoff[1] = 3s, so a 1s window is too early…
-        $tooEarly = $broker->receive($queue, 1);
+        $tooEarly = $broker->receive($queue, 1)[0] ?? null;
         $this->assertNotInstanceOf(\Utopia\Queue\Message::class, $tooEarly, 'redelivery arrived before the 3s backoff elapsed');
 
         // …and a window past the full delay sees it.
-        $third = $broker->receive($queue, 4);
+        $third = $broker->receive($queue, 4)[0] ?? null;
         $this->assertInstanceOf(Message::class, $third);
         $this->assertSame(2, $third->getAttempts());
 
@@ -511,7 +608,7 @@ final class NatsBrokerTest extends TestCase
 
         $broker->publish($queue, ['task' => 'doomed']);
         for ($i = 0; $i < 2; $i++) {
-            $message = $broker->receive($queue, 3);
+            $message = $broker->receive($queue, 3)[0] ?? null;
             $this->assertInstanceOf(Message::class, $message);
             $broker->reject($queue, $message);
         }
@@ -537,7 +634,7 @@ final class NatsBrokerTest extends TestCase
             $this->broker->publish($this->queue, ['task' => "job-{$i}"]);
         }
 
-        $batch = $this->broker->receiveBatch($this->queue, 2, 8);
+        $batch = $this->broker->receive($this->queue, 2, 8);
 
         $this->assertCount(8, $batch);
         $this->assertSame(
@@ -550,7 +647,7 @@ final class NatsBrokerTest extends TestCase
             $this->broker->commit($this->queue, $message);
         }
 
-        $this->assertCount(12, $this->broker->receiveBatch($this->queue, 2, 32));
+        $this->assertCount(12, $this->broker->receive($this->queue, 2, 32));
     }
 
     /**
@@ -568,7 +665,7 @@ final class NatsBrokerTest extends TestCase
         $this->broker->publish($this->queue, ['task' => 'only-one']);
 
         $started = microtime(true);
-        $batch = $this->broker->receiveBatch($this->queue, 2, 16);
+        $batch = $this->broker->receive($this->queue, 2, 16);
         $elapsed = microtime(true) - $started;
 
         $this->assertCount(1, $batch);
@@ -582,27 +679,27 @@ final class NatsBrokerTest extends TestCase
     public function testAnEmptyQueueCostsTheTimeoutOnceRatherThanPerMessage(): void
     {
         $started = microtime(true);
-        $batch = $this->broker->receiveBatch($this->queue, 1, 16);
+        $batch = $this->broker->receive($this->queue, 1, 16);
         $elapsed = microtime(true) - $started;
 
         $this->assertSame([], $batch);
         $this->assertLessThan(2.0, $elapsed, 'one timeout for the call, not one per message asked for');
     }
 
-    public function testEnqueueManyStoresEveryPayloadInOrder(): void
+    public function testPublishManyStoresEveryPayloadInOrder(): void
     {
         $payloads = [];
         for ($i = 0; $i < 40; $i++) {
             $payloads[] = ['task' => "job-{$i}"];
         }
 
-        $this->assertTrue($this->broker->enqueueMany($this->queue, $payloads));
+        $this->assertTrue($this->broker->publishMany($this->queue, $payloads));
         $this->assertSame(40, $this->broker->getQueueSize($this->queue));
 
         // The batch is written before any acknowledgment is read, so this also
         // asserts the writes reached the stream in the order they were given.
         for ($i = 0; $i < 40; $i++) {
-            $message = $this->broker->receive($this->queue, 2);
+            $message = $this->broker->receive($this->queue, 2)[0] ?? null;
             $this->assertInstanceOf(Message::class, $message);
             $this->assertSame("job-{$i}", $message->getPayload()['task']);
             $this->broker->commit($this->queue, $message);
@@ -611,7 +708,7 @@ final class NatsBrokerTest extends TestCase
         $this->assertSame(0, $this->broker->getQueueSize($this->queue));
     }
 
-    public function testEnqueueManyUnderStableIdsCollapsesTheRepublish(): void
+    public function testPublishManyUnderStableIdsCollapsesTheRepublish(): void
     {
         $broker = $this->brokerWithStableIds();
         $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
@@ -621,35 +718,27 @@ final class NatsBrokerTest extends TestCase
             ['id' => 'invoice-2', 'task' => 'charge'],
         ];
 
-        $broker->enqueueMany($queue, $payloads);
+        $broker->publishMany($queue, $payloads);
         $this->assertSame(2, $broker->getQueueSize($queue));
         $this->assertSame(0, $broker->duplicates());
 
         // The retry a caller makes after an ambiguous timeout on the batch.
-        $broker->enqueueMany($queue, $payloads);
+        $broker->publishMany($queue, $payloads);
         $this->assertSame(2, $broker->getQueueSize($queue), 'a retried batch must not become four messages');
         $this->assertSame(2, $broker->duplicates(), 'the collapsed publishes must be counted, not discarded');
 
         $broker->close();
     }
 
-    public function testEnqueueManyHonoursThePriorityFlag(): void
-    {
-        $this->broker->enqueueMany($this->queue, [['task' => 'normal']]);
-        $this->broker->enqueueMany($this->queue, [['task' => 'urgent']], priority: true);
 
-        $message = $this->broker->receive($this->queue, 2);
-        $this->assertInstanceOf(Message::class, $message);
-        $this->assertSame('urgent', $message->getPayload()['task']);
-    }
 
-    public function testEnqueueManyStoresNothingForAnEmptyBatch(): void
+    public function testPublishManyStoresNothingForAnEmptyBatch(): void
     {
-        $this->assertTrue($this->broker->enqueueMany($this->queue, []));
+        $this->assertTrue($this->broker->publishMany($this->queue, []));
         $this->assertSame(0, $this->broker->getQueueSize($this->queue));
     }
 
-    public function testRetriedEnqueueUnderAStableIdStoresOneMessage(): void
+    public function testRetriedPublishUnderAStableIdStoresOneMessage(): void
     {
         $broker = $this->brokerWithStableIds();
         $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
@@ -665,7 +754,7 @@ final class NatsBrokerTest extends TestCase
         $this->assertSame(1, $broker->duplicates(), 'the collapsed publish must be counted, not discarded');
 
         // One delivery, and it is the work rather than an empty placeholder.
-        $message = $broker->receive($queue, 2);
+        $message = $broker->receive($queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $message);
         $this->assertSame('charge', $message->getPayload()['task']);
         $broker->commit($queue, $message);
@@ -742,7 +831,7 @@ final class NatsBrokerTest extends TestCase
     {
         $this->broker->publish($this->queue, ['task' => 'slow']);
 
-        $message = $this->broker->receive($this->queue, 2);
+        $message = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $message);
 
         // ackWait is 2s here. Hold the message well past it, reporting progress
@@ -756,7 +845,7 @@ final class NatsBrokerTest extends TestCase
         // Nothing was handed to a second worker while this one was still busy.
         $this->assertNotInstanceOf(
             \Utopia\Queue\Message::class,
-            $this->broker->receive($this->queue, 1),
+            ($this->broker->receive($this->queue, 1)[0] ?? null),
             'a message under extension must not be redelivered',
         );
 
@@ -781,14 +870,14 @@ final class NatsBrokerTest extends TestCase
 
         $broker->publish($queue, ['task' => 'always-fails']);
 
-        $first = $broker->receive($queue, 2);
+        $first = $broker->receive($queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $first);
         $broker->reject($queue, $first);
 
         // The first attempt's entry is 2s, so nothing is due inside one.
         $this->assertNotInstanceOf(
             \Utopia\Queue\Message::class,
-            $broker->receive($queue, 1),
+            ($broker->receive($queue, 1)[0] ?? null),
             'a rejected message must wait out its backoff, not come straight back',
         );
 
@@ -828,7 +917,7 @@ final class NatsBrokerTest extends TestCase
         // pinned JetStreamMessage per failed ack, for the life of the worker.
         $this->broker->publish($this->queue, ['task' => 'a']);
 
-        $message = $this->broker->receive($this->queue, 2);
+        $message = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $message);
 
         $inFlight = new \ReflectionProperty(Nats::class, 'inFlight');
@@ -860,9 +949,9 @@ final class NatsBrokerTest extends TestCase
         $this->broker->publish($this->queue, ['task' => 'a']);
         $this->broker->publish($this->queue, ['task' => 'b']);
 
-        $first = $this->broker->receive($this->queue, 2);
+        $first = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $first);
-        $second = $this->broker->receive($this->queue, 2);
+        $second = $this->broker->receive($this->queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $second);
 
         // The stored copy's position, which distinguishes one delivery from
@@ -895,7 +984,7 @@ final class NatsBrokerTest extends TestCase
         $broker->publish($queue, ['task' => 'after']);
         $this->assertSame(2, $broker->getQueueSize($queue));
 
-        $message = $broker->receive($queue, 2);
+        $message = $broker->receive($queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $message);
         $broker->commit($queue, $message);
 
@@ -930,7 +1019,7 @@ final class NatsBrokerTest extends TestCase
         $broker->publish($queue, ['task' => 'ephemeral']);
         $this->assertSame(1, $broker->getQueueSize($queue));
 
-        $message = $broker->receive($queue, 2);
+        $message = $broker->receive($queue, 2)[0] ?? null;
         $this->assertInstanceOf(Message::class, $message);
         $this->assertSame('ephemeral', $message->getPayload()['task']);
 
@@ -969,7 +1058,7 @@ final class NatsBrokerTest extends TestCase
 
             // Take the only message, so the fetch below has nothing to return and
             // parks for its whole timeout.
-            $message = $broker->receive($queue, 2);
+            $message = $broker->receive($queue, 2)[0] ?? null;
             if (!$message instanceof Message) {
                 $error ??= new \RuntimeException('the published message was not delivered');
 
@@ -1100,7 +1189,7 @@ final class NatsBrokerTest extends TestCase
                     $adapter->stop();
                 },
                 [
-                    ['queue' => $queue, 'maxCoroutines' => $cap],
+                    ['queue' => $queue, 'coroutines' => $cap],
                 ],
             );
 
@@ -1115,7 +1204,7 @@ final class NatsBrokerTest extends TestCase
         $this->assertFalse($timedOut, 'the consume loop had to be stopped by the watchdog');
         $this->assertSame($total, $handled, 'every message must be handled');
         $this->assertGreaterThan(1, $overlap, 'the handlers must have actually overlapped');
-        $this->assertLessThanOrEqual($cap, $overlap, 'concurrency stays bounded by maxCoroutines');
+        $this->assertLessThanOrEqual($cap, $overlap, 'concurrency stays bounded by coroutines');
         $this->assertSame(0, $depth, 'every message must be acknowledged');
     }
 
@@ -1165,7 +1254,7 @@ final class NatsBrokerTest extends TestCase
 
         $js = Connection::connect($url)->jetStream();
         $stream = 'Q_' . strtoupper($queue->name);
-        foreach (['worker', 'worker_priority'] as $durable) {
+        foreach (['worker'] as $durable) {
             $config = $js->getConsumer($stream, $durable)->info(true)->config;
             $this->assertSame(8, $config->maxAckPending, "{$durable} must carry maxAckPending");
             $this->assertSame(16, $config->maxWaiting, "{$durable} must carry maxWaiting");
@@ -1218,7 +1307,7 @@ final class NatsBrokerTest extends TestCase
         // Dead-letter one message, so retry() below has something to move.
         $owner->publish($queue, ['task' => 'doomed']);
         for ($i = 0; $i < 2; $i++) {
-            $message = $owner->receive($queue, 3);
+            $message = $owner->receive($queue, 3)[0] ?? null;
             $this->assertInstanceOf(Message::class, $message);
             $owner->reject($queue, $message);
         }
@@ -1230,7 +1319,6 @@ final class NatsBrokerTest extends TestCase
             'work' => $js->getStreamInfo($stream)->config->toArray(),
             'dead' => $js->getStreamInfo($stream . '_DEAD')->config->toArray(),
             'normal' => $js->getConsumer($stream, 'worker')->info(true)->config->toArray(),
-            'priority' => $js->getConsumer($stream, 'worker_priority')->info(true)->config->toArray(),
         ];
         $before = $snapshot();
 

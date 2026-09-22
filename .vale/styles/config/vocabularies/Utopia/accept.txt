@@ -224,3 +224,13 @@ WhatsApp
 YAML
 Yandex
 zstd
+ETags?
+
+Dramatiq(?:\x27s)?
+BullMQ
+prefetch(?:ed|ing)?
+[Pp]ipelined
+rollouts?
+retryable
+variadic
+ACKs?
