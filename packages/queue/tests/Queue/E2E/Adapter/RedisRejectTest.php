@@ -35,7 +35,13 @@ final class RedisRejectTest extends RedisTestCase
         $this->assertSame(0, $connection->listSize($this->namespace . '.dead.audits'));
     }
 
-    public function testATerminalFailureSkipsTheRetrySweep(): void
+    /**
+     * A terminal verdict is a JetStream economy: there, every further attempt holds
+     * an ack slot for the length of its backoff. This broker has no such window, so
+     * the verdict must not cost the operator the only recovery they have -- retry()
+     * reads the failed list, and nothing anywhere pops the dead one.
+     */
+    public function testATerminalFailureStaysWhereTheSweepCanReachIt(): void
     {
         $connection = $this->connection;
         $broker = new Redis($connection, $connection);
@@ -45,11 +51,14 @@ final class RedisRejectTest extends RedisTestCase
         $message = $broker->receive($queue, 0)[0];
         $broker->reject($queue, $message->terminal());
 
-        // The dead list is where an exhausted message ends up anyway; a terminal
-        // one gets there on the first failure instead of after N of them.
-        $this->assertSame(0, $broker->getQueueSize($queue, failedJobs: true));
-        $this->assertSame([], $broker->receive($queue, 0));
-        $this->assertSame([$message->getPid()], $connection->listRange($this->namespace . '.dead.audits', 10, 0));
+        $this->assertSame(1, $broker->getQueueSize($queue, failedJobs: true));
+        $this->assertSame(0, $connection->listSize($this->namespace . '.dead.audits'), 'nothing pops the dead list, so nothing may be parked there by a verdict alone');
+        $this->assertSame([], $broker->receive($queue, 0), 'and it is not re-run on its own');
+
+        // The property this test exists for: once the fault behind the verdict is
+        // fixed, the existing sweep brings the work back.
+        $broker->retry($queue);
+        $this->assertSame(1, $broker->getQueueSize($queue), 'the sweep re-drives it once the fault is fixed');
     }
 
     /**
@@ -109,10 +118,14 @@ final class RedisRejectTest extends RedisTestCase
             (static fn(array $project): array => $project)($message->getPayload()['project']);
         });
 
-        // The list, not the summed read: #302 makes getQueueSize(failedJobs: true)
-        // count the dead list too, and this message is on it by design.
-        $this->assertSame(0, $connection->listSize($this->namespace . '.failed.audits'), 'a type error must not join the retry sweep');
-        $this->assertSame([], $broker->receive($queue, 0), 'and must not be delivered again');
-        $this->assertSame([$message->getPid()], $connection->listRange($this->namespace . '.dead.audits', 10, 0));
+        $this->assertSame([], $broker->receive($queue, 0), 'it must not be re-run on its own');
+        $this->assertSame(0, $connection->listSize($this->namespace . '.dead.audits'), 'and must not be put beyond the sweep');
+        $this->assertSame([$message->getPid()], $connection->listRange($this->namespace . '.failed.audits', 10, 0));
+
+        // A codec change is the case this matters for: flip the writer, find the
+        // handlers whose payloads no longer fit their signatures, fix them, and the
+        // work is still there to re-drive.
+        $broker->retry($queue);
+        $this->assertSame(1, $broker->getQueueSize($queue), 'the operator sweep can still recover it');
     }
 }
