@@ -65,8 +65,12 @@ class Email implements Message
 
         $this->assertAddress($this->fromEmail, InvalidArgumentException::SENDER_MALFORMED);
         $this->assertName($this->fromName);
-        $this->assertAddress($this->replyToEmail, InvalidArgumentException::SENDER_MALFORMED);
         $this->assertName($this->replyToName);
+
+        // An explicitly empty reply-to tells the adapters to omit the header.
+        if (!\in_array($this->replyToEmail, ['', '0'], true)) {
+            $this->assertAddress($this->replyToEmail, InvalidArgumentException::SENDER_MALFORMED);
+        }
     }
 
     /**
@@ -75,7 +79,11 @@ class Email implements Message
     private function assertAddress(string $email, string $type = InvalidArgumentException::RECIPIENT_MALFORMED): void
     {
         if ($email === '') {
-            throw new InvalidArgumentException(InvalidArgumentException::RECIPIENT_EMPTY, 'Recipient email must not be empty.', $email);
+            throw new InvalidArgumentException(
+                $type === InvalidArgumentException::SENDER_MALFORMED ? $type : InvalidArgumentException::RECIPIENT_EMPTY,
+                'Email address must not be empty.',
+                $email,
+            );
         }
 
         if (filter_var($email, FILTER_VALIDATE_EMAIL, FILTER_FLAG_EMAIL_UNICODE) === false) {

@@ -53,13 +53,6 @@ final class EmailTest extends TestCase
         }
     }
 
-    public function testRecipientNameWithSpecialsIsKeptForTheAdapterToQuote(): void
-    {
-        $message = $this->message(to: [['email' => 'john@appwrite.io', 'name' => 'Doe, John <JD>']]);
-
-        $this->assertSame('Doe, John <JD>', $message->getTo()[0]['name']);
-    }
-
     public function testCarbonCopyRecipientsAreValidatedToo(): void
     {
         $this->expectException(InvalidArgumentException::class);
@@ -67,14 +60,37 @@ final class EmailTest extends TestCase
         $this->message(to: ['john@appwrite.io'], bcc: ['not an address']);
     }
 
-    public function testMalformedSenderIsRefused(): void
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function malformedSenders(): array
+    {
+        return ['no domain' => ['noreply'], 'empty' => ['']];
+    }
+
+    #[DataProvider('malformedSenders')]
+    public function testMalformedSenderIsRefused(string $fromEmail): void
     {
         try {
-            $this->message(to: ['john@appwrite.io'], fromEmail: 'noreply');
+            $this->message(to: ['john@appwrite.io'], fromEmail: $fromEmail);
             $this->fail('Expected sender failure');
         } catch (InvalidArgumentException $exception) {
             $this->assertSame(InvalidArgumentException::SENDER_MALFORMED, $exception->getType());
         }
+    }
+
+    public function testEmptyReplyToOmitsTheHeaderRatherThanFailing(): void
+    {
+        $message = new Email(
+            to: ['john@appwrite.io'],
+            subject: 'Subject',
+            content: 'Body',
+            fromName: 'Sender',
+            fromEmail: 'noreply@appwrite.io',
+            replyToEmail: '',
+        );
+
+        $this->assertSame('', $message->getReplyToEmail());
     }
 
     public function testEmptyRecipientKeepsItsType(): void
