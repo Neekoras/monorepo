@@ -109,7 +109,9 @@ final class RedisRejectTest extends RedisTestCase
             (static fn(array $project): array => $project)($message->getPayload()['project']);
         });
 
-        $this->assertSame(0, $broker->getQueueSize($queue, failedJobs: true), 'a type error must not join the retry sweep');
+        // The list, not the summed read: #302 makes getQueueSize(failedJobs: true)
+        // count the dead list too, and this message is on it by design.
+        $this->assertSame(0, $connection->listSize($this->namespace . '.failed.audits'), 'a type error must not join the retry sweep');
         $this->assertSame([], $broker->receive($queue, 0), 'and must not be delivered again');
         $this->assertSame([$message->getPid()], $connection->listRange($this->namespace . '.dead.audits', 10, 0));
     }
