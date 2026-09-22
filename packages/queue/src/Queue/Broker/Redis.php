@@ -448,10 +448,8 @@ class Redis implements Synchronous, Consumer
                 continue;
             }
 
-            // Settlement deletes the payload and the ownership record together,
-            // so reading the payload first keeps a claim its worker settles
-            // mid-sweep from looking like an owned delivery whose payload is
-            // gone. Only legacy payloads expire while processing.
+            // Payload before owner: settlement deletes both, so a claim settled
+            // mid-sweep reads as gone. Only legacy payloads expire while processing.
             $ownerKey = "{$queue->namespace}.owners.{$queue->name}.{$pid}";
             $job = $this->getJob($queue, $pid);
             $owner = $this->commands->get($ownerKey);

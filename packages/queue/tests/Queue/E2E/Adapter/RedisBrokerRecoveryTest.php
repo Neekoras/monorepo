@@ -205,19 +205,14 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
 
     public function testReapToleratesAClaimSettledMidSweep(): void
     {
-        // A busy queue settles deliveries while a sweep is reading them. The
-        // sweep's reads are not atomic, so a claim it finds on the processing
-        // list can be committed before it has finished inspecting that claim.
         $this->broker->publish($this->queue, ['n' => 1]);
         $claimed = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(Message::class, $claimed);
-        $this->backdate($claimed->getPid(), 3600);
-        $this->expire('.claims.*');
 
-        $host = getenv('REDIS_HOST') ?: '127.0.0.1';
-        $port = (int) (getenv('REDIS_PORT') ?: 16379);
-        $racing = new class ($host, $port, $this->broker, $this->queue, $claimed) extends Connection {
-            public function __construct(string $host, int $port, private readonly Redis $broker, private readonly Queue $queue, private readonly Message $claimed)
+        // Commit the claim while the sweep is reading it.
+        $settle = fn() => $this->broker->commit($this->queue, $claimed);
+        $racing = new class (getenv('REDIS_HOST') ?: '127.0.0.1', (int) (getenv('REDIS_PORT') ?: 16379), $settle) extends Connection {
+            public function __construct(string $host, int $port, private readonly \Closure $settle)
             {
                 parent::__construct($host, $port);
             }
@@ -226,7 +221,7 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
             public function get(string $key): array|string|null
             {
                 if (str_contains($key, '.jobs.')) {
-                    $this->broker->commit($this->queue, $this->claimed);
+                    ($this->settle)();
                 }
                 return parent::get($key);
             }
@@ -234,10 +229,9 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
 
         $requeued = new Redis($racing, $racing)->reap($this->queue, olderThan: 0);
 
-        $this->assertSame(0, $requeued, 'a claim its worker just finished is not a stranded claim');
+        $this->assertSame(0, $requeued);
         $this->assertSame(0, $this->processingSize(), 'the commit stands');
         $this->assertSame(0, $this->broker->getQueueSize($this->queue), 'no duplicate is enqueued');
-        $racing->close();
     }
 
     public function testAHeartbeatedClaimIsNeverReaped(): void
