@@ -19,19 +19,15 @@ interface Synchronous
      *
      * @param array<string, mixed> $payload
      */
-    public function publish(Queue $queue, array $payload, bool $priority = false): bool;
+    public function publish(Queue $queue, array $payload): bool;
 
     /**
-     * Publishes several messages in one round trip.
-     *
-     * A caller with many messages due at the same moment pays one connection
-     * checkout and one command instead of N of each. Each payload becomes its
-     * own message with its own id, exactly as if enqueue() had been called for
-     * it, so consumers cannot tell the difference.
+     * Publishes several messages, blocking until the broker accepts them.
+     * Each payload becomes an independent message, as with publish().
      *
      * @param list<array<string, mixed>> $payloads
      */
-    public function enqueueMany(Queue $queue, array $payloads, bool $priority = false): bool;
+    public function publishMany(Queue $queue, array $payloads): bool;
 
     /**
      * Retries failed jobs.

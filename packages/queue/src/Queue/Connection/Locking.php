@@ -39,6 +39,11 @@ class Locking implements Connection
         return $this->lock->withLock($command, self::ACQUIRE_TIMEOUT);
     }
 
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        return $this->synchronize(fn(): mixed => $this->connection->execute($script, $keys, $args));
+    }
+
     public function rightPushArray(string $queue, array $payload): bool
     {
         return $this->synchronize(fn(): bool => $this->connection->rightPushArray($queue, $payload));
@@ -127,6 +132,11 @@ class Locking implements Connection
     public function set(string $key, string $value, int $ttl = 0): bool
     {
         return $this->synchronize(fn(): bool => $this->connection->set($key, $value, $ttl));
+    }
+
+    public function setNotExists(string $key, string $value, int $ttl = 0): bool
+    {
+        return $this->synchronize(fn(): bool => $this->connection->setNotExists($key, $value, $ttl));
     }
 
     public function get(string $key): array|string|null

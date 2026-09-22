@@ -13,6 +13,33 @@ class Redis implements Connection
 
     public function __construct(protected string $host, protected int $port = 6379, protected ?string $user = null, protected ?string $password = null, protected float $connectTimeout = -1, protected float $readTimeout = -1) {}
 
+    private array $scripts = [];
+
+    public function execute(string $script, array $keys, array $args): mixed
+    {
+        return $this->call(function (\Redis $redis) use ($script, $keys, $args): mixed {
+            $hash = sha1($script);
+            if (!isset($this->scripts[$hash])) {
+                $redis->script('load', $script);
+                $this->scripts[$hash] = true;
+            }
+            $redis->clearLastError();
+            $result = $redis->evalSha($hash, [...$keys, ...$args], \count($keys));
+            $error = $redis->getLastError();
+            if ($result === false && $error !== null && str_starts_with($error, 'NOSCRIPT')) {
+                // The server definitively did not execute this operation.
+                $redis->script('load', $script);
+                $redis->clearLastError();
+                $result = $redis->evalSha($hash, [...$keys, ...$args], \count($keys));
+                $error = $redis->getLastError();
+            }
+            if ($result === false && $error !== null) {
+                throw new \RedisException($error);
+            }
+            return $result;
+        });
+    }
+
     public function rightPopLeftPushArray(string $queue, string $destination, int $timeout): array|false
     {
         $response = $this->rightPopLeftPush($queue, $destination, $timeout);
@@ -161,9 +188,21 @@ class Redis implements Connection
         return $this->call(fn(\Redis $redis): \Redis|string|bool => $redis->set($key, $value), idempotent: true);
     }
 
+    public function setNotExists(string $key, string $value, int $ttl = 0): bool
+    {
+        $options = $ttl > 0 ? ['nx', 'ex' => $ttl] : ['nx'];
+
+        // A retried SET NX that already landed answers false the second time,
+        // which reads as "someone holds it" -- the safe answer for a lock, so
+        // the retry stays on.
+        return (bool) $this->call(fn(\Redis $redis): \Redis|string|bool => $redis->set($key, $value, $options), idempotent: true);
+    }
+
     public function get(string $key): array|string|null
     {
-        return $this->call(fn(\Redis $redis): mixed => $redis->get($key), idempotent: true);
+        $value = $this->call(fn(\Redis $redis): mixed => $redis->get($key), idempotent: true);
+
+        return $value === false ? null : $value;
     }
 
     public function listSize(string $key): int
@@ -212,6 +251,7 @@ class Redis implements Connection
         } catch (\Throwable) {
         } finally {
             $this->redis = null;
+            $this->scripts = [];
         }
     }
 

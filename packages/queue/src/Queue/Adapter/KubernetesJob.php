@@ -105,7 +105,7 @@ class KubernetesJob extends Adapter
      * receive() times out or stop() is called, so the Job completes rather
      * than blocking forever like the long-running adapters.
      *
-     * @param array<int, array{queue: Queue, maxCoroutines: int, consumer?: Consumer}> $queues
+     * @param array<int, array{queue: Queue, coroutines: int, consumer?: Consumer}> $queues
      */
     #[\Override]
     public function consume(
@@ -166,7 +166,7 @@ class KubernetesJob extends Adapter
         $consumer ??= $this->consumer;
 
         while (!$this->isStopped()) {
-            $message = $consumer->receive($queue, static::RECEIVE_TIMEOUT);
+            $message = $consumer->receive($queue, static::RECEIVE_TIMEOUT)[0] ?? null;
 
             if (!$message instanceof Message) {
                 break;

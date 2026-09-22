@@ -4,25 +4,24 @@ namespace Utopia\Queue\Broker;
 
 use Utopia\Pools\Pool as UtopiaPool;
 use Utopia\Queue\Consumer;
-use Utopia\Queue\Consumer\Batched;
 use Utopia\Queue\Consumer\Bounded;
 use Utopia\Queue\Message;
 use Utopia\Queue\Publisher\Synchronous;
 use Utopia\Queue\Queue;
 
-readonly class Pool implements Synchronous, Consumer, Batched, Bounded
+readonly class Pool implements Synchronous, Consumer, Bounded
 {
     public function __construct(
         private ?UtopiaPool $publisher = null,
         private ?UtopiaPool $consumer = null,
     ) {}
 
-    public function publish(Queue $queue, array $payload, bool $priority = false): bool
+    public function publish(Queue $queue, array $payload): bool
     {
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
 
-    public function enqueueMany(Queue $queue, array $payloads, bool $priority = false): bool
+    public function publishMany(Queue $queue, array $payloads): bool
     {
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
@@ -46,30 +45,9 @@ readonly class Pool implements Synchronous, Consumer, Batched, Bounded
         return $this->delegate($this->publisher, __FUNCTION__, \func_get_args());
     }
 
-    public function receive(Queue $queue, int $timeout): ?Message
+    public function receive(Queue $queue, int $timeout, int $n = 1): array
     {
-        return $this->delegate($this->consumer, __FUNCTION__, \func_get_args());
-    }
-
-    /**
-     * One lease for the whole batch, and one per acknowledgment after it.
-     *
-     * Declared unconditionally, like the ack-extension methods below, because
-     * what a pool holds is only knowable once a lease is taken -- so the
-     * capability is probed there and a broker without it falls back to the
-     * single receive rather than the pool refusing to batch at all.
-     */
-    public function receiveBatch(Queue $queue, int $timeout, int $max): array
-    {
-        return $this->consumer?->use(function (Consumer $adapter) use ($queue, $timeout, $max): array {
-            if ($adapter instanceof Batched) {
-                return $adapter->receiveBatch($queue, $timeout, $max);
-            }
-
-            $message = $adapter->receive($queue, $timeout);
-
-            return $message instanceof Message ? [$message] : [];
-        }) ?? [];
+        return $this->delegate($this->consumer, __FUNCTION__, \func_get_args()) ?? [];
     }
 
     public function commit(Queue $queue, Message $message): void
@@ -104,13 +82,26 @@ readonly class Pool implements Synchronous, Consumer, Batched, Bounded
      * map has no entry for it; {@see \Utopia\Queue\Broker\Nats::extend()} is
      * silent in that case by design.
      */
-    public function extend(Queue $queue, Message $message): void
+    public function release(Queue $queue, Message ...$messages): void
     {
-        $this->consumer?->use(function (Synchronous|Consumer $adapter) use ($queue, $message): void {
-            $extend = [$adapter, 'extend'];
+        $this->consumer?->use(function (Synchronous|Consumer $adapter) use ($queue, $messages): void {
+            if (\is_callable([$adapter, 'release'])) {
+                $adapter->release($queue, ...$messages);
+            }
+        });
+    }
 
-            if (\is_callable($extend)) {
-                $extend($queue, $message);
+    public function extend(Queue $queue, Message ...$messages): void
+    {
+        $this->consumer?->use(function (Synchronous|Consumer $adapter) use ($queue, $messages): void {
+            if (\is_callable([$adapter, 'extend'])) {
+                if (new \ReflectionMethod($adapter, 'extend')->isVariadic()) {
+                    $adapter->extend($queue, ...$messages);
+                } else {
+                    foreach ($messages as $message) {
+                        $adapter->extend($queue, $message);
+                    }
+                }
             }
         });
     }
