@@ -36,7 +36,7 @@ final class BatchedReceiveTest extends RedisTestCase
 
         $this->assertCount(4, $batch);
         $this->assertSame([1, 2, 3, 4], array_map(static fn(Message $m): int => $m->getPayload()['n'], $batch), 'a batch is FIFO, like the single receive');
-        $this->assertSame(6, $broker->getQueueSize($queue), 'only what was asked for leaves the queue');
+        $this->assertSame(6, $broker->getPendingCount($queue), 'only what was asked for leaves the queue');
     }
 
     public function testReturnsWhatIsThereRatherThanWaitingForTheBatchToFill(): void
@@ -75,7 +75,7 @@ final class BatchedReceiveTest extends RedisTestCase
 
         $this->assertInstanceOf(Message::class, $message);
         $this->assertSame(['n' => 1], $message->getPayload());
-        $this->assertSame(1, $broker->getQueueSize($queue), 'the second message stays put');
+        $this->assertSame(1, $broker->getPendingCount($queue), 'the second message stays put');
     }
 
     public function testEveryMessageInTheBatchIsClaimed(): void
@@ -95,7 +95,7 @@ final class BatchedReceiveTest extends RedisTestCase
             $broker->commit($queue, $message);
         }
 
-        $this->assertSame(1, $broker->getQueueSize($queue, failedJobs: true));
+        $this->assertSame(1, $broker->getFailedCount($queue));
         $this->assertSame(0, $broker->reap($queue, olderThan: 0));
         $this->assertSame([], $broker->receive($queue, 0, 5));
     }
@@ -112,7 +112,7 @@ final class BatchedReceiveTest extends RedisTestCase
         $broker->publish($queue, ['n' => 1]);
         $broker->close();
         $this->assertSame([], $broker->receive($queue, 0));
-        $this->assertSame(1, $broker->getQueueSize($queue));
+        $this->assertSame(1, $broker->getPendingCount($queue));
     }
 
     public function testPooledConsumersHonorDefaultAndExplicitCounts(): void

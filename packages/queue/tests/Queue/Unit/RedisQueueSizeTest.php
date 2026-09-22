@@ -9,7 +9,7 @@ use Utopia\Queue\Broker\Redis;
 use Utopia\Queue\Queue;
 
 /**
- * What getQueueSize(failedJobs: true) counts, which decides whether an incident
+ * What getFailedCount() counts, which decides whether an incident
  * is visible at all.
  *
  * A message leaves the work queue for three different reasons and lands on three
@@ -36,7 +36,7 @@ final class RedisQueueSizeTest extends TestCase
         // Depth is what is still waiting to be worked. Nothing on the other three
         // lists is: a scaler reading this must not be handed a backlog that no
         // worker will ever take.
-        $this->assertSame(7, $broker->getQueueSize(new Queue('audits', 'tests')));
+        $this->assertSame(7, $broker->getPendingCount(new Queue('audits', 'tests')));
     }
 
     public function testFailedSumsTheRetrySweepTheDeadListAndTheParkedBytes(): void
@@ -50,7 +50,7 @@ final class RedisQueueSizeTest extends TestCase
         ];
         $broker = new Redis($connection, $connection);
 
-        $this->assertSame(6, $broker->getQueueSize(new Queue('audits', 'tests'), failedJobs: true));
+        $this->assertSame(6, $broker->getFailedCount(new Queue('audits', 'tests')));
     }
 
     public function testATerminalRejectIsVisibleWithNothingOnTheFailedList(): void
@@ -63,7 +63,7 @@ final class RedisQueueSizeTest extends TestCase
         $connection->sizes = ['tests.dead.audits' => 4];
         $broker = new Redis($connection, $connection);
 
-        $this->assertSame(4, $broker->getQueueSize(new Queue('audits', 'tests'), failedJobs: true));
+        $this->assertSame(4, $broker->getFailedCount(new Queue('audits', 'tests')));
     }
 
     public function testParkedBytesAreVisibleWithNothingElseWrong(): void
@@ -75,7 +75,7 @@ final class RedisQueueSizeTest extends TestCase
         $connection->sizes = ['tests.poison.audits' => 9];
         $broker = new Redis($connection, $connection);
 
-        $this->assertSame(9, $broker->getQueueSize(new Queue('audits', 'tests'), failedJobs: true));
+        $this->assertSame(9, $broker->getFailedCount(new Queue('audits', 'tests')));
     }
 
     public function testAHealthyQueueStillReportsNothingFailed(): void
@@ -86,6 +86,6 @@ final class RedisQueueSizeTest extends TestCase
         $connection->sizes = ['tests.queue.audits' => 12];
         $broker = new Redis($connection, $connection);
 
-        $this->assertSame(0, $broker->getQueueSize(new Queue('audits', 'tests'), failedJobs: true));
+        $this->assertSame(0, $broker->getFailedCount(new Queue('audits', 'tests')));
     }
 }

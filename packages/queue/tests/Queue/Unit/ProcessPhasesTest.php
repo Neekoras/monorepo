@@ -331,7 +331,12 @@ final class PhaseConsumer implements Consumer
         $this->terminal = $message->isTerminal();
     }
 
-    public function getQueueSize(Queue $queue, bool $failedJobs = false): int
+    public function getPendingCount(Queue $queue): int
+    {
+        return 0;
+    }
+
+    public function getFailedCount(Queue $queue): int
     {
         return 0;
     }

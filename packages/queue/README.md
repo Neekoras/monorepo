@@ -94,7 +94,7 @@ $broker = new Nats(
 $broker->publish(new Queue('my-queue'), ['type' => 'test_number', 'value' => 123]);
 ```
 
-Each queue is a WorkQueue-retention stream (a message is removed once acknowledged) with a companion dead stream. `commit()` acknowledges a message, `reject()` schedules redelivery until `maxDeliver` and then dead-letters — unless the handler declared the failure permanent, which dead-letters it at once — `retry()` re-drives the dead stream onto the queue, and `getQueueSize()` reports pending (consumer `num_pending`) or failed (dead stream) counts. `reap()` is a no-op — redelivery after `ackWait` reclaims jobs stranded by a dead worker. Requires [`utopia-php/nats`](https://github.com/utopia-php/nats).
+Each queue is a WorkQueue-retention stream (a message is removed once acknowledged) with a companion dead stream. `commit()` acknowledges a message, `reject()` schedules redelivery until `maxDeliver` and then dead-letters — unless the handler declared the failure permanent, which dead-letters it at once — `retry()` re-drives the dead stream onto the queue, `getPendingCount()` reports the consumer's `num_pending` and `getFailedCount()` the dead stream. `reap()` is a no-op — redelivery after `ackWait` reclaims jobs stranded by a dead worker. Requires [`utopia-php/nats`](https://github.com/utopia-php/nats).
 
 ### Shaping a queue
 
@@ -150,7 +150,7 @@ reading of the same socket in coroutine#3 at the same time is not allowed
 | Connection | Carries | Driven by |
 |---|---|---|
 | receive | fetch, provisioning, the dead-letter advisory, publishing | the consume loop |
-| commands | `commit()`, `reject()`, `extend()`, `getQueueSize()` | the handler and telemetry coroutines |
+| commands | `commit()`, `reject()`, `extend()`, the depth reads | the handler and telemetry coroutines |
 
 A JetStream acknowledgment is a message published to the delivery's reply subject, so it does not have to leave on the connection that fetched the message. Rebinding it moves the whole per-message acknowledgment path off the receive socket, so an acknowledgment raised while the loop is parked in a fetch is a round trip rather than a wait. Each connection has one lock and the two are never nested, so they cannot deadlock.
 
@@ -244,7 +244,7 @@ On NATS every published message carries a `Content-Type` header naming the forma
 
 Bytes that no codec can read are parked rather than dropped or retried: the Redis broker moves them to `<namespace>.poison.<queue>`, and the NATS broker publishes them to the queue's dead subject and terminates the delivery. The pop has already taken them off the queue by the time anything can tell, so the only question is where they go — and a message every worker chokes on must not sit at the head of the queue.
 
-Parked bytes are counted by `getQueueSize($queue, failedJobs: true)`, which reports everything a queue could not get through: the retry sweep's list, the dead letters, and the parked bytes together. Counting the retry list alone answers zero for a queue whose handlers declare every message permanently impossible, and zero again for one whose envelopes nothing can decode — the two cases where the number matters most.
+Parked bytes are counted by `getFailedCount()`, which reports everything a queue could not get through: the retry sweep's list, the dead letters, and the parked bytes together. Counting the retry list alone answers zero for a queue whose handlers declare every message permanently impossible, and zero again for one whose envelopes nothing can decode — the two cases where the number matters most.
 
 ## Background publishing
 

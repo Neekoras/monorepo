@@ -192,7 +192,12 @@ final class BackgroundTest extends TestCase
 
             public function retry(Queue $queue, ?int $limit = null): void {}
 
-            public function getQueueSize(Queue $queue, bool $failedJobs = false): int
+            public function getPendingCount(Queue $queue): int
+            {
+                return 0;
+            }
+
+            public function getFailedCount(Queue $queue): int
             {
                 return 0;
             }
@@ -244,7 +249,7 @@ final class BackgroundTest extends TestCase
         $published = [['id' => 1], ['id' => 2]];
         $background = new Background($this->recordingPublisher($published));
 
-        $this->assertSame(2, $background->getQueueSize(new Queue('emails')));
+        $this->assertSame(2, $background->getPendingCount(new Queue('emails')));
     }
 
     public function testEnqueueThrowsWhenBufferStaysFull(): void
@@ -269,7 +274,12 @@ final class BackgroundTest extends TestCase
 
             public function retry(Queue $queue, ?int $limit = null): void {}
 
-            public function getQueueSize(Queue $queue, bool $failedJobs = false): int
+            public function getPendingCount(Queue $queue): int
+            {
+                return 0;
+            }
+
+            public function getFailedCount(Queue $queue): int
             {
                 return 0;
             }
@@ -360,9 +370,14 @@ final class BackgroundTest extends TestCase
 
             public function retry(Queue $queue, ?int $limit = null): void {}
 
-            public function getQueueSize(Queue $queue, bool $failedJobs = false): int
+            public function getPendingCount(Queue $queue): int
             {
                 return \count($this->buffer);
+            }
+
+            public function getFailedCount(Queue $queue): int
+            {
+                return 0;
             }
         };
     }
@@ -395,9 +410,14 @@ final class BackgroundTest extends TestCase
 
             public function retry(Queue $queue, ?int $limit = null): void {}
 
-            public function getQueueSize(Queue $queue, bool $failedJobs = false): int
+            public function getPendingCount(Queue $queue): int
             {
                 return \count($this->batches);
+            }
+
+            public function getFailedCount(Queue $queue): int
+            {
+                return 0;
             }
         };
     }

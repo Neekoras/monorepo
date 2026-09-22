@@ -55,7 +55,7 @@ use Utopia\Queue\Queue;
  *   receive connection  — fetch, provisioning, the dead-letter advisory, publishing.
  *     Driven by the consume loop, behind {@see self::synchronize()}. The fetch parks
  *     here for the whole receive timeout, and nothing on the hot path waits for it.
- *   commands connection — commit, reject, extend, getQueueSize. Driven by the handler
+ *   commands connection — commit, reject, extend, the depth reads. Driven by the handler
  *     and telemetry coroutines, behind {@see self::command()}. A JetStream ack is just
  *     a message published to the delivery's reply subject, so it does not have to
  *     leave on the connection that fetched it; rebinding it (see onCommands()) is what
@@ -1001,9 +1001,10 @@ class Nats implements Synchronous, Consumer, Bounded
     }
 
     /**
-     * Queue depth, read on the commands connection under its lock, so it is safe to
-     * call from a telemetry or health coroutine while another coroutine is in receive()
-     * on this same broker.
+     * Messages waiting to be delivered, read on the commands connection under its
+     * lock, so it is safe to call from a telemetry or health coroutine while another
+     * coroutine is in receive() on this same broker. {@see self::getFailedCount()}
+     * reads the dead stream the same way.
      *
      * This used to need a third connection of its own, because nothing serialised the
      * socket and a depth read from the telemetry coroutine could land on top of the
@@ -1015,17 +1016,32 @@ class Nats implements Synchronous, Consumer, Bounded
      * -- the consume loop owns those -- and reports 0 for a queue whose streams do not
      * exist yet, matching Broker\Redis's empty-list semantics.
      */
-    public function getQueueSize(Queue $queue, bool $failedJobs = false): int
+    public function getPendingCount(Queue $queue): int
     {
         $stream = $this->workStream($queue);
 
-        return $this->command(function () use ($queue, $stream, $failedJobs): int {
-            try {
-                if ($failedJobs) {
-                    return $this->commandsJs()->getStreamInfo($this->deadStream($queue))->state->messages;
-                }
+        return $this->count(fn(): int => $this->commandsConsumer($stream)->info(true)->numPending);
+    }
 
-                return $this->commandsConsumer($stream)->info(true)->numPending;
+    /**
+     * The dead stream, which is where every failure this broker keeps ends up:
+     * a terminal reject and an exhausted one are copied to the same place.
+     */
+    public function getFailedCount(Queue $queue): int
+    {
+        return $this->count(fn(): int => $this->commandsJs()->getStreamInfo($this->deadStream($queue))->state->messages);
+    }
+
+    /**
+     * A read of JetStream state, answering 0 for what is not provisioned yet.
+     *
+     * @param callable(): int $read
+     */
+    private function count(callable $read): int
+    {
+        return $this->command(function () use ($read): int {
+            try {
+                return $read();
             } catch (JetStreamException $e) {
                 if ($e->apiError?->code === 404) {
                     return 0; // stream/consumer not provisioned yet — nothing enqueued

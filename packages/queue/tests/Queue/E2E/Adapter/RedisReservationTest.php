@@ -46,7 +46,7 @@ final class RedisReservationTest extends TestCase
             $this->broker->commit($this->queue, $message);
         }
         $this->assertSame(0, $this->redis->lLen($this->key('processing')));
-        $this->assertSame(1, $this->broker->getQueueSize($this->queue, true));
+        $this->assertSame(1, $this->broker->getFailedCount($this->queue));
         $this->assertSame('99', $this->redis->get($this->key('stats') . '.success'));
         try {
             $this->broker->commit($this->queue, $messages[0]);
@@ -74,13 +74,13 @@ final class RedisReservationTest extends TestCase
             self::fail('Expected simulated crash');
         } catch (\RuntimeException) {
         }
-        $this->assertSame(0, $broker->getQueueSize($this->queue));
+        $this->assertSame(0, $broker->getPendingCount($this->queue));
         $reservations = $this->redis->zRange($this->key('reservations'), 0, -1);
         $this->assertCount(1, $reservations);
         $this->assertSame(1, $this->redis->lLen($reservations[0]));
         $this->redis->zAdd($this->key('reservations'), 0, $reservations[0]);
         $broker->maintain();
-        $this->assertSame(1, $broker->getQueueSize($this->queue));
+        $this->assertSame(1, $broker->getPendingCount($this->queue));
         $this->assertSame(['n' => 1], $this->broker->receive($this->queue, 0)[0]->getPayload());
     }
 
@@ -154,7 +154,7 @@ final class RedisReservationTest extends TestCase
         }
         $this->assertSame('1', $this->redis->get($this->key('stats') . '.success'));
         $this->assertSame(0, $this->redis->lLen($this->key('processing')));
-        $this->assertSame(0, $this->broker->getQueueSize($this->queue, true));
+        $this->assertSame(0, $this->broker->getFailedCount($this->queue));
     }
 
     public function testClusterRejectsUnsafePlacementBeforeRemovingWork(): void
@@ -169,7 +169,7 @@ final class RedisReservationTest extends TestCase
         } catch (\InvalidArgumentException $error) {
             $this->assertStringContainsString('shared hash tag', $error->getMessage());
         }
-        $this->assertSame(1, $broker->getQueueSize($queue));
+        $this->assertSame(1, $broker->getPendingCount($queue));
         $connection->remove($queue->namespace . '.queue.' . $queue->name);
         $connection->close();
     }
@@ -248,7 +248,7 @@ final class RedisReservationTest extends TestCase
         $this->broker->reject($queue, $message);
         sleep(2);
         $this->assertFalse($this->redis->get($this->key('jobs') . '.' . $message->getPid()));
-        $this->assertSame(1, $this->broker->getQueueSize($queue, true));
+        $this->assertSame(1, $this->broker->getFailedCount($queue));
     }
 
     public function testHeartbeatExpiryDoesNotPreventSettlementButTakeoverDoes(): void
@@ -394,7 +394,7 @@ final class RedisReservationTest extends TestCase
         };
         $connection->before = fn() => $this->broker->$operation($this->queue, $message);
         $this->assertSame(0, new Broker($connection, $connection)->reap($this->queue, olderThan: 0));
-        $this->assertSame(0, $this->broker->getQueueSize($this->queue));
+        $this->assertSame(0, $this->broker->getPendingCount($this->queue));
         if ($operation === 'extend') {
             $this->broker->commit($this->queue, $message);
         }

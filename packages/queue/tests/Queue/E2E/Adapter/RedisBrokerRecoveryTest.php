@@ -42,7 +42,7 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
     /**
      * The retry sweep's own list, on its own.
      *
-     * getQueueSize(failedJobs: true) sums this with the dead and poison lists --
+     * getFailedCount() sums this with the dead and poison lists --
      * an operator asking what a queue could not get through means all three --
      * so proving a message *moved off* this list needs the list itself.
      */
@@ -76,7 +76,7 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
 
         $this->assertSame(1, $requeued);
         $this->assertSame(0, $this->processingSize(), 'the stranded claim is reclaimed');
-        $this->assertSame(1, $this->broker->getQueueSize($this->queue), 'the message is back on the queue');
+        $this->assertSame(1, $this->broker->getPendingCount($this->queue), 'the message is back on the queue');
 
         $retried = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $retried);
@@ -102,7 +102,7 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
         $requeued = $this->broker->reap($this->queue, olderThan: 0);
         $this->assertSame(0, $requeued);
         $this->assertSame(0, $this->processingSize(), 'the unrecoverable legacy claim is pruned');
-        $this->assertSame(0, $this->broker->getQueueSize($this->queue));
+        $this->assertSame(0, $this->broker->getPendingCount($this->queue));
     }
 
     public function testReapParksExhaustedClaimsOnTheDeadQueue(): void
@@ -126,7 +126,7 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
         $this->assertSame(0, $requeued);
         $this->assertSame(0, $this->processingSize());
         $this->assertSame(1, $this->deadSize(), 'the exhausted claim is parked, not looped');
-        $this->assertSame(0, $this->broker->getQueueSize($this->queue));
+        $this->assertSame(0, $this->broker->getPendingCount($this->queue));
     }
 
     public function testRetryRequeuesARejectedMessageWithItsAttemptCount(): void
@@ -137,11 +137,11 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
         $this->broker->reject($this->queue, $claimed);
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $claimed);
         $this->backdate($claimed->getPid());
-        $this->assertSame(1, $this->broker->getQueueSize($this->queue, failedJobs: true));
+        $this->assertSame(1, $this->broker->getFailedCount($this->queue));
 
         $this->broker->retry($this->queue);
 
-        $this->assertSame(0, $this->broker->getQueueSize($this->queue, failedJobs: true));
+        $this->assertSame(0, $this->broker->getFailedCount($this->queue));
         $retried = $this->broker->receive($this->queue, 0)[0] ?? null;
         $this->assertInstanceOf(\Utopia\Queue\Message::class, $retried);
         $this->assertSame(['n' => 1], $retried->getPayload());
@@ -160,10 +160,10 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
 
         $this->broker->retry($this->queue, maxAttempts: 3);
 
-        $this->assertSame(0, $this->broker->getQueueSize($this->queue), 'nothing is requeued');
+        $this->assertSame(0, $this->broker->getPendingCount($this->queue), 'nothing is requeued');
         $this->assertSame(0, $this->failedSize(), 'the sweep is done with it');
         $this->assertSame(1, $this->deadSize(), 'the exhausted message is parked');
-        $this->assertSame(1, $this->broker->getQueueSize($this->queue, failedJobs: true), 'and it still counts as work this queue could not get through');
+        $this->assertSame(1, $this->broker->getFailedCount($this->queue), 'and it still counts as work this queue could not get through');
     }
 
     public function testRetrySkipsEntriesWhosePayloadExpired(): void
@@ -183,8 +183,8 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
 
         $this->broker->retry($this->queue);
 
-        $this->assertSame(0, $this->broker->getQueueSize($this->queue, failedJobs: true), 'the expired entry does not block the sweep');
-        $this->assertSame(1, $this->broker->getQueueSize($this->queue), 'the recoverable entry is requeued');
+        $this->assertSame(0, $this->broker->getFailedCount($this->queue), 'the expired entry does not block the sweep');
+        $this->assertSame(1, $this->broker->getPendingCount($this->queue), 'the recoverable entry is requeued');
     }
     public function testRetryParksEntriesOlderThanTheAgeGate(): void
     {
@@ -196,10 +196,10 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
 
         $this->broker->retry($this->queue, newerThan: 600);
 
-        $this->assertSame(0, $this->broker->getQueueSize($this->queue), 'ancient work is not resurrected');
+        $this->assertSame(0, $this->broker->getPendingCount($this->queue), 'ancient work is not resurrected');
         $this->assertSame(0, $this->failedSize(), 'the sweep is done with it');
         $this->assertSame(1, $this->deadSize(), 'the ancient entry is parked for inspection');
-        $this->assertSame(1, $this->broker->getQueueSize($this->queue, failedJobs: true), 'parking for inspection is not the same as nothing to inspect');
+        $this->assertSame(1, $this->broker->getFailedCount($this->queue), 'parking for inspection is not the same as nothing to inspect');
     }
 
     public function testReapParksClaimsOlderThanTheAgeGate(): void
@@ -247,7 +247,7 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
 
         $this->assertSame(0, $requeued);
         $this->assertSame(0, $this->processingSize(), 'the commit stands');
-        $this->assertSame(0, $this->broker->getQueueSize($this->queue), 'no duplicate is enqueued');
+        $this->assertSame(0, $this->broker->getPendingCount($this->queue), 'no duplicate is enqueued');
     }
 
     public function testAHeartbeatedClaimIsNeverReaped(): void
@@ -264,7 +264,7 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
 
         $this->assertSame(0, $requeued, 'the live claim is left with its worker');
         $this->assertSame(1, $this->processingSize());
-        $this->assertSame(0, $this->broker->getQueueSize($this->queue), 'no duplicate is enqueued');
+        $this->assertSame(0, $this->broker->getPendingCount($this->queue), 'no duplicate is enqueued');
     }
 
     public function testExtendRenewsHeartbeatWhileStillOwned(): void
@@ -296,7 +296,7 @@ final class RedisBrokerRecoveryTest extends RedisTestCase
         $broker->maintain();
 
         $this->assertSame(0, $this->processingSize(), 'the stranded claim is reclaimed by the sweep');
-        $this->assertSame(1, $broker->getQueueSize($this->queue), 'the message is back on the queue');
+        $this->assertSame(1, $broker->getPendingCount($this->queue), 'the message is back on the queue');
     }
 
     public function testTheReapLockAdmitsOneSweepPerInterval(): void

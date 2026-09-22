@@ -35,7 +35,17 @@ interface Synchronous
     public function retry(Queue $queue, ?int $limit = null): void;
 
     /**
-     * Returns the amount of pending messages in the queue.
+     * Messages waiting to be delivered.
      */
-    public function getQueueSize(Queue $queue, bool $failedJobs = false): int;
+    public function getPendingCount(Queue $queue): int;
+
+    /**
+     * Messages this queue could not get through, whatever stopped them.
+     *
+     * A message leaves the work queue for more than one reason -- rejected with
+     * attempts left, rejected terminally or out of attempts, or bytes no codec
+     * here could read -- and an operator asking whether a queue is in trouble
+     * means all of them. Each broker sums whatever destinations it keeps.
+     */
+    public function getFailedCount(Queue $queue): int;
 }
