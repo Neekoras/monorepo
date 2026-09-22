@@ -2,7 +2,7 @@
 
 The source of truth for the [utopia-php](https://github.com/utopia-php) libraries. Each `packages/<name>` is an independent Composer library; development happens here, and every push is mirrored to its read-only repository (e.g. `utopia-php/http`), so Composer/Packagist distribution is unchanged — mechanics in [docs/distribution.md](docs/distribution.md).
 
-[`utopia-php/compression`](https://github.com/appwrite/appwrite/tree/main/packages/compression) and [`utopia-php/system`](https://github.com/appwrite/appwrite/tree/main/packages/system) are maintained in Appwrite. Their distribution mirrors and Packagist packages remain available.
+[`utopia-php/compression`](https://github.com/appwrite/appwrite/tree/main/packages/compression), [`utopia-php/smtp`](https://github.com/appwrite/appwrite/tree/main/packages/smtp) and [`utopia-php/system`](https://github.com/appwrite/appwrite/tree/main/packages/system) are maintained in Appwrite. Their distribution mirrors and Packagist packages remain available.
 
 ## Quickstart
 
@@ -74,7 +74,6 @@ graph TD
     http --> validators
     messaging --> client
     messaging --> pools
-    messaging --> smtp
     messaging --> telemetry
     platform --> cli
     platform --> http
