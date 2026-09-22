@@ -449,25 +449,34 @@ class Redis implements Synchronous, Consumer
             }
 
             // Payload before owner: settlement deletes both, so a claim settled
-            // mid-sweep reads as gone. Only legacy payloads expire while processing.
+            // mid-sweep reads as gone rather than as an owner with no payload.
             $ownerKey = "{$queue->namespace}.owners.{$queue->name}.{$pid}";
             $job = $this->getJob($queue, $pid);
             $owner = $this->commands->get($ownerKey);
-            if ($job === false) {
-                if (\is_string($owner)) {
-                    throw new \RuntimeException('Queue delivery payload is missing');
-                }
+
+            // Legacy claims carry no ownership record, so a payload that is
+            // gone leaves nothing to reclaim atomically: drop the entry.
+            if ($job === false && !\is_string($owner)) {
                 $this->commands->listRemove($processing, $pid);
                 continue;
             }
 
-            if ($job->getTimestamp() > $cutoff
-                || \is_string($this->commands->get("{$queue->namespace}.claims.{$queue->name}.{$pid}"))) {
+            // An owner still standing here means no settlement ran, so the
+            // payload went missing on its own: maxmemory evicted a job key,
+            // which is held without a TTL, or the codec cannot decode what is
+            // stored. Either way it can never be requeued, and failing the
+            // sweep only strands the claims behind it for another interval, so
+            // park it like an exhausted one and move on. The script still
+            // refuses claims a live heartbeat says are in hand.
+            if ($job !== false
+                && ($job->getTimestamp() > $cutoff
+                    || \is_string($this->commands->get("{$queue->namespace}.claims.{$queue->name}.{$pid}")))) {
                 $retained++;
                 continue;
             }
 
-            $dead = ($maxAttempts !== null && $job->getAttempts() >= $maxAttempts)
+            $dead = $job === false
+                || ($maxAttempts !== null && $job->getAttempts() >= $maxAttempts)
                 || ($newerThan !== null && $job->getTimestamp() < $now - $newerThan);
             $moved = $this->script($this->commands, 'reclaim', [
                 $ownerKey, "{$queue->namespace}.claims.{$queue->name}.{$pid}",
