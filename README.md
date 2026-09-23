@@ -46,7 +46,7 @@ To use an unmerged branch from an *external* consumer (e.g. test a fix in Appwri
 
 ## Dependency graph
 
-Local siblings only: arrows point at dependencies between the packages in this checkout (`platform --> http` means platform requires http). Requirements on packages maintained elsewhere, such as the `utopia-php/telemetry` and `utopia-php/pools` constraints that `cache`, `client`, `dns`, `http`, `messaging`, `queue`, `schedule` and `storage` keep, are not drawn, so a node without arrows is not necessarily dependency-free. Regenerate with `bin/monorepo graph` after changing a package's requirements — `bin/monorepo validate` (which CI runs on every push) fails while it is stale.
+Local siblings only: arrows point at dependencies between the packages in this checkout (`platform --> http` means platform requires http). Requirements on packages maintained elsewhere, such as `utopia-php/telemetry` (required by `cache`, `dns`, `http`, `messaging`, `queue`, `schedule` and `storage`) and `utopia-php/pools` (required by `cache`, `client`, `messaging` and `queue`), are not drawn, so a node without arrows is not necessarily dependency-free. Regenerate with `bin/monorepo graph` after changing a package's requirements — `bin/monorepo validate` (which CI runs on every push) fails while it is stale.
 
 <!-- graph -->
 ```mermaid
