@@ -121,6 +121,48 @@ final class PlainCodecTest extends TestCase
         $this->assertSame($bare->decode($bare->encode($value)), $wrapped->decode($wrapped->encode($value)));
     }
 
+    public function testAPayloadThatContainsItselfIsRefused(): void
+    {
+        // igbinary carries a self-referential graph happily, and json_encode refuses one
+        // -- so the walk has to refuse it too rather than follow it until the stack ends.
+        $cycle = new ArrayObject(['id' => 'p1']);
+        $cycle['self'] = $cycle;
+
+        $this->expectException(\RuntimeException::class);
+
+        (new Plain($this->preserving()))->encode(['payload' => $cycle]);
+    }
+
+    public function testBytesCarryingACycleAreRefusedRatherThanFollowed(): void
+    {
+        // The same graph arriving from the queue. Refusing makes it a poison message the
+        // broker parks; following it takes the worker down with it.
+        $preserving = $this->preserving();
+        $cycle = new ArrayObject(['id' => 'p1']);
+        $cycle['self'] = $cycle;
+        $bytes = $preserving->encode(['payload' => $cycle]);
+
+        $this->expectException(\RuntimeException::class);
+
+        (new Plain($preserving))->decode($bytes);
+    }
+
+    /**
+     * Sharing is not a cycle: the same object twice in one payload has a flat form, and
+     * refusing it would reject an ordinary message.
+     */
+    public function testTheSameObjectTwiceIsNotACycle(): void
+    {
+        $shared = new ArrayObject(['id' => 't1']);
+        $codec = new Plain($this->preserving());
+
+        $decoded = $codec->decode($codec->encode(['a' => $shared, 'b' => $shared]));
+
+        $this->assertSame([], $this->objectsIn($decoded));
+        $this->assertSame('t1', $decoded['a']['id']);
+        $this->assertSame('t1', $decoded['b']['id']);
+    }
+
     /** A codec with igbinary's defining property, available on every build. */
     private function preserving(): Codec
     {
