@@ -72,6 +72,12 @@ jobs:
           llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
           llm_model: ${{ vars.OCR_LLM_MODEL }}
           llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+          # Optional; when set it overrides llm_use_anthropic. GPT-5.6 and GPT-6
+          # models answer only through the OpenAI Responses API.
+          llm_protocol: ${{ vars.OCR_LLM_PROTOCOL }}
+          # The action default disables Anthropic thinking with a field that
+          # the OpenAI Responses API rejects; send nothing extra instead.
+          llm_extra_body: '{}'
           # Keep the CLI on the same release as the pinned action.
           ocr_version: 1.12.9
           pr_number: ${{ inputs.pr_number }}
@@ -82,3 +88,5 @@ jobs:
           sticky_summary: 'true'
           incremental: 'true'
           checkpoint_range: 'true'
+          # Stream per-file progress into the job log for troubleshooting.
+          stream_progress: 'true'

@@ -14,6 +14,7 @@ In the monorepo's **Settings → Secrets and variables → Actions**, set:
 - secret `OCR_LLM_AUTH_TOKEN` — the API key for that endpoint.
 - variable `OCR_LLM_MODEL` — the model name, for example `claude-sonnet-5`. There is no default.
 - variable `OCR_LLM_USE_ANTHROPIC` — `true` for the Anthropic Messages protocol, `false` for an OpenAI-compatible endpoint. An unset variable selects Anthropic.
+- variable `OCR_LLM_PROTOCOL` — optional. `openai-responses` for models that answer only through the OpenAI Responses API, such as GPT-5.6 and GPT-6; `openai` or `anthropic` otherwise. When set, it overrides `OCR_LLM_USE_ANTHROPIC`.
 
 `GITHUB_TOKEN` is provided by GitHub Actions; the workflow grants it `pull-requests: write` to post the review, which appears as `github-actions[bot]`.
 
