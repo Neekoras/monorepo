@@ -2,7 +2,7 @@
 
 The source of truth for the [utopia-php](https://github.com/utopia-php) libraries. Each `packages/<name>` is an independent Composer library; development happens here, and every push is mirrored to its read-only repository (e.g. `utopia-php/http`), so Composer/Packagist distribution is unchanged — mechanics in [docs/distribution.md](docs/distribution.md).
 
-[`utopia-php/client`](https://github.com/appwrite/appwrite/tree/main/packages/client), [`utopia-php/compression`](https://github.com/appwrite/appwrite/tree/main/packages/compression), [`utopia-php/pools`](https://github.com/appwrite/appwrite/tree/main/packages/pools), [`utopia-php/smtp`](https://github.com/appwrite/appwrite/tree/main/packages/smtp), [`utopia-php/span`](https://github.com/appwrite/appwrite/tree/main/packages/span), [`utopia-php/system`](https://github.com/appwrite/appwrite/tree/main/packages/system), [`utopia-php/telemetry`](https://github.com/appwrite/appwrite/tree/main/packages/telemetry) and [`utopia-php/user-agent`](https://github.com/appwrite/appwrite/tree/main/packages/user-agent) are maintained in Appwrite. Their distribution mirrors and Packagist packages remain available.
+[`utopia-php/client`](https://github.com/appwrite/appwrite/tree/main/packages/client), [`utopia-php/compression`](https://github.com/appwrite/appwrite/tree/main/packages/compression), [`utopia-php/openapi`](https://github.com/appwrite/appwrite/tree/main/packages/openapi), [`utopia-php/pools`](https://github.com/appwrite/appwrite/tree/main/packages/pools), [`utopia-php/smtp`](https://github.com/appwrite/appwrite/tree/main/packages/smtp), [`utopia-php/span`](https://github.com/appwrite/appwrite/tree/main/packages/span), [`utopia-php/system`](https://github.com/appwrite/appwrite/tree/main/packages/system), [`utopia-php/telemetry`](https://github.com/appwrite/appwrite/tree/main/packages/telemetry) and [`utopia-php/user-agent`](https://github.com/appwrite/appwrite/tree/main/packages/user-agent) are maintained in Appwrite. Their distribution mirrors and Packagist packages remain available.
 
 ## Quickstart
 
@@ -80,7 +80,6 @@ graph TD
     image
     messaging
     nats
-    openapi
     replication
     reputation
     schedule
