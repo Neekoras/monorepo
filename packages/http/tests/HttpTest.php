@@ -999,6 +999,17 @@ final class HttpTest extends TestCase
             });
 
         $this->assertSame('NULL', $run('/null-default', ['x' => null]));
+
+        // A param that skips validation never has its validator built, and its null passes through as before
+        Http::get('/skip-validation')
+            ->param('x', 'x-def', function () {
+                throw new \RuntimeException('validator must not be built');
+            }, 'x param', true, skipValidation: true)
+            ->action(function (?string $x) {
+                echo var_export($x, true);
+            });
+
+        $this->assertSame('NULL', $run('/skip-validation', ['x' => null]));
     }
 
     public function testCanInjectResourceAndParamWithSameName(): void

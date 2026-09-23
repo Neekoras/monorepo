@@ -732,7 +732,7 @@ class Http
             $existsInRequest = \array_key_exists($requestKey, $requestParams);
 
             // An explicit null is treated as omitted unless the validator accepts null as a value
-            if ($existsInRequest && $requestParams[$requestKey] === null && $param['optional'] && $param['default'] !== null) {
+            if ($existsInRequest && $requestParams[$requestKey] === null && $param['optional'] && $param['default'] !== null && !$param['skipValidation']) {
                 $validator = $this->resolveValidator($param);
                 if ($validator instanceof Validator && !$validator->isValid(null)) {
                     $existsInRequest = false;
