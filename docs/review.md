@@ -22,7 +22,7 @@ In the monorepo's **Settings → Secrets and variables → Actions**, set:
 
 To post under a dedicated name and avatar instead of `github-actions[bot]`, give the workflow a GitHub App to act as. It mints a short-lived token from the app on every run, and falls back to the default token while no app is configured.
 
-1. Create the app at **Settings → Developer settings → GitHub Apps → New GitHub App**, under the `utopia-php` organization if you can so it is not tied to a personal account. The app name becomes the reviewer's display name with `[bot]` appended, and its logo becomes the avatar. Disable the webhook. Under **Repository permissions** grant **Pull requests: Read and write**, **Contents: Read-only**, and **Metadata: Read-only**; nothing else is needed.
+1. Create the app at **Settings → Developer settings → GitHub Apps → New GitHub App**, under the `utopia-php` organization if you can so it is not tied to a personal account. The app name becomes the reviewer's display name with `[bot]` appended, and its logo becomes the avatar. Disable the webhook. Under **Repository permissions** grant **Pull requests: Read and write**, **Contents: Read and write** (GitHub gates resolving review threads on it), and **Metadata: Read-only**; nothing else is needed.
 2. Generate a private key on the app's settings page and note the **App ID** shown there.
 3. Install the app on the monorepo.
 4. In the monorepo's **Settings → Secrets and variables → Actions**, set:
