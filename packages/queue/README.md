@@ -242,6 +242,32 @@ $broker = new Broker(
 
 Changing the codec of a queue that already holds messages needs `Codec\Compat`. It reads either format and writes the one you give it, because the messages on the list, the jobs in flight, and the dead letters nobody has drained yet were all written by yesterday's release. Deploy it writing JSON first, then give it the `Igbinary` writer, and leave it reading both afterwards — a dead-letter list has no deadline.
 
+### The two codecs do not agree on what a handler receives
+
+`Codec\Json` flattens an object on the way out and `json_decode(assoc: true)` returns an array on the way back. `Codec\Igbinary` preserves the class. So the same payload arrives as two different types depending on which writer is configured, and a consumer written against one breaks on the other — with no compile-time warning, and no failing test, because a test over the JSON codec passes either way.
+
+That is worth knowing before flipping a writer. A consumer whose handlers rebuild from arrays — `new Document($payload['project'])`, where `Document extends ArrayObject` — runs for years on JSON and wedges within minutes of the flip: every delivery of every affected message throws a `TypeError`, each holding a `maxAckPending` slot through its whole backoff, until the consumer has no slot left to deliver into.
+
+`Codec\Plain` makes the payload's shape a property of the payload rather than of the format, in both directions:
+
+```php
+use Utopia\Queue\Codec\Compat;
+use Utopia\Queue\Codec\Igbinary;
+use Utopia\Queue\Codec\Plain;
+
+$broker = new Broker(
+    receive: $receive,
+    commands: $commands,
+    codec: new Plain(new Compat(new Igbinary())),
+);
+```
+
+An `ArrayObject` becomes its storage and a `stdClass` becomes an array, at any depth — the two shapes an envelope actually carries, a document-shaped value and the empty map a JSON renderer leaves behind for `{}`. Any other class passes through untouched: a codec quietly reshaping a type nobody considered is how this class of defect is made, not how it is fixed.
+
+Reading matters as much as writing, which is why it flattens both ways. Bytes outlive the build that wrote them — queued, in flight, and on dead letters that have no deadline — so a message written before this was composed in, or by a pod that has not rolled yet, still reaches a handler as arrays.
+
+Nothing wraps anything on its own. A consumer that means to round-trip objects through igbinary is doing something this package supports, and composing `Plain` is how the other kind says so.
+
 On NATS every published message carries a `Content-Type` header naming the format it is in — `application/json` or `application/vnd.php.igbinary` — so a consumer can switch on the header instead of inspecting the payload. `Codec\Compat` still reads by sniffing the bytes, because messages written before this release carry no header. Redis lists have nowhere to put one, so there the sniff is the whole answer.
 
 Bytes that no codec can read are parked rather than dropped or retried: the Redis broker moves them to `<namespace>.poison.<queue>`, and the NATS broker publishes them to the queue's dead subject and terminates the delivery. The pop has already taken them off the queue by the time anything can tell, so the only question is where they go — and a message every worker chokes on must not sit at the head of the queue.
