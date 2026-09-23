@@ -75,10 +75,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           [ -n "$PR_NUMBER" ] || { echo "::error::No pull request number to review"; exit 1; }
           gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefName,headRefOid \
             --jq '"base_ref=\(.baseRefName)", "head_sha=\(.headRefOid)"' >> "$GITHUB_OUTPUT"
+          # `/open-code-review full`, as a whole word, asks for a review from the merge base.
+          if [[ "$COMMENT_BODY" =~ ^/open-code-review[[:space:]]+full([[:space:]]|$) ]]; then
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # The action checks out the trusted base branch itself and reviews the
       # base-to-head diff from git objects; it never runs code from the pull
@@ -107,7 +112,7 @@ jobs:
           checkpoint_range: 'true'
           # Review from the merge base instead of the last checkpoint when a
           # maintainer asks with `/open-code-review full` or the manual option.
-          full_review: ${{ (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/open-code-review full')) || inputs.full_review == true }}
+          full_review: ${{ steps.pr.outputs.full == 'true' || inputs.full_review == true }}
           # Resolve the reviewer's own inline threads once their lines have left
           # the diff. Threads a human replied to are never touched.
           resolve_outdated: 'true'
