@@ -3,8 +3,9 @@ name: Review
 # AI code review of pull requests with OpenCodeReview
 # (https://github.com/alibaba/open-code-review). A pull request is reviewed
 # when it is opened, marked ready for review, reopened, or pushed to. A
-# maintainer can re-run the review by commenting `/open-code-review` on it, or
-# by dispatching this workflow with the pull request number. Setup, and the
+# maintainer can re-run the review by commenting `/open-code-review` on it
+# (`/open-code-review full` reviews the whole pull request again), or by
+# dispatching this workflow with the pull request number. Setup, and the
 # secrets and variables this needs, are documented in docs/review.md.
 
 on:
@@ -18,9 +19,17 @@ on:
         description: 'Pull request number to review'
         required: true
         type: string
+      full_review:
+        description: 'Review the whole pull request again instead of only the commits since the last checkpoint'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  # GitHub gates resolving review threads on repository write access, so
+  # contents: write is needed to close the reviewer's own outdated threads.
+  # The job never writes to the repository.
+  contents: write
   pull-requests: write
 
 # A new review cancels a stale one for the same pull request. Comments that do
@@ -66,10 +75,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           [ -n "$PR_NUMBER" ] || { echo "::error::No pull request number to review"; exit 1; }
           gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefName,headRefOid \
             --jq '"base_ref=\(.baseRefName)", "head_sha=\(.headRefOid)"' >> "$GITHUB_OUTPUT"
+          # `/open-code-review full`, as a whole word, asks for a review from the merge base.
+          if [[ "$COMMENT_BODY" =~ ^/open-code-review[[:space:]]+full([[:space:]]|$) ]]; then
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # The action checks out the trusted base branch itself and reviews the
       # base-to-head diff from git objects; it never runs code from the pull
@@ -96,5 +110,11 @@ jobs:
           sticky_summary: 'true'
           incremental: 'true'
           checkpoint_range: 'true'
+          # Review from the merge base instead of the last checkpoint when a
+          # maintainer asks with `/open-code-review full` or the manual option.
+          full_review: ${{ steps.pr.outputs.full == 'true' || inputs.full_review == true }}
+          # Resolve the reviewer's own inline threads once their lines have left
+          # the diff. Threads a human replied to are never touched.
+          resolve_outdated: 'true'
           # Stream per-file progress into the job log for troubleshooting.
           stream_progress: 'true'
