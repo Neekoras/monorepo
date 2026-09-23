@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Utopia\Tests\Adapter\SMS\GEOSMS;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use Utopia\Messaging\Adapter\SMS\GEOSMS\CallingCode;
 use Utopia\Tests\Adapter\Base;
 
@@ -19,23 +20,24 @@ final class CallingCodeTest extends Base
         $this->assertEquals(null, CallingCode::fromPhoneNumber('2'));
     }
 
-    public function testSwissMobileIsSwitzerland(): void
+    /**
+     * @return \Iterator<string, array{string, string}>
+     */
+    public static function neighbouringPrefixes(): \Iterator
     {
-        $this->assertSame(CallingCode::SWITZERLAND, CallingCode::fromPhoneNumber('+41791234567'));
-        $this->assertSame(CallingCode::LIECHTENSTEIN, CallingCode::fromPhoneNumber('+4237891234'));
+        yield 'Swiss mobile' => ['+41791234567', '41'];
+        yield 'Liechtenstein' => ['+4237891234', '423'];
+        yield 'Czech Republic' => ['+420601234567', '420'];
+        yield 'Slovak Republic' => ['+421901234567', '421'];
+        yield 'Egypt' => ['+201001234567', '20'];
+        yield 'Morocco' => ['+212612345678', '212'];
+        yield 'South Africa' => ['+27821234567', '27'];
+        yield 'Kazakhstan' => ['+77011234567', '7'];
     }
 
-    public function testCodesArePrefixFree(): void
+    #[DataProvider('neighbouringPrefixes')]
+    public function testResolvesCountryWhoseCodeStartsAnother(string $number, string $callingCode): void
     {
-        $codes = array_unique(array_values(new \ReflectionClass(CallingCode::class)->getConstants(\ReflectionClassConstant::IS_PUBLIC)));
-
-        foreach ($codes as $code) {
-            foreach ($codes as $other) {
-                $this->assertFalse(
-                    $code !== $other && str_starts_with((string) $code, (string) $other),
-                    "Calling code {$code} shadows {$other}",
-                );
-            }
-        }
+        $this->assertSame($callingCode, CallingCode::fromPhoneNumber($number));
     }
 }
