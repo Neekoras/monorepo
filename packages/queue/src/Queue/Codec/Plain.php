@@ -7,82 +7,97 @@ namespace Utopia\Queue\Codec;
 use ArrayObject;
 use RuntimeException;
 use stdClass;
-use Utopia\Queue\Codec;
 
 /**
- * Hands a handler arrays and scalars, whatever the publisher passed.
+ * Arrays and scalars, all the way down.
  *
- * {@see Json} flattens an object on the way out and returns an array on the way back;
- * {@see Igbinary} preserves the class. So the same payload reaches a handler as two
- * different types depending on which writer is configured, and a consumer written
- * against one breaks on the other -- with no compile-time warning and no failing test,
- * since a test over the JSON codec passes either way.
+ * A codec that can carry an object has to apply this, because the shape a handler
+ * receives is the package's contract and not a property of the format: {@see Json}
+ * flattens an object on the way out and returns an array on the way back, and a
+ * consumer written against that breaks on a codec that preserves the class -- with no
+ * compile-time warning and no failing test, since a test over the JSON codec passes
+ * either way.
  *
- * Composing this makes the shape a property of the payload rather than of the format:
+ * Not a codec itself, so it can be tested on a build that has no binary extension to
+ * wrap, and so the next format that preserves an object inherits it rather than
+ * reimplementing it.
  *
- *     $codec = new Plain(new Compat(new Igbinary()));
- *
- * Both directions, because bytes outlive the build that wrote them -- queued, in flight,
- * and on dead letters that have no deadline.
- *
- * An ArrayObject becomes its storage and a stdClass becomes an array, at any depth. Any
- * other class is left alone: a codec quietly reshaping a type nobody considered is how
- * this class of defect is made, not how it is fixed.
+ * An ArrayObject becomes its storage and a stdClass becomes an array, at any depth.
+ * Any other class is left alone: quietly reshaping a type nobody considered is how this
+ * class of defect is made, not how it is fixed.
  */
-final class Plain implements Codec
+final class Plain
 {
     /**
-     * json_encode's own default, and for the same reason: a value that refers to itself
-     * has no flat form, and the cheapest way to say so is to stop descending.
+     * json_encode's own limit, measured the same way -- it carries 512 levels of array
+     * and refuses the 513th -- so a payload this accepts is one JSON would have
+     * accepted too.
      */
     private const int MAX_DEPTH = 512;
 
-    public function __construct(private readonly Codec $inner) {}
-
-    public function encode(mixed $value): string
+    /**
+     * @throws RuntimeException on a payload that nests deeper than a message can
+     */
+    public static function of(mixed $value): mixed
     {
-        return $this->inner->encode($this->plain($value));
-    }
+        $changed = false;
 
-    public function decode(string $value): mixed
-    {
-        return $this->plain($this->inner->decode($value));
-    }
-
-    public function contentType(): string
-    {
-        return $this->inner->contentType();
+        return self::walk($value, $changed, 0);
     }
 
     /**
-     * Arrays and scalars, all the way down.
+     * The walk rebuilds only the branches that hold an object, and reports through
+     * $changed whether it did. In steady state nothing does -- everything was written
+     * flat -- and an untouched array is handed back rather than copied level by level,
+     * which is what makes this affordable on every message on every delivery.
      *
-     * The cast, not getArrayCopy(): a subclass may define its own copy that walks nested
-     * objects for you -- Utopia\Database\Document does -- and the descent then happens
-     * inside that, where the depth below cannot see it. Casting hands back the storage
-     * one level deep and leaves the walking here.
+     * The cast, not getArrayCopy(): a subclass may define its own copy that walks
+     * nested objects for you -- Utopia\Database\Document does -- and the descent then
+     * happens inside that, where the depth below cannot see it. Casting hands back the
+     * storage one level deep and leaves the walking here.
      *
-     * Depth is what refuses a payload that refers to itself, whether the loop runs
-     * through an object or through a native array with a reference in it. Both are
-     * shapes igbinary will carry and json_encode refuses -- the same limit, for the same
-     * reason, so a payload this accepts is one JSON would have accepted too.
+     * Depth is also what refuses a payload that refers to itself, whether the loop runs
+     * through an object or through a native array holding a reference to itself. Both
+     * are shapes a binary format will carry and json_encode refuses. Only descending
+     * into an array counts, so an object costs what the array it stands for costs.
      *
      * @throws RuntimeException on a payload that nests deeper than a message can
      */
-    private function plain(mixed $value, int $depth = 0): mixed
+    private static function walk(mixed $value, bool &$changed, int $depth): mixed
     {
-        if ($depth > self::MAX_DEPTH) {
-            throw new RuntimeException('Queue payload nests deeper than ' . self::MAX_DEPTH . ' levels, or refers to itself.');
+        if ($value instanceof ArrayObject || $value instanceof stdClass) {
+            $changed = true;
+            $ignored = false;
+
+            return self::walk((array) $value, $ignored, $depth);
         }
 
-        if (\is_array($value)) {
-            return array_map(fn(mixed $item): mixed => $this->plain($item, $depth + 1), $value);
-        }
-
-        if (!$value instanceof ArrayObject && !$value instanceof stdClass) {
+        if (!\is_array($value)) {
             return $value;
         }
 
-        return $this->plain((array) $value, $depth + 1);
+        if ($depth >= self::MAX_DEPTH) {
+            throw new RuntimeException('Queue payload nests deeper than ' . self::MAX_DEPTH . ' levels, or refers to itself.');
+        }
+
+        $plain = $value;
+
+        foreach ($value as $key => $item) {
+            if (!\is_array($item) && !$item instanceof ArrayObject && !$item instanceof stdClass) {
+                continue;
+            }
+
+            $itemChanged = false;
+            $item = self::walk($item, $itemChanged, $depth + 1);
+
+            if (!$itemChanged) {
+                continue;
+            }
+
+            $changed = true;
+            $plain[$key] = $item;
+        }
+
+        return $plain;
     }
 }
