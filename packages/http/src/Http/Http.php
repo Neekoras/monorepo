@@ -9,6 +9,7 @@ use Utopia\Telemetry\Adapter\None as NoTelemetry;
 use Utopia\Telemetry\Histogram;
 use Utopia\Telemetry\UpDownCounter;
 use Utopia\Validator;
+use Utopia\Validator\Nullable;
 
 class Http
 {
@@ -730,6 +731,12 @@ class Http
             }
 
             $existsInRequest = \array_key_exists($requestKey, $requestParams);
+
+            // An explicit null is treated as omitted unless the validator declares null as a value
+            if ($existsInRequest && $requestParams[$requestKey] === null && $param['optional'] && $param['default'] !== null && !$this->resolveValidator($param) instanceof Nullable) {
+                $existsInRequest = false;
+            }
+
             $existsInValues = \array_key_exists($valuesKey, $values);
             $paramExists = $existsInRequest || $existsInValues;
 
@@ -884,12 +891,7 @@ class Http
             return;
         }
 
-        $validator = $param['validator']; // checking whether the class exists
-
-        if (\is_callable($validator)) {
-            $context = $this->adapter->context();
-            $validator = \call_user_func_array($validator, array_map($context->get(...), $param['injections']));
-        }
+        $validator = $this->resolveValidator($param);
 
         if (!$validator instanceof Validator) { // is the validator object an instance of the Validator class
             throw new Exception('Validator object is not an instance of the Validator class', 500);
@@ -898,6 +900,23 @@ class Http
         if (!$validator->isValid($value)) {
             throw new Exception('Invalid `' . $key . '` param: ' . $validator->getDescription(), 400);
         }
+    }
+
+    /**
+     * Build the param's validator, resolving a factory closure with its injections.
+     *
+     * @param  array<string, mixed>  $param
+     */
+    private function resolveValidator(array $param): mixed
+    {
+        $validator = $param['validator'];
+
+        if (\is_callable($validator)) {
+            $context = $this->adapter->context();
+            $validator = \call_user_func_array($validator, array_map($context->get(...), $param['injections']));
+        }
+
+        return $validator;
     }
 
     /**
