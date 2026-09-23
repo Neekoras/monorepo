@@ -11,6 +11,7 @@ use Utopia\Http\Adapter\FPM\Request;
 use Utopia\Http\Adapter\FPM\Response;
 use Utopia\Http\Adapter\FPM\Server;
 use Utopia\Http\Tests\UtopiaFPMRequestTest;
+use Utopia\Validator\AnyOf;
 use Utopia\Validator\Integer;
 use Utopia\Validator\Nullable;
 use Utopia\Validator\Text;
@@ -979,15 +980,16 @@ final class HttpTest extends TestCase
         $this->assertSame($run('/typed', []), $run('/typed', ['image' => null, 'badge' => null]));
         $this->assertSame(var_export(['', -1], true), $run('/typed', ['image' => null, 'badge' => null]));
 
-        // Nullable validators declare null as a value, so it is passed through
+        // Validators that accept null declare it as a value, so it is passed through
         Http::get('/nullable')
             ->param('x', 'x-def', new Nullable(new Text(200)), 'x param', true)
             ->param('y', 'y-def', fn() => new Nullable(new Text(200)), 'y param', true)
-            ->action(function (?string $x, ?string $y) {
-                echo var_export([$x, $y], true);
+            ->param('z', 'z-def', new AnyOf([new Nullable(new Text(200)), new Integer()]), 'z param', true)
+            ->action(function (?string $x, ?string $y, mixed $z) {
+                echo var_export([$x, $y, $z], true);
             });
 
-        $this->assertSame(var_export([null, null], true), $run('/nullable', ['x' => null, 'y' => null]));
+        $this->assertSame(var_export([null, null, null], true), $run('/nullable', ['x' => null, 'y' => null, 'z' => null]));
 
         // A null default already matches the explicit null
         Http::get('/null-default')

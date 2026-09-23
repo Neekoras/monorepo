@@ -9,7 +9,6 @@ use Utopia\Telemetry\Adapter\None as NoTelemetry;
 use Utopia\Telemetry\Histogram;
 use Utopia\Telemetry\UpDownCounter;
 use Utopia\Validator;
-use Utopia\Validator\Nullable;
 
 class Http
 {
@@ -732,9 +731,12 @@ class Http
 
             $existsInRequest = \array_key_exists($requestKey, $requestParams);
 
-            // An explicit null is treated as omitted unless the validator declares null as a value
-            if ($existsInRequest && $requestParams[$requestKey] === null && $param['optional'] && $param['default'] !== null && !$this->resolveValidator($param) instanceof Nullable) {
-                $existsInRequest = false;
+            // An explicit null is treated as omitted unless the validator accepts null as a value
+            if ($existsInRequest && $requestParams[$requestKey] === null && $param['optional'] && $param['default'] !== null) {
+                $validator = $this->resolveValidator($param);
+                if ($validator instanceof Validator && !$validator->isValid(null)) {
+                    $existsInRequest = false;
+                }
             }
 
             $existsInValues = \array_key_exists($valuesKey, $values);
