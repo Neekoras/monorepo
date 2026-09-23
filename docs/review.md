@@ -2,7 +2,7 @@
 
 Every pull request gets an AI review from [OpenCodeReview](https://github.com/alibaba/open-code-review), run by the `Review` workflow (`.github/workflows/review.yml`). It posts one summary comment per pull request, updated in place, plus inline comments on the changed lines. A later push reviews only the new commits, and an inline comment is never repeated on a line range that already has one. Findings are advisory: treat them like any other review comment.
 
-The review runs when a pull request is opened, marked ready for review, reopened, or pushed to; draft pull requests are skipped. A maintainer (owner, member, or collaborator of the repository) can re-run it at any time by commenting `/open-code-review` on the pull request.
+The review runs when a pull request is opened, marked ready for review, reopened, or pushed to; draft pull requests are skipped. A maintainer (owner, member, or collaborator of the repository) can re-run it at any time by commenting `/open-code-review` on the pull request, or by running the `Review` workflow from the Actions tab with the pull request number. The manual run also works from a branch, which is how to test a change to the workflow before it lands on `main`.
 
 The workflow uses the `pull_request_target` event so the LLM credentials are available to pull requests from forks. This is safe because the action checks out the trusted base branch and reviews the base-to-head diff from git objects; it never runs code from the pull request.
 

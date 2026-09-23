@@ -2,16 +2,22 @@ name: Review
 
 # AI code review of pull requests with OpenCodeReview
 # (https://github.com/alibaba/open-code-review). A pull request is reviewed
-# when it is opened, marked ready for review, reopened, or pushed to, and a
-# maintainer can re-run the review by commenting `/open-code-review` on it.
-# Setup, and the secrets and variables this needs, are documented in
-# docs/review.md.
+# when it is opened, marked ready for review, reopened, or pushed to. A
+# maintainer can re-run the review by commenting `/open-code-review` on it, or
+# by dispatching this workflow with the pull request number. Setup, and the
+# secrets and variables this needs, are documented in docs/review.md.
 
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull request number to review'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,7 +27,7 @@ permissions:
 # not ask for a review get a unique group, so they are skipped without
 # cancelling a review in progress.
 concurrency:
-  group: ${{ (github.event_name == 'pull_request_target' || startsWith(github.event.comment.body, '/open-code-review')) && format('review-{0}', github.event.pull_request.number || github.event.issue.number) || format('review-noop-{0}', github.run_id) }}
+  group: ${{ (github.event_name != 'issue_comment' || startsWith(github.event.comment.body, '/open-code-review')) && format('review-{0}', github.event.pull_request.number || github.event.issue.number || inputs.pr_number) || format('review-noop-{0}', github.run_id) }}
   cancel-in-progress: true
 
 jobs:
@@ -30,6 +36,7 @@ jobs:
     timeout-minutes: 30
     if: |
       (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false)
+      || github.event_name == 'workflow_dispatch'
       || (
         github.event_name == 'issue_comment'
         && github.event.issue.pull_request
@@ -38,13 +45,13 @@ jobs:
         && startsWith(github.event.comment.body, '/open-code-review')
       )
     steps:
-      # An issue_comment event carries no pull request refs; resolve them so the
-      # action reviews the right range.
+      # Only pull_request_target carries the pull request refs; resolve them
+      # for the other triggers so the action reviews the right range.
       - id: pr
-        if: github.event_name == 'issue_comment'
+        if: github.event_name != 'pull_request_target'
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
         run: |
           gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefName,headRefOid \
             --jq '"base_ref=\(.baseRefName)", "head_sha=\(.headRefOid)"' >> "$GITHUB_OUTPUT"
@@ -60,6 +67,7 @@ jobs:
           llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
           # Keep the CLI on the same release as the pinned action.
           ocr_version: 1.12.9
+          pr_number: ${{ inputs.pr_number }}
           base_ref: ${{ steps.pr.outputs.base_ref }}
           head_sha: ${{ steps.pr.outputs.head_sha }}
           # One summary comment updated in place; a push reviews only the new
