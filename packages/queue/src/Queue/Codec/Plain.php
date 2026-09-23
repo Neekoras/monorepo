@@ -5,9 +5,9 @@ declare(strict_types=1);
 namespace Utopia\Queue\Codec;
 
 use ArrayObject;
+use RuntimeException;
 use SplObjectStorage;
 use stdClass;
-use RuntimeException;
 use Utopia\Queue\Codec;
 
 /**
@@ -32,9 +32,7 @@ use Utopia\Queue\Codec;
  */
 final class Plain implements Codec
 {
-    public function __construct(private readonly Codec $inner)
-    {
-    }
+    public function __construct(private readonly Codec $inner) {}
 
     public function encode(mixed $value): string
     {
@@ -69,7 +67,7 @@ final class Plain implements Codec
     private function plain(mixed $value, SplObjectStorage $open): mixed
     {
         if (\is_array($value)) {
-            return \array_map(fn (mixed $item): mixed => $this->plain($item, $open), $value);
+            return array_map(fn(mixed $item): mixed => $this->plain($item, $open), $value);
         }
 
         if (!$value instanceof ArrayObject && !$value instanceof stdClass) {
