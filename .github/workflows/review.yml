@@ -8,11 +8,6 @@ name: Review
 # secrets and variables this needs, are documented in docs/review.md.
 
 on:
-  # TEMPORARY, for an end-to-end test before merge: pull_request runs this
-  # branch's workflow file with secrets for same-repo branches, which
-  # pull_request_target cannot do until the file is on main.
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
@@ -29,10 +24,24 @@ permissions:
   pull-requests: write
 
 # A new review cancels a stale one for the same pull request. Comments that do
-# not ask for a review get a unique group, so they are skipped without
-# cancelling a review in progress.
+# not ask for a review, or that the job below would not accept, get a unique
+# group, so they are skipped without cancelling a review in progress. Keep the
+# comment test here in step with the job condition.
 concurrency:
-  group: ${{ (github.event_name != 'issue_comment' || startsWith(github.event.comment.body, '/open-code-review')) && format('review-{0}', github.event.pull_request.number || github.event.issue.number || inputs.pr_number) || format('review-noop-{0}', github.run_id) }}
+  group: >-
+    ${{
+      (
+        github.event_name != 'issue_comment'
+        || (
+          github.event.issue.pull_request
+          && github.event.comment.user.type != 'Bot'
+          && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+          && startsWith(github.event.comment.body, '/open-code-review')
+        )
+      )
+      && format('review-{0}', github.event.pull_request.number || github.event.issue.number || inputs.pr_number)
+      || format('review-noop-{0}', github.run_id)
+    }}
   cancel-in-progress: true
 
 jobs:
@@ -41,7 +50,6 @@ jobs:
     timeout-minutes: 30
     if: |
       (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false)
-      || github.event_name == 'pull_request'
       || github.event_name == 'workflow_dispatch'
       || (
         github.event_name == 'issue_comment'
