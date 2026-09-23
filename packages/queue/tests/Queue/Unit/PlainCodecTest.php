@@ -6,6 +6,7 @@ namespace Tests\Unit;
 
 use ArrayObject;
 use PHPUnit\Framework\TestCase;
+use RuntimeException;
 use Utopia\Queue\Codec;
 use Utopia\Queue\Codec\Igbinary;
 use Utopia\Queue\Codec\Json;
@@ -123,12 +124,24 @@ final class PlainCodecTest extends TestCase
 
     public function testAPayloadThatContainsItselfIsRefused(): void
     {
-        // igbinary carries a self-referential graph happily, and json_encode refuses one
-        // -- so the walk has to refuse it too rather than follow it until the stack ends.
+        // igbinary carries a self-referential graph happily and json_encode refuses one,
+        // so this has to refuse it too rather than descend until the stack ends.
         $cycle = new ArrayObject(['id' => 'p1']);
         $cycle['self'] = $cycle;
 
-        $this->expectException(\RuntimeException::class);
+        $this->expectException(RuntimeException::class);
+
+        (new Plain($this->preserving()))->encode(['payload' => $cycle]);
+    }
+
+    public function testAnArrayThatContainsItselfIsRefusedToo(): void
+    {
+        // A reference rather than an object, which is why tracking visited objects was
+        // not enough: nothing about this loop involves an object at all.
+        $cycle = ['id' => 'p1'];
+        $cycle['self'] = &$cycle;
+
+        $this->expectException(RuntimeException::class);
 
         (new Plain($this->preserving()))->encode(['payload' => $cycle]);
     }
@@ -136,20 +149,20 @@ final class PlainCodecTest extends TestCase
     public function testBytesCarryingACycleAreRefusedRatherThanFollowed(): void
     {
         // The same graph arriving from the queue. Refusing makes it a poison message the
-        // broker parks; following it takes the worker down with it.
+        // broker parks; descending takes the worker down with it.
         $preserving = $this->preserving();
         $cycle = new ArrayObject(['id' => 'p1']);
         $cycle['self'] = $cycle;
         $bytes = $preserving->encode(['payload' => $cycle]);
 
-        $this->expectException(\RuntimeException::class);
+        $this->expectException(RuntimeException::class);
 
         (new Plain($preserving))->decode($bytes);
     }
 
     /**
-     * Sharing is not a cycle: the same object twice in one payload has a flat form, and
-     * refusing it would reject an ordinary message.
+     * The same object twice in one payload has a flat form, and refusing it would turn
+     * an ordinary message into a poison one.
      */
     public function testTheSameObjectTwiceIsNotACycle(): void
     {
