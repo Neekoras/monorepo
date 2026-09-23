@@ -89,10 +89,16 @@ jobs:
       # workflow token, and its github-actions[bot] identity, is the fallback.
       - id: app-token
         if: vars.REVIEW_APP_ID != ''
+        # A broken app setup (not installed, wrong key) must not take the review
+        # down with it: fall back to the workflow token and warn instead.
+        continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # ratchet:actions/create-github-app-token@v3
         with:
           app-id: ${{ vars.REVIEW_APP_ID }}
           private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+
+      - if: steps.app-token.outcome == 'failure'
+        run: echo "::warning::Could not mint a token for the review app (REVIEW_APP_ID); posting as github-actions[bot] instead. Check that the app is installed on this repository and that REVIEW_APP_PRIVATE_KEY belongs to it."
 
       # The action checks out the trusted base branch itself and reviews the
       # base-to-head diff from git objects; it never runs code from the pull
