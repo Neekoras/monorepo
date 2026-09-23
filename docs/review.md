@@ -33,7 +33,7 @@ The first review under the new identity re-reviews each open pull request in ful
 
 ## Approving reviews
 
-The reviewer can leave an approving review, in GitHub's own review sense, when it is satisfied: the run reviewed every file it selected without failures, it found nothing, and none of its earlier inline threads on the pull request is still open. When a later run finds something, it dismisses the approval it left earlier. It never requests changes.
+The reviewer can leave an approving review, in GitHub's own review sense, when it is satisfied: the run reviewed every file it selected without failures, it found nothing, and none of its earlier inline threads is still open on lines the pull request has not changed since. Threads GitHub marks as outdated do not block an approval, because the run that approves has reviewed the change that made them outdated. When a later run finds something, it dismisses the approval it left earlier. It never requests changes.
 
 This is off by default. Turn it on by setting the repository variable `OCR_APPROVE_WHEN_CLEAN` to `true`.
 

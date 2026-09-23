@@ -138,7 +138,11 @@ jobs:
 
       # Leave an approving review when the reviewer is satisfied: this run
       # reviewed every file it selected, found nothing, and none of its earlier
-      # inline threads on the pull request is still open. A run that finds
+      # inline threads is still open on lines the pull request has not changed
+      # since. Outdated threads (GitHub marks a thread outdated once its lines
+      # change) do not block: this run reviewed those changes. OpenCodeReview
+      # only resolves them on runs that report findings, so without this a
+      # clean fix would never be approved. A run that finds
       # something dismisses an approval left earlier. Off until the
       # OCR_APPROVE_WHEN_CLEAN variable is 'true'; docs/review.md explains what
       # to check in the branch rules first.
@@ -155,7 +159,7 @@ jobs:
           WARNINGS=$(jq '.warnings // [] | length' "$RESULT" 2>/dev/null || echo 1)
           FILES=$(jq '.summary.files_reviewed // 0' "$RESULT" 2>/dev/null || echo 0)
 
-          # Threads the reviewer opened that nobody has resolved yet.
+          # Threads the reviewer opened that nobody has resolved, on unchanged lines.
           OPEN=0
           CURSOR=null
           while :; do
@@ -167,12 +171,12 @@ jobs:
                   pullRequest(number: $number) {
                     reviewThreads(first: 100, after: $after) {
                       pageInfo { hasNextPage endCursor }
-                      nodes { isResolved comments(first: 1) { nodes { body } } }
+                      nodes { isResolved isOutdated comments(first: 1) { nodes { body } } }
                     }
                   }
                 }
               }' --jq '.data.repository.pullRequest.reviewThreads')
-            OPEN=$((OPEN + $(jq '[.nodes[] | select(.isResolved | not) | select(.comments.nodes[0].body | startswith("<!-- ocr-"))] | length' <<<"$PAGE")))
+            OPEN=$((OPEN + $(jq '[.nodes[] | select(.isResolved | not) | select(.isOutdated | not) | select(.comments.nodes[0].body | startswith("<!-- ocr-"))] | length' <<<"$PAGE")))
             [ "$(jq -r '.pageInfo.hasNextPage' <<<"$PAGE")" = "true" ] || break
             CURSOR=$(jq -r '.pageInfo.endCursor' <<<"$PAGE")
           done
