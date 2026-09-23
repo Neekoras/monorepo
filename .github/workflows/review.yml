@@ -51,14 +51,15 @@ jobs:
         && startsWith(github.event.comment.body, '/open-code-review')
       )
     steps:
-      # Only pull_request_target carries the pull request refs; resolve them
-      # for the other triggers so the action reviews the right range.
+      # Comment and manual triggers carry no pull request refs; resolve them so
+      # the action reviews the right range.
       - id: pr
-        if: github.event_name != 'pull_request_target'
+        if: github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
         run: |
+          [ -n "$PR_NUMBER" ] || { echo "::error::No pull request number to review"; exit 1; }
           gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefName,headRefOid \
             --jq '"base_ref=\(.baseRefName)", "head_sha=\(.headRefOid)"' >> "$GITHUB_OUTPUT"
 
