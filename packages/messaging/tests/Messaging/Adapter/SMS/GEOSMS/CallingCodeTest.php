@@ -18,4 +18,24 @@ final class CallingCodeTest extends Base
         $this->assertSame(CallingCode::UNITED_KINGDOM, CallingCode::fromPhoneNumber('011441234567890'));
         $this->assertEquals(null, CallingCode::fromPhoneNumber('2'));
     }
+
+    public function testSwissMobileIsSwitzerland(): void
+    {
+        $this->assertSame(CallingCode::SWITZERLAND, CallingCode::fromPhoneNumber('+41791234567'));
+        $this->assertSame(CallingCode::LIECHTENSTEIN, CallingCode::fromPhoneNumber('+4237891234'));
+    }
+
+    public function testCodesArePrefixFree(): void
+    {
+        $codes = array_unique(array_values(new \ReflectionClass(CallingCode::class)->getConstants(\ReflectionClassConstant::IS_PUBLIC)));
+
+        foreach ($codes as $code) {
+            foreach ($codes as $other) {
+                $this->assertFalse(
+                    $code !== $other && str_starts_with((string) $code, (string) $other),
+                    "Calling code {$code} shadows {$other}",
+                );
+            }
+        }
+    }
 }
