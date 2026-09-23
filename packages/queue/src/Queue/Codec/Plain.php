@@ -52,8 +52,10 @@ final class Plain implements Codec
     /**
      * Arrays and scalars, all the way down.
      *
-     * getArrayCopy() alone would not do: it flattens one level, so an ArrayObject nested
-     * inside another survives it.
+     * The cast, not getArrayCopy(): a subclass may define its own copy that walks nested
+     * objects for you -- Utopia\Database\Document does -- and a cycle then recurses
+     * inside that before it can reach the check below. Casting hands back the storage one
+     * level deep and leaves the walking here, where the guard is.
      *
      * $open holds the objects this branch is already inside, so a payload that refers
      * back to itself is refused rather than followed until the stack ends. json_encode
@@ -79,7 +81,7 @@ final class Plain implements Codec
         }
 
         $open[$value] = true;
-        $flat = $this->plain($value instanceof ArrayObject ? $value->getArrayCopy() : (array) $value, $open);
+        $flat = $this->plain((array) $value, $open);
         unset($open[$value]);
 
         return $flat;
