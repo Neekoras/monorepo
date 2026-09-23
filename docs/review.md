@@ -31,6 +31,14 @@ To post under a dedicated name and avatar instead of `github-actions[bot]`, give
 
 The first review under the new identity re-reviews each open pull request in full once, because a checkpoint is only trusted when the same identity wrote it.
 
+## Approving reviews
+
+The reviewer can leave an approving review, in GitHub's own review sense, when it is satisfied: the run reviewed every file it selected without failures, it found nothing, and none of its earlier inline threads on the pull request is still open. When a later run finds something, it dismisses the approval it left earlier. It never requests changes.
+
+This is off by default. Turn it on by setting the repository variable `OCR_APPROVE_WHEN_CLEAN` to `true`.
+
+Before turning it on, look at the branch rules for `main`. They require one approving review, and the reviewer's approval counts towards that, so with the variable on, a pull request the reviewer approved could be merged without a maintainer ever looking at it. Requiring a review from code owners in the branch rules keeps a person in the loop: the reviewer is not a code owner, so its approval becomes an extra signal rather than a substitute.
+
 ## Review rules
 
 Repository-specific guidance for the reviewer lives in `.opencodereview/rule.json`. The first entry whose glob matches a changed file decides the prompt for that file, and `merge_system_rule` appends the entry to the built-in rule for the file's language instead of replacing it. Files that match no entry fall back to the built-in rules. See the [review rules reference](https://open-codereview.ai/docs/review-rules) for the schema and glob syntax.

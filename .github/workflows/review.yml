@@ -83,7 +83,8 @@ jobs:
       # The action checks out the trusted base branch itself and reviews the
       # base-to-head diff from git objects; it never runs code from the pull
       # request, which is what makes pull_request_target safe here.
-      - uses: alibaba/open-code-review@bccbc15f785269400735d5255540c231e6c02b6d # ratchet:alibaba/open-code-review@v1.12.9
+      - id: review
+        uses: alibaba/open-code-review@bccbc15f785269400735d5255540c231e6c02b6d # ratchet:alibaba/open-code-review@v1.12.9
         with:
           llm_url: ${{ secrets.OCR_LLM_URL }}
           llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
@@ -108,3 +109,71 @@ jobs:
           checkpoint_range: 'true'
           # Stream per-file progress into the job log for troubleshooting.
           stream_progress: 'true'
+
+      # Leave an approving review when the reviewer is satisfied: this run
+      # reviewed every file it selected, found nothing, and none of its earlier
+      # inline threads on the pull request is still open. A run that finds
+      # something dismisses an approval left earlier. Off until the
+      # OCR_APPROVE_WHEN_CLEAN variable is 'true'; docs/review.md explains what
+      # to check in the branch rules first.
+      - if: vars.OCR_APPROVE_WHEN_CLEAN == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.pr.outputs.head_sha }}
+          NEW_FINDINGS: ${{ steps.review.outputs.comments_total }}
+          RESULT: /tmp/ocr-result.json
+        run: |
+          STATUS=$(jq -r '.status // ""' "$RESULT" 2>/dev/null || echo "")
+          WARNINGS=$(jq '.warnings // [] | length' "$RESULT" 2>/dev/null || echo 1)
+          FILES=$(jq '.summary.files_reviewed // 0' "$RESULT" 2>/dev/null || echo 0)
+
+          # Threads the reviewer opened that nobody has resolved yet.
+          OPEN=0
+          CURSOR=null
+          while :; do
+            # shellcheck disable=SC2016 # GraphQL variables, not shell ones
+            PAGE=$(gh api graphql -F owner="${GITHUB_REPOSITORY%/*}" -F name="${GITHUB_REPOSITORY#*/}" \
+              -F number="$PR_NUMBER" -F after="$CURSOR" -f query='
+              query($owner: String!, $name: String!, $number: Int!, $after: String) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $number) {
+                    reviewThreads(first: 100, after: $after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { isResolved comments(first: 1) { nodes { body } } }
+                    }
+                  }
+                }
+              }' --jq '.data.repository.pullRequest.reviewThreads')
+            OPEN=$((OPEN + $(jq '[.nodes[] | select(.isResolved | not) | select(.comments.nodes[0].body | startswith("<!-- ocr-"))] | length' <<<"$PAGE")))
+            [ "$(jq -r '.pageInfo.hasNextPage' <<<"$PAGE")" = "true" ] || break
+            CURSOR=$(jq -r '.pageInfo.endCursor' <<<"$PAGE")
+          done
+
+          echo "status=$STATUS warnings=$WARNINGS files_reviewed=$FILES new_findings=${NEW_FINDINGS:-?} open_threads=$OPEN"
+
+          # Approvals the reviewer left earlier that are still standing.
+          APPROVALS=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews?per_page=100" \
+            --jq '[.[] | select(.state == "APPROVED") | select(.body | contains("<!-- ocr-approval -->")) | .id] | join(" ")')
+
+          if [ "${NEW_FINDINGS:-0}" != "0" ] || [ "$OPEN" != "0" ]; then
+            for ID in $APPROVALS; do
+              gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews/$ID/dismissals" --silent \
+                -f event=DISMISS -f message="Dismissed automatically: the reviewer has open findings again as of ${HEAD_SHA:0:7}." \
+                && echo "Dismissed earlier approval $ID." \
+                || echo "::warning::Could not dismiss earlier approval $ID."
+            done
+          elif { [ "$STATUS" = "complete" ] || [ "$STATUS" = "success" ]; } && [ "$WARNINGS" = "0" ] && [ "$FILES" -gt 0 ] && [ -n "$HEAD_SHA" ]; then
+            if [ -n "$APPROVALS" ]; then
+              echo "An approval from the reviewer is already standing."
+            else
+              # shellcheck disable=SC2016 # Markdown backticks, not a command substitution
+              BODY=$(printf '✅ **OpenCodeReview** found no issues in `%s` and has no open findings on this pull request.\n\nThis is an automated review and does not replace a review by a maintainer.\n<!-- ocr-approval -->' "${HEAD_SHA:0:7}")
+              gh api -X POST "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" \
+                -f event=APPROVE -f commit_id="$HEAD_SHA" -f body="$BODY" --jq '"Approved: \(.html_url)"' \
+                || echo "::warning::Could not submit the approving review; check that the token may approve pull requests."
+            fi
+          else
+            echo "Nothing reviewed or the run was incomplete; leaving approvals as they are."
+          fi
