@@ -8,6 +8,11 @@ name: Review
 # secrets and variables this needs, are documented in docs/review.md.
 
 on:
+  # TEMPORARY, for an end-to-end test before merge: pull_request runs this
+  # branch's workflow file with secrets for same-repo branches, which
+  # pull_request_target cannot do until the file is on main.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
@@ -36,6 +41,7 @@ jobs:
     timeout-minutes: 30
     if: |
       (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false)
+      || github.event_name == 'pull_request'
       || github.event_name == 'workflow_dispatch'
       || (
         github.event_name == 'issue_comment'
