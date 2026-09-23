@@ -1008,6 +1008,15 @@ final class HttpTest extends TestCase
             });
 
         $this->assertSame('NULL', $run('/skip-validation', ['x' => null]));
+
+        // A path value takes precedence over an explicit null in the request for the same key
+        Http::get('/items/:x')
+            ->param('x', 'x-def', new Text(200), 'x param', true)
+            ->action(function (string $x) {
+                echo var_export($x, true);
+            });
+
+        $this->assertSame(var_export('abc', true), $run('/items/abc', ['x' => null]));
     }
 
     public function testCanInjectResourceAndParamWithSameName(): void
