@@ -1,0 +1,13 @@
+{
+  "rules": [
+    {
+      "path": "packages/*/composer.json",
+      "rule": "This is the manifest of an independent Composer library. Its directory is mirrored read-only to github.com/utopia-php/<name> and published on Packagist under that name. Check that: `name` is `utopia-php/<directory name>`; there is no `version` key, because releases are git tags; every `utopia-php/*` dependency uses a Packagist version constraint and there is no `repositories` entry of type `path` pointing at a sibling package; QA tooling (Pint, PHPStan, Rector, PHPUnit) is not added as a dependency, because the monorepo root provides it. Report violations of these conventions as blocking."
+    },
+    {
+      "path": "packages/*/src/**/*.php",
+      "rule": "This file belongs to an independent Composer library under packages/<name>, mirrored to its own repository and released on its own semantic version. Use `file_read` on that package's composer.json before reporting. A class from a sibling package (another `Utopia\\...` namespace under packages/) may only be used when that sibling is listed in the package's `require` or `require-dev`. Syntax and standard library functions must exist on the minimum PHP version in `require.php`, and every PHP extension used must be declared as `ext-*`. Call out public API changes (renamed or removed public methods, changed signatures or thrown exceptions) as breaking for consumers.",
+      "merge_system_rule": true
+    }
+  ]
+}

@@ -33,6 +33,7 @@ Markdown documentation is linted with [Vale](https://vale.sh) (`vale README.md d
 - Keep each pull request focused on a single concern, with a commit message that describes the change.
 - For bug fixes, documentation updates, and small improvements, open a pull request directly.
 - For larger API changes or new features, open an issue first so maintainers can confirm the direction before you invest in an implementation.
+- Every pull request is reviewed automatically by OpenCodeReview; comment `/open-code-review` on it to request another pass. See [docs/review.md](docs/review.md).
 
 Releases are made by maintainers, by tagging the monorepo `<package>/<version>` — never edit a changelog to release.
 

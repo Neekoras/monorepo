@@ -1,0 +1,205 @@
+name: Review
+
+# AI code review of pull requests with OpenCodeReview
+# (https://github.com/alibaba/open-code-review). A pull request is reviewed
+# when it is opened, marked ready for review, reopened, or pushed to. A
+# maintainer can re-run the review by commenting `/open-code-review` on it
+# (`/open-code-review full` reviews the whole pull request again), or by
+# dispatching this workflow with the pull request number. Setup, and the
+# secrets and variables this needs, are documented in docs/review.md.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull request number to review'
+        required: true
+        type: string
+      full_review:
+        description: 'Review the whole pull request again instead of only the commits since the last checkpoint'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  # GitHub gates resolving review threads on repository write access, so
+  # contents: write is needed to close the reviewer's own outdated threads.
+  # The job never writes to the repository.
+  contents: write
+  pull-requests: write
+
+# A new review cancels a stale one for the same pull request. Comments that do
+# not ask for a review, or that the job below would not accept, get a unique
+# group, so they are skipped without cancelling a review in progress. Keep the
+# comment test here in step with the job condition.
+concurrency:
+  group: >-
+    ${{
+      (
+        github.event_name != 'issue_comment'
+        || (
+          github.event.issue.pull_request
+          && github.event.comment.user.type != 'Bot'
+          && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+          && startsWith(github.event.comment.body, '/open-code-review')
+        )
+      )
+      && format('review-{0}', github.event.pull_request.number || github.event.issue.number || inputs.pr_number)
+      || format('review-noop-{0}', github.run_id)
+    }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: |
+      (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false)
+      || github.event_name == 'workflow_dispatch'
+      || (
+        github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && github.event.comment.user.type != 'Bot'
+        && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+        && startsWith(github.event.comment.body, '/open-code-review')
+      )
+    steps:
+      # Comment and manual triggers carry no pull request refs; resolve them so
+      # the action reviews the right range.
+      - id: pr
+        if: github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          [ -n "$PR_NUMBER" ] || { echo "::error::No pull request number to review"; exit 1; }
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefName,headRefOid \
+            --jq '"base_ref=\(.baseRefName)", "head_sha=\(.headRefOid)"' >> "$GITHUB_OUTPUT"
+          # `/open-code-review full`, as a whole word, asks for a review from the merge base.
+          if [[ "$COMMENT_BODY" =~ ^/open-code-review[[:space:]]+full([[:space:]]|$) ]]; then
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Post as the review app when one is configured (see docs/review.md); the
+      # workflow token, and its github-actions[bot] identity, is the fallback.
+      - id: app-token
+        if: vars.REVIEW_APP_ID != ''
+        # A broken app setup (not installed, wrong key) must not take the review
+        # down with it: fall back to the workflow token and warn instead.
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # ratchet:actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.REVIEW_APP_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+
+      - if: steps.app-token.outcome == 'failure'
+        run: echo "::warning::Could not mint a token for the review app (REVIEW_APP_ID); posting as github-actions[bot] instead. Check that the app is installed on this repository and that REVIEW_APP_PRIVATE_KEY belongs to it."
+
+      # The action checks out the trusted base branch itself and reviews the
+      # base-to-head diff from git objects; it never runs code from the pull
+      # request, which is what makes pull_request_target safe here.
+      - id: review
+        uses: alibaba/open-code-review@bccbc15f785269400735d5255540c231e6c02b6d # ratchet:alibaba/open-code-review@v1.12.9
+        with:
+          llm_url: ${{ secrets.OCR_LLM_URL }}
+          llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          llm_model: ${{ vars.OCR_LLM_MODEL }}
+          llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+          # Optional; when set it overrides llm_use_anthropic. GPT-5.6 and GPT-6
+          # models answer only through the OpenAI Responses API.
+          llm_protocol: ${{ vars.OCR_LLM_PROTOCOL }}
+          # The action default disables Anthropic thinking with a field that
+          # the OpenAI Responses API rejects; send nothing extra instead.
+          llm_extra_body: '{}'
+          # Keep the CLI on the same release as the pinned action.
+          ocr_version: 1.12.9
+          github_token: ${{ steps.app-token.outputs.token || github.token }}
+          pr_number: ${{ inputs.pr_number }}
+          base_ref: ${{ steps.pr.outputs.base_ref }}
+          head_sha: ${{ steps.pr.outputs.head_sha }}
+          # One summary comment updated in place; a push reviews only the new
+          # commits and never repeats an inline comment already on the thread.
+          sticky_summary: 'true'
+          incremental: 'true'
+          checkpoint_range: 'true'
+          # Review from the merge base instead of the last checkpoint when a
+          # maintainer asks with `/open-code-review full` or the manual option.
+          full_review: ${{ steps.pr.outputs.full == 'true' || inputs.full_review == true }}
+          # Resolve the reviewer's own inline threads once their lines have left
+          # the diff. Threads a human replied to are never touched.
+          resolve_outdated: 'true'
+          # Stream per-file progress into the job log for troubleshooting.
+          stream_progress: 'true'
+
+      # Leave an approving review when the reviewer is satisfied: this run
+      # reviewed every file it selected, found nothing, and none of its earlier
+      # inline threads on the pull request is still open. A run that finds
+      # something dismisses an approval left earlier. Off until the
+      # OCR_APPROVE_WHEN_CLEAN variable is 'true'; docs/review.md explains what
+      # to check in the branch rules first.
+      - if: vars.OCR_APPROVE_WHEN_CLEAN == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.pr.outputs.head_sha }}
+          NEW_FINDINGS: ${{ steps.review.outputs.comments_total }}
+          RESULT: /tmp/ocr-result.json
+        run: |
+          STATUS=$(jq -r '.status // ""' "$RESULT" 2>/dev/null || echo "")
+          WARNINGS=$(jq '.warnings // [] | length' "$RESULT" 2>/dev/null || echo 1)
+          FILES=$(jq '.summary.files_reviewed // 0' "$RESULT" 2>/dev/null || echo 0)
+
+          # Threads the reviewer opened that nobody has resolved yet.
+          OPEN=0
+          CURSOR=null
+          while :; do
+            # shellcheck disable=SC2016 # GraphQL variables, not shell ones
+            PAGE=$(gh api graphql -F owner="${GITHUB_REPOSITORY%/*}" -F name="${GITHUB_REPOSITORY#*/}" \
+              -F number="$PR_NUMBER" -F after="$CURSOR" -f query='
+              query($owner: String!, $name: String!, $number: Int!, $after: String) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $number) {
+                    reviewThreads(first: 100, after: $after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { isResolved comments(first: 1) { nodes { body } } }
+                    }
+                  }
+                }
+              }' --jq '.data.repository.pullRequest.reviewThreads')
+            OPEN=$((OPEN + $(jq '[.nodes[] | select(.isResolved | not) | select(.comments.nodes[0].body | startswith("<!-- ocr-"))] | length' <<<"$PAGE")))
+            [ "$(jq -r '.pageInfo.hasNextPage' <<<"$PAGE")" = "true" ] || break
+            CURSOR=$(jq -r '.pageInfo.endCursor' <<<"$PAGE")
+          done
+
+          echo "status=$STATUS warnings=$WARNINGS files_reviewed=$FILES new_findings=${NEW_FINDINGS:-?} open_threads=$OPEN"
+
+          # Approvals the reviewer left earlier that are still standing.
+          APPROVALS=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews?per_page=100" \
+            --jq '[.[] | select(.state == "APPROVED") | select(.body | contains("<!-- ocr-approval -->")) | .id] | join(" ")')
+
+          if [ "${NEW_FINDINGS:-0}" != "0" ] || [ "$OPEN" != "0" ]; then
+            for ID in $APPROVALS; do
+              gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews/$ID/dismissals" --silent \
+                -f event=DISMISS -f message="Dismissed automatically: the reviewer has open findings again as of ${HEAD_SHA:0:7}." \
+                && echo "Dismissed earlier approval $ID." \
+                || echo "::warning::Could not dismiss earlier approval $ID."
+            done
+          elif { [ "$STATUS" = "complete" ] || [ "$STATUS" = "success" ]; } && [ "$WARNINGS" = "0" ] && [ "$FILES" -gt 0 ] && [ -n "$HEAD_SHA" ]; then
+            if [ -n "$APPROVALS" ]; then
+              echo "An approval from the reviewer is already standing."
+            else
+              # shellcheck disable=SC2016 # Markdown backticks, not a command substitution
+              BODY=$(printf '✅ **OpenCodeReview** found no issues in `%s` and has no open findings on this pull request.\n\nThis is an automated review and does not replace a review by a maintainer.\n<!-- ocr-approval -->' "${HEAD_SHA:0:7}")
+              gh api -X POST "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" \
+                -f event=APPROVE -f commit_id="$HEAD_SHA" -f body="$BODY" --jq '"Approved: \(.html_url)"' \
+                || echo "::warning::Could not submit the approving review; check that the token may approve pull requests."
+            fi
+          else
+            echo "Nothing reviewed or the run was incomplete; leaving approvals as they are."
+          fi
