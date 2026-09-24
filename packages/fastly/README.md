@@ -18,7 +18,7 @@ composer require utopia-php/fastly
 ```php
 <?php
 
-use Utopia\Client;
+use Utopia\Client\Client;
 use Utopia\Client\Adapter\Curl\Client as CurlAdapter;
 use Utopia\Fastly\Fastly;
 

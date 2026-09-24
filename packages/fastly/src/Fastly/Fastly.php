@@ -12,7 +12,7 @@ use Utopia\Psr7\Request\Factory as RequestFactory;
 /**
  * Fastly HTTP API client. Currently exposes surrogate-key purging.
  *
- * Transport is any PSR-18 client — pass a configured `Utopia\Client` (its
+ * Transport is any PSR-18 client — pass a configured `Utopia\Client\Client` (its
  * cURL or Swoole adapter) so timeouts, TLS and pooling are the caller's choice.
  */
 final readonly class Fastly
