@@ -245,6 +245,11 @@ abstract class Adapter
     abstract public function getRepositoryUrl(string $owner, string $repositoryName): string;
 
     /**
+     * Browser-facing URL for an owner's home page: a user, organization or group.
+     */
+    abstract public function getOrganizationUrl(string $owner): string;
+
+    /**
      * Browser-facing URL for a branch within a repository.
      */
     abstract public function getBranchUrl(string $owner, string $repositoryName, string $branch): string;
