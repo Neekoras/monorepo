@@ -507,6 +507,34 @@ final class NatsBrokerTest extends TestCase
         $broker->close();
     }
 
+    public function testAMessageExhaustedWhileNoBrokerListensStillReachesTheDeadStream(): void
+    {
+        // The max-deliveries advisory is core NATS: nobody subscribed, nobody gets it.
+        // A worker that dies holding a message's last delivery -- a rollout, a crash
+        // loop -- used to leave it on the work stream past maxDeliver, where nothing
+        // delivers it, getQueueSize() reads 0 and it never expires. Seen on staging:
+        // 110 edge and 35 webhook messages, stranded for over a day.
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        $dying = new Nats(Connection::connect($url), ackWait: 1.0, maxDeliver: 2);
+        $dying->publish($queue, ['poison' => true]);
+        $this->assertCount(1, $dying->receive($queue, 2));
+        sleep(2);
+        $this->assertCount(1, $dying->receive($queue, 2)); // the last delivery, never acked
+        $dying->close();
+        sleep(2); // past ackWait with no broker subscribed to anything
+
+        $fresh = new Nats(Connection::connect($url), ackWait: 1.0, maxDeliver: 2);
+        $this->assertSame([], $fresh->receive($queue, 2), 'an exhausted message must not reach a handler');
+
+        $js = Connection::connect($url)->jetStream();
+        $this->assertSame(0, $js->getStreamInfo('Q_' . strtoupper($queue->name))->state->messages, 'work stream holds nothing');
+        $this->assertSame(1, $js->getStreamInfo('Q_' . strtoupper($queue->name) . '_DEAD')->state->messages, 'the message is on the dead stream');
+
+        $fresh->close();
+    }
+
     /**
      * getQueueSize() must be safe to call while another coroutine is blocked in
      * receive() on the SAME broker — the shape the Swoole worker runs, where the
