@@ -9,6 +9,7 @@ use PHPUnit\Framework\TestCase;
 use Utopia\NATS\Connection;
 use Utopia\NATS\ConnectionOptions;
 use Utopia\NATS\Exception\ConnectionException;
+use Utopia\NATS\JetStream\ConsumerConfig;
 use Utopia\NATS\JetStream\DiscardPolicy;
 use Utopia\NATS\JetStream\StorageType;
 use Utopia\NATS\Transport\TcpTransport;
@@ -1368,5 +1369,66 @@ final class NatsBrokerTest extends TestCase
 
         $maintenance->close();
         $owner->close();
+    }
+
+    public function testARequireBrokerDeadLettersOnTheOwnersSpareDelivery(): void
+    {
+        // A Require broker writes no configuration, so the spare delivery it can use is
+        // the one the owner provisioned -- read from the server, not from its own knobs.
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+
+        $owner = new Nats(Connection::connect($url), ackWait: 1.0, maxDeliver: 2);
+        $owner->publish($queue, ['poison' => true]);
+        $this->assertCount(1, $owner->receive($queue, 2));
+        sleep(2);
+        $this->assertCount(1, $owner->receive($queue, 2));
+        $owner->close();
+        sleep(2);
+
+        $adopter = new Nats(Connection::connect($url), ackWait: 1.0, maxDeliver: 9, provisioning: Provisioning::Require);
+        $this->assertSame([], $adopter->receive($queue, 2), 'an exhausted message must not reach a handler');
+
+        $js = Connection::connect($url)->jetStream();
+        $this->assertSame(0, $js->getStreamInfo('Q_' . strtoupper($queue->name))->state->messages, 'work stream holds nothing');
+        $this->assertSame(1, $js->getStreamInfo('Q_' . strtoupper($queue->name) . '_DEAD')->state->messages, 'the message is on the dead stream');
+
+        $adopter->close();
+    }
+
+    public function testARequireBrokerReportsAConsumerWithoutASpareDelivery(): void
+    {
+        // A consumer provisioned before the spare delivery existed, which a Require
+        // broker may not change: it says so rather than leaving strandings unexplained.
+        $url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14225';
+        $queue = new Queue('t_' . substr(md5(uniqid('', true)), 0, 8));
+        $owner = new Nats(Connection::connect($url), maxDeliver: 2);
+        $owner->publish($queue, ['task' => 'a']);
+        $owner->close();
+
+        $js = Connection::connect($url)->jetStream();
+        $stream = 'Q_' . strtoupper($queue->name);
+        $legacy = $js->getConsumer($stream, 'worker')->info(true)->config->toArray();
+        // What a pre-spare broker provisioned: no extra delivery, and no marker for one.
+        $legacy['max_deliver'] = 2;
+        unset($legacy['metadata']['utopia_queue_spare_delivery']);
+        $js->updateConsumer($stream, ConsumerConfig::fromArray($legacy));
+
+        $reported = [];
+        $adopter = new Nats(
+            Connection::connect($url),
+            maxDeliver: 2,
+            onError: static function (\Throwable $error) use (&$reported): void {
+                $reported[] = $error->getMessage();
+            },
+            provisioning: Provisioning::Require,
+        );
+        $adopter->receive($queue, 1);
+
+        $this->assertCount(1, $reported);
+        $this->assertStringContainsString('allows no delivery past max_deliver 2', $reported[0]);
+        $this->assertSame(2, $js->getConsumer($stream, 'worker')->info(true)->config->maxDeliver, 'and leaves the consumer as it found it');
+
+        $adopter->close();
     }
 }

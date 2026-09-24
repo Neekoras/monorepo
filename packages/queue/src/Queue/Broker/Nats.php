@@ -94,6 +94,10 @@ class Nats implements Synchronous, Consumer, Bounded
     private const int MAX_STREAM_NAME = 255;
     private const string METADATA_IDENTITY = 'utopia_queue_identity';
 
+    // Consumer-metadata key marking a work consumer provisioned with one delivery past
+    // maxDeliver, so a broker adopting it can tell that spare from a larger budget.
+    private const string METADATA_SPARE_DELIVERY = 'utopia_queue_spare_delivery';
+
     // Retry budget for first-time provisioning of a replicated stream. The window
     // doubles per attempt because a fixed one re-synchronises the losers: every process
     // that lost the first race waits the same interval and collides again. See ensure().
@@ -117,6 +121,13 @@ class Nats implements Synchronous, Consumer, Bounded
 
     /** @var array<string, \Utopia\NATS\Subscription> max-deliveries advisory subscription per queue */
     private array $advisories = [];
+
+    /**
+     * @var array<string, int|null> per queue, the delivery that is dead-lettered on
+     *      arrival -- the server's last, when it allows one past maxDeliver; null when
+     *      the consumer allows none, and exhaustion falls to the advisory alone
+     */
+    private array $spareDelivery = [];
 
     /** Publishes the stream recognised as duplicates of an id it already held. */
     private int $duplicates = 0;
@@ -690,12 +701,14 @@ class Nats implements Synchronous, Consumer, Bounded
 
         $messages = [];
 
+        $spare = $this->spareDelivery[$key] ?? null;
+
         foreach ($deliveries as $jsMessage) {
             // The server allows one delivery past maxDeliver (see provision()), and it
             // only reaches here when no attempt before it ended in reject() -- a worker
             // died holding each one. Dead-lettered on this delivery rather than by the
             // advisory, which nobody receives while no broker is subscribed.
-            if ($jsMessage->metadata()->numDelivered > $this->maxDeliver) {
+            if ($spare !== null && $jsMessage->metadata()->numDelivered >= $spare) {
                 $this->park($queue, $jsMessage, 'max deliveries exceeded');
 
                 continue;
@@ -853,6 +866,7 @@ class Nats implements Synchronous, Consumer, Bounded
         $this->commandsConsumers = [];
         $this->consumers = [];
         $this->advisories = [];
+        $this->spareDelivery = [];
         $this->provisioned = [];
         $this->inFlight = [];
 
@@ -1257,6 +1271,7 @@ class Nats implements Synchronous, Consumer, Bounded
             maxWaiting: $this->maxWaiting,
             maxAckPending: $this->maxAckPending,
             inactiveThreshold: $this->inactiveThreshold,
+            metadata: [self::METADATA_SPARE_DELIVERY => '1'],
             backoff: $this->backoff,
         ));
 
@@ -1276,6 +1291,7 @@ class Nats implements Synchronous, Consumer, Bounded
             queue: self::ADVISORY_GROUP,
         );
 
+        $this->spareDelivery[$key] = $this->maxDeliver + 1;
         $this->provisioned[$key] = true;
     }
 
@@ -1310,6 +1326,20 @@ class Nats implements Synchronous, Consumer, Bounded
         }
 
         $this->consumers[$key] = $this->adoptConsumer($queue, self::CONSUMER_WORK);
+
+        // The owner's spare delivery, not this broker's: it exists only if the owner
+        // provisioned one, which it marks in the consumer's metadata. A consumer from
+        // before the spare was introduced allows none, and nothing here may change that,
+        // so it is reported instead -- a message it exhausts while no broker is
+        // subscribed stays on the work stream until its owner reprovisions. A limit
+        // below 1 is unlimited: such a message never exhausts.
+        $config = $this->consumers[$key]->info()->config;
+        $allowed = $config->maxDeliver ?? -1;
+        $marked = isset($config->metadata[self::METADATA_SPARE_DELIVERY]);
+        $this->spareDelivery[$key] = $marked && $allowed >= 1 ? $allowed : null;
+        if (!$marked && $allowed >= 1) {
+            $this->report(new \RuntimeException('NATS consumer "' . self::CONSUMER_WORK . "\" on stream \"{$this->workStream($queue)}\" allows no delivery past max_deliver {$allowed}, so a message exhausted while no broker is subscribed is left on the work stream; reprovision it from the queue's owner."));
+        }
 
         // Same advisory subscription provision() takes: a core subscription carries no
         // configuration, and a broker consuming a pre-provisioned queue still owes its
